@@ -69,276 +69,30 @@ def deadzone_loss(input_tensor, threshold=20.0):
     # Squared error on the excess
     return (excess ** 2).mean()
 
-# class SfMPoseLoss(nn.Module):
-#     def __init__(self, 
-#                  up_vector=(0, 1, 0),       # HM3D/Habitat usually Y-up
-#                  frame0_leash=15.0):         # Radius of the deadzone for Frame 0 (meters)
-#         super().__init__()
-#         self.register_buffer("up_vector", torch.tensor(up_vector, dtype=torch.float32))
-#         self.frame0_leash = frame0_leash
-
-#     def forward(self, pred_t, pred_q, gt_t, gt_q, batch_counts):
-#         """
-#         pred_t: (N_total, 3)
-#         pred_q: (N_total, 4) - Normalized
-#         gt_t:   (N_total, 3)
-#         gt_q:   (N_total, 4)
-#         batch_counts: List[int] - images per episode
-#         """
-#         total_rel_trans_loss = 0
-#         total_rel_rot_loss = 0
-#         total_gravity_loss = 0
-#         total_scale_loss = 0
-#         total_frame0_loss = 0
-        
-#         cursor = 0
-#         num_episodes = len(batch_counts)
-        
-#         for count in batch_counts:
-#             # === SLICE EPISODE ===
-#             p_t = pred_t[cursor : cursor+count] # (T, 3)
-#             p_q = pred_q[cursor : cursor+count] # (T, 4)
-#             g_t = gt_t[cursor : cursor+count]
-#             g_q = gt_q[cursor : cursor+count]
-
-#             # --- 1. Frame 0 Constraint (The Leash) ---
-#             # We only penalize the first frame if it drifts too far from origin.
-#             # This creates the "Flat Zone" you requested.
-#             total_frame0_loss += deadzone_loss(p_t[0], threshold=self.frame0_leash)
-
-#             # --- 2. Absolute Gravity Loss ---
-#             # We want predicted "Up" to match GT "Up".
-#             # World Up Vector (broadcasted)
-#             up_vec = self.up_vector.to(p_q.device).unsqueeze(0).expand(count, -1)
-            
-#             # Rotate World-Up into Local Camera Frame (or vice versa).
-#             # Here: Rotate World-Up by Pred Rotation -> Predicted Local Up
-#             pred_up = q_rotate_vector(q_inverse(p_q), up_vec)
-#             gt_up = q_rotate_vector(q_inverse(g_q), up_vec)
-            
-#             # Cosine Distance (1 - cos). 
-#             # Note: We don't square this because Up is a vector, not a quaternion.
-#             # <v1, v2> should be 1.0. 
-#             total_gravity_loss += (1.0 - F.cosine_similarity(pred_up, gt_up, dim=-1)).mean()
-
-#             # --- PREPARE RELATIVE POSE ---
-#             # To compute relative pose loss, we transform all poses to be relative 
-#             # to the First Frame of the episode.
-            
-#             # 1. Relative Rotation: Q_rel = Q_0_inv * Q_i
-#             p_q0_inv = q_inverse(p_q[0:1].expand(count, -1))
-#             g_q0_inv = q_inverse(g_q[0:1].expand(count, -1))
-            
-#             p_q_rel = q_multiply(p_q0_inv, p_q)
-#             g_q_rel = q_multiply(g_q0_inv, g_q)
-            
-#             # 2. Relative Translation, world frame
-
-#             p_t_world = p_t - p_t[0:1]
-#             g_t_world = g_t - g_t[0:1]
-
-#             p_t_centered = q_rotate_vector(p_q0_inv, p_t_world) #local to the first frame.
-            
-#             # Rotate GT by GT_R0_Inv
-#             g_t_centered = q_rotate_vector(g_q0_inv, g_t_world)
-#             # Rotate translation into Frame 0's coordinates (Optional, but strictly 'relative pose')
-#             # If we just want distance consistency, keeping it in world frame aligned to 0 is fine.
-#             # Let's keep it in "Zero-Centered World Frame" for simplicity of gradients.
-            
-#             # --- 3. Scale Alignment (Least Squares) ---
-#             # We align p_t_centered to g_t_centered
-#             # s = dot(p, g) / dot(p, p)
-#             p_flat = p_t_centered.reshape(-1)
-#             g_flat = g_t_centered.reshape(-1)
-
-#             # Stop gradient on denominator for stability? 
-#             # Usually standard backprop is fine, but clamping is essential.
-#             dot_pp = torch.dot(p_flat, p_flat)
-#             dot_pg = torch.dot(p_flat, g_flat)
-#             dot_gg = torch.dot(g_flat, g_flat)
-
-#             if dot_gg < 1e-4:
-#                 print(f"[DEBUG] Found Stationary Episode!")
-#                 print(f"GT Translation Norms: {g_t_centered.norm(dim=-1)}")
-#                 print(f"Pred Translation Norms: {p_t_centered.norm(dim=-1)}")
-
-#             if dot_gg > 1e-4:
-#                 # SAFETY GUARD 2: Check if Model predicts ~0 (Singularity)
-#                 if dot_pp < 1e-5:
-#                     # Model is effectively outputting 0. 
-#                     # We cannot infer scale. 
-#                     # Set scale to 1.0 (Identity) so Trans Loss = |0 - GT|.
-#                     # This forces the model to grow p naturally via Trans Loss.
-#                     scale_raw = 1.0
-                    
-#                     # We skip the scale loss because log(scale) is meaningless here
-#                     scale_loss_term = 0.0
-#                 else:
-#                     # Normal case
-#                     scale_raw = dot_pg / dot_pp
-                    
-#                     # Log-Safe Loss: log(|s| + eps)
-#                     # We add 1e-6 inside abs to prevent log(0)
-#                     scale_loss_term = (torch.log(torch.abs(scale_raw) + 1e-6)**2)
-
-#                 total_scale_loss += scale_loss_term
-#                 scale = torch.clamp(scale_raw, min=0.001, max=1000.0) # Sanity clamps
-#                 p_t_aligned = p_t_centered * scale
-#             else:
-#                 p_t_aligned = p_t_centered
-#             # --- 4. Relative Translation Loss ---
-#             # We use Smooth L1. This covers both Direction and Magnitude (Scaled).
-#             total_rel_trans_loss += F.smooth_l1_loss(p_t_aligned, g_t_centered, beta=0.1)
-            
-#             # --- 5. Relative Rotation Loss ---
-#             # Double cover check: 1 - <q1, q2>^2
-#             dot_prod = (p_q_rel * g_q_rel).sum(dim=1)
-#             total_rel_rot_loss += (1.0 - dot_prod**2).mean()
-
-#             cursor += count
-
-#         # Normalize by batch size
-#         return {
-#             "loss_trans": total_rel_trans_loss / num_episodes,
-#             "loss_rot": total_rel_rot_loss / num_episodes,
-#             "loss_grav": total_gravity_loss / num_episodes,
-#             "loss_leash": total_frame0_loss / num_episodes,
-#             "loss_scale": total_scale_loss / num_episodes
-#         }
-
-# class SfMPoseLoss(nn.Module):
-#     def __init__(self, 
-#                  up_vector=(0, 1, 0),       # HM3D/Habitat usually Y-up
-#                  frame0_leash=15.0):         # Radius of the deadzone for Frame 0 (meters)
-#         super().__init__()
-#         self.register_buffer("up_vector", torch.tensor(up_vector, dtype=torch.float32))
-#         self.frame0_leash = frame0_leash
-
-#     def forward(self, pred_t, pred_q, gt_t, gt_q, batch_counts):
-#         """
-#         pred_t: (N_total, 3)
-#         pred_q: (N_total, 4) - Normalized
-#         gt_t:   (N_total, 3)
-#         gt_q:   (N_total, 4)
-#         batch_counts: List[int] - images per episode
-#         """
-#         total_rel_trans_loss = 0
-#         total_rel_rot_loss = 0
-#         total_gravity_loss = 0
-#         total_scale_loss = 0
-        
-#         cursor = 0
-#         num_episodes = len(batch_counts)
-        
-#         for count in batch_counts:
-#             # === SLICE EPISODE ===
-#             p_t = pred_t[cursor : cursor+count] # (T, 3)
-#             p_q = pred_q[cursor : cursor+count] # (T, 4)
-#             g_t = gt_t[cursor : cursor+count]
-#             g_q = gt_q[cursor : cursor+count]
-
-#             # --- 2. Absolute Gravity Loss ---
-#             # We want predicted "Up" to match GT "Up".
-#             # World Up Vector (broadcasted)
-#             up_vec = self.up_vector.to(p_q.device).unsqueeze(0).expand(count, -1)
-            
-#             # Rotate World-Up into Local Camera Frame (or vice versa).
-#             # Here: Rotate World-Up by Pred Rotation -> Predicted Local Up
-#             pred_up = q_rotate_vector(q_inverse(p_q), up_vec)
-#             gt_up = q_rotate_vector(q_inverse(g_q), up_vec)
-            
-#             # Cosine Distance (1 - cos). 
-#             # Note: We don't square this because Up is a vector, not a quaternion.
-#             # <v1, v2> should be 1.0. 
-#             total_gravity_loss += (1.0 - F.cosine_similarity(pred_up, gt_up, dim=-1)).mean()
-
-#             # --- PREPARE RELATIVE POSE ---
-#             # To compute relative pose loss, we transform all poses to be relative 
-#             # to the First Frame of the episode.
-            
-#             # 1. Relative Rotation: Q_rel = Q_0_inv * Q_i
-#             g_q0_inv = q_inverse(g_q[0:1].expand(count, -1))
-            
-#             g_q_rel = q_multiply(g_q0_inv, g_q[1:])
-            
-#             # 2. Relative Translation, world frame
-
-#             p_t_world = p_t[1:]
-#             g_t_world = g_t[1:] - g_t[0:1]
-
-            
-#             # Rotate GT by GT_R0_Inv
-#             g_t_centered = q_rotate_vector(g_q0_inv, g_t_world)
-#             # Rotate translation into Frame 0's coordinates (Optional, but strictly 'relative pose')
-#             # If we just want distance consistency, keeping it in world frame aligned to 0 is fine.
-#             # Let's keep it in "Zero-Centered World Frame" for simplicity of gradients.
-            
-#             # --- 3. Scale Alignment (Least Squares) ---
-#             # We align p_t_centered to g_t_centered
-#             # s = dot(p, g) / dot(p, p)
-#             p_flat = p_t_world.reshape(-1)
-#             g_flat = g_t_centered.reshape(-1)
-
-#             # Stop gradient on denominator for stability? 
-#             # Usually standard backprop is fine, but clamping is essential.
-#             dot_pp = torch.dot(p_flat, p_flat)
-#             dot_pg = torch.dot(p_flat, g_flat)
-#             dot_gg = torch.dot(g_flat, g_flat)
-
-#             if dot_gg < 1e-4:
-#                 print(f"[DEBUG] Found Stationary Episode!")
-#                 print(f"GT Translation Norms: {g_t_centered.norm(dim=-1)}")
-#                 print(f"Pred Translation Norms: {p_t_world.norm(dim=-1)}")
-
-#             if dot_gg > 1e-4:
-#                 # SAFETY GUARD 2: Check if Model predicts ~0 (Singularity)
-#                 if dot_pp < 1e-5:
-#                     # Model is effectively outputting 0. 
-#                     # We cannot infer scale. 
-#                     # Set scale to 1.0 (Identity) so Trans Loss = |0 - GT|.
-#                     # This forces the model to grow p naturally via Trans Loss.
-#                     scale_raw = 1.0
-                    
-#                     # We skip the scale loss because log(scale) is meaningless here
-#                     scale_loss_term = 0.0
-#                 else:
-#                     # Normal case
-#                     scale_raw = dot_pg / dot_pp
-                    
-#                     # Log-Safe Loss: log(|s| + eps)
-#                     # We add 1e-6 inside abs to prevent log(0)
-#                     scale_loss_term = (torch.log(torch.abs(scale_raw) + 1e-6)**2)
-
-#                 total_scale_loss += scale_loss_term
-#                 scale = torch.clamp(scale_raw, min=0.001, max=1000.0) # Sanity clamps
-#                 p_t_aligned = p_t_world * scale
-#             else:
-#                 p_t_aligned = p_t_world
-#             # --- 4. Relative Translation Loss ---
-#             # We use Smooth L1. This covers both Direction and Magnitude (Scaled).
-#             total_rel_trans_loss += F.smooth_l1_loss(p_t_aligned, g_t_centered, beta=0.1)
-            
-#             # --- 5. Relative Rotation Loss ---
-#             # Double cover check: 1 - <q1, q2>^2
-#             dot_prod = (p_q[1:] * g_q_rel).sum(dim=1)
-#             total_rel_rot_loss += (1.0 - dot_prod**2).mean()
-
-#             cursor += count
-
-#         # Normalize by batch size
-#         return {
-#             "loss_trans": total_rel_trans_loss / num_episodes,
-#             "loss_rot": total_rel_rot_loss / num_episodes,
-#             "loss_grav": total_gravity_loss / num_episodes,
-#             "loss_scale": total_scale_loss / num_episodes
-#         }
 class SfMPoseLoss(nn.Module):
     def __init__(self, 
                  up_vector=(0, 1, 0),       
                  frame0_leash=15.0):
         super().__init__()
         self.register_buffer("up_vector", torch.tensor(up_vector, dtype=torch.float32))
-
+    def _get_flattened_weights(self, count, device):
+        """
+        Generates pairwise weights based on temporal distance.
+        Returns: (weights_flat, mask_upper_tri)
+        """
+        rng = torch.arange(count, device=device)
+        i, j = torch.meshgrid(rng, rng, indexing='ij')
+        
+        # Temporal distance matrix
+        dist = (j - i).float()
+        mask = dist > 0 # Upper triangle (j > i)
+        
+        # Calculate weights: w = 1 / (distance ^ gamma)
+        # Epsilon ensures stability if gamma is negative or dist is 0 (masked anyway)
+        raw_weights = 1.0 / (dist.pow(self.focal_gamma) + 1e-6)
+        
+        return raw_weights[mask], mask
+    
     def forward(self, pred_t, pred_q, gt_t, gt_q, batch_counts):
         total_rel_trans_loss = 0
         total_rel_rot_loss = 0
@@ -440,11 +194,29 @@ class SfMPoseLoss(nn.Module):
         }
     
 class AllPairsPoseLoss(nn.Module):
-    def __init__(self, up_vector=(0, 1, 0), frame0_leash=15.0):
+    def __init__(self, up_vector=(0, 1, 0), frame0_leash=15.0,focal_gamma=0.0):
         super().__init__()
         self.register_buffer("up_vector", torch.tensor(up_vector, dtype=torch.float32))
         self.frame0_leash = frame0_leash
+        self.focal_gamma = focal_gamma
 
+    def _get_flattened_weights(self, count, device):
+        """
+        Generates pairwise weights based on temporal distance.
+        Returns: (weights_flat, mask_upper_tri)
+        """
+        rng = torch.arange(count, device=device)
+        i, j = torch.meshgrid(rng, rng, indexing='ij')
+        
+        # Temporal distance matrix
+        dist = (j - i).float()
+        mask = dist > 0 # Upper triangle (j > i)
+        
+        # Calculate weights: w = 1 / (distance ^ gamma)
+        # Epsilon ensures stability if gamma is negative or dist is 0 (masked anyway)
+        raw_weights = 1.0 / (dist.pow(self.focal_gamma) + 1e-6)
+        
+        return raw_weights[mask], mask
     def forward(self, pred_t, pred_q, gt_t, gt_q, batch_counts):
         """
         Computes All-Pairs Relative Pose Loss.
@@ -500,7 +272,8 @@ class AllPairsPoseLoss(nn.Module):
             # i == j is 0, i > j is just the inverse (redundant).
             # Create Upper Triangular Mask (offset 1 to exclude diagonal)
             mask = torch.triu(torch.ones(count, count, device=p_t.device, dtype=torch.bool), diagonal=1)
-            
+            weights, mask = self._get_flattened_weights(count, p_t.device)
+            weights_sum = weights.sum() + 1e-8
             # Flatten to (M, 3) and (M, 4) where M is number of valid pairs
             p_t_flat = p_t_rel[mask]
             g_t_flat = g_t_rel[mask]
@@ -516,11 +289,13 @@ class AllPairsPoseLoss(nn.Module):
             p_vec = p_t_flat.reshape(-1)
             g_vec = g_t_flat.reshape(-1)
             
-            dot_pp = torch.dot(p_vec, p_vec)
-            dot_pg = torch.dot(p_vec, g_vec)
+            w_vec_spatial = weights.repeat_interleave(3)
+
+            dot_pp = torch.dot(p_vec*w_vec_spatial, p_vec)
+            dot_pg = torch.dot(p_vec*w_vec_spatial, g_vec)
             
             # Stationary Check (on Ground Truth pairs)
-            g_mag = torch.dot(g_vec, g_vec)
+            g_mag = torch.dot(g_vec*w_vec_spatial, g_vec)
             
             if g_mag > 1e-4:
                 if dot_pp < 1e-5:
@@ -541,13 +316,17 @@ class AllPairsPoseLoss(nn.Module):
             # === 5. LOSSES ===
             
             # Translation (Smooth L1 over all pairs)
-            total_loss_trans += F.smooth_l1_loss(p_t_aligned, g_t_flat, beta=0.1)
+            trans_error = F.smooth_l1_loss(p_t_aligned, g_t_flat, beta=0.1,reduce='none')
+            total_loss_trans += (trans_error * weights).sum() / weights_sum
             
             # Rotation (Cosine over all pairs)
             # 1 - <q1, q2>^2
-            rot_dot = (p_q_flat * g_q_flat).sum(dim=1)
-            total_loss_rot += (1.0 - rot_dot**2).mean()
-            
+            dot_prod = (p_q_flat * g_q_flat).sum(dim=1)
+            # 1. Calculate per-pair error (Vector)
+            rot_error_vector = 1.0 - dot_prod**2 
+            # 2. Manual Weighted Reduction (Scalar)
+            # sum(error * weight) / sum(weights)
+            total_loss_rot += (rot_error_vector * weights).sum() / weights_sum
             # Gravity (Relative)
             # Compare how "Up" transforms from frame i to j
             up_vec = self.up_vector.to(p_q.device).unsqueeze(0).expand(p_q.shape[0], -1)

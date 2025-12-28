@@ -116,7 +116,11 @@ def make_dynamic_resize_transform(N: int=190, M: int=29, H: int=480, W: int=640,
             episode_imgs = []
             for p in paths:
                 # Load from disk
-                img = PILImage.open(p) 
+                if isinstance(p, str):
+                    img = PILImage.open(p)
+                else:
+                    img = p 
+                # img = PILImage.open(p) 
                 
                 # Resize only if necessary (Lanczos is best for downsampling)
                 if scale < 1.0:
