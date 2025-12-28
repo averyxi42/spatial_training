@@ -1,13 +1,18 @@
 import os
+import sys
+import argparse
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 import torch.nn as nn
-from transformers import AutoModelForImageTextToText, AutoTokenizer, TrainingArguments,AutoProcessor
+from transformers import AutoModelForImageTextToText, AutoProcessor
 from trl import SFTTrainer, SFTConfig
-from peft import LoraConfig, get_peft_model, TaskType
-from datasets import Dataset,load_dataset
-from PIL import Image as PILImage
-import os
+from peft import LoraConfig
 # export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 # --- CONFIGURATION ---
 MODEL_ID = "/Projects/SG_VLN_HumanData/SG-VLN/sft_pipeline/text_adapted_model"#,"Qwen/Qwen3-VL-2B-Instruct" # Or your specific VLM backbone
@@ -21,6 +26,10 @@ TURN_TOKENS = 30
 ORIG_H = 480
 ORIG_W = 640
 TOTAL_BUDGET = 32000#34000
+TRAIN_DATASET_DIR = "/Projects/SG_VLN_HumanData/spatial_training/data/habitat_web_pose_v1/train"
+EVAL_DATASET_DIR = "/Projects/SG_VLN_HumanData/spatial_training/data/habitat_web_pose_v1/validation"
+OUTPUT_DIR = "/Projects/SG_VLN_HumanData/spatial_training/dump/sft_training_continue"
+EVAL_MAX_SAMPLES = 40
 
 def get_peak_memory_gb():
     """Helper to get peak GPU memory in GB"""
@@ -37,7 +46,7 @@ def preprocess_logits_for_metrics(logits, labels):
     # Argmax on GPU, return integer IDs
     return logits.argmax(dim=-1)
 
-from utils.training_utils import SpatialFeatureExtractor,get_image_token_indices
+from utils.training_utils import SpatialFeatureExtractor, get_image_token_indices
 from utils.pose import SfMPoseLoss
 class PoseTrainer(SFTTrainer):
     def __init__(self, *args, **kwargs):
@@ -166,23 +175,47 @@ ORIG_H = 480
 ORIG_W = 640
 TOTAL_BUDGET = 32000#34000
 dynamic_resize_transform = make_dynamic_resize_transform(SYSTEM_TOKENS,TURN_TOKENS,ORIG_H,ORIG_W,TOTAL_BUDGET-600)
+
+def parse_args():
+    p = argparse.ArgumentParser(description="SFT training (minimal CLI: only overrides hardcoded paths)")
+    p.add_argument("--model_id", type=str, default=MODEL_ID, help="HF model id or local path")
+    p.add_argument("--train_dataset_dir", type=str, default=TRAIN_DATASET_DIR, help="load_from_disk() dir")
+    p.add_argument(
+        "--eval_dataset_dir",
+        type=str,
+        default=EVAL_DATASET_DIR,
+        help="load_from_disk() dir (use empty string to disable eval)",
+    )
+    p.add_argument("--output_dir", type=str, default=OUTPUT_DIR, help="Trainer output_dir")
+    p.add_argument("--eval_max_samples", type=int, default=EVAL_MAX_SAMPLES, help="Eval subset size")
+    p.add_argument("--print_config", action="store_true", help="Print config then exit")
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
+
+    if args.print_config:
+        print(vars(args))
+        return
+
     print(f"--- Starting Memory Profile ---")
-    print(f"Model: {MODEL_ID}")
-    print(f"Target Seq Len: {TARGET_SEQ_LEN}")
+    print(f"Model: {args.model_id}")
     print(f"Batch Size: {BATCH_SIZE}")
     
     # 1. Load Model in bfloat16 (No quantization)
     print("Loading model...")
     model = AutoModelForImageTextToText.from_pretrained(
-        MODEL_ID,
+        args.model_id,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2" if USE_FLASH_ATTN else "eager",
-        device_map="auto",
+        attn_implementation="sdpa", # Changed from flash_attention_2 to sdpa to avoid extra dependencies
+        # device_map="auto",
+        # Force single-GPU placement
+        device_map={"": 0} if torch.cuda.is_available() else None,
         # use_cache=False # Important for training with gradient checkpointing
     )
     model.enable_input_require_grads()
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
+    processor = AutoProcessor.from_pretrained(args.model_id)
     tokenizer = processor.tokenizer
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -197,19 +230,24 @@ def main():
     )
 
     from datasets import load_from_disk
-    train_dataset = load_from_disk("/Projects/SG_VLN_HumanData/spatial_training/data/habitat_web_pose_v1/train") 
+    train_dataset = load_from_disk(args.train_dataset_dir)
     train_dataset.set_transform(dynamic_resize_transform)
-    
-    eval_dataset = load_from_disk("/Projects/SG_VLN_HumanData/spatial_training/data/habitat_web_pose_v1/validation").select(range(40)) 
-    eval_dataset.set_transform(dynamic_resize_transform)
+
+    if args.eval_dataset_dir:
+        eval_dataset = load_from_disk(args.eval_dataset_dir)
+        if args.eval_max_samples is not None and args.eval_max_samples > 0:
+            eval_dataset = eval_dataset.select(range(min(args.eval_max_samples, len(eval_dataset))))
+        eval_dataset.set_transform(dynamic_resize_transform)
+    else:
+        eval_dataset = None
     # eval_dataset = None
 
     # 4. Training Arguments
     training_args = SFTConfig(
-        output_dir="/Projects/SG_VLN_HumanData/spatial_training/dump/sft_training_continue",
+        output_dir=args.output_dir,
         # run_name="qwen-vln-action-dropout",
         save_strategy="steps",        # Save checkpoints frequently
-        save_steps=100,          
+        save_steps=100,
                   # Save every 500 steps
         eval_strategy="steps",        # Check validation loss periodically
         eval_steps=100,               # Frequency: Every 100 steps
@@ -241,7 +279,11 @@ def main():
     # 5. Initialize Trainer
     trainer = SFTTrainer(
         model=model,
-        data_collator = ActionMaskingVLMCollator(processor=processor,max_length=TOTAL_BUDGET,dropout=0.6),
+        data_collator=ActionMaskingVLMCollator(
+            processor=processor,
+            max_length=TOTAL_BUDGET,
+            dropout=0.6,
+        ),
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
