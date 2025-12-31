@@ -118,24 +118,47 @@ class ActionMaskingVLMCollator(DataCollatorForVisionLanguageModeling):
     It identifies Assistant turns based on specific start/end token IDs and masks everything else.
     """
     dropout:float=-1
+    length_warning: int=40000
     # You must provide these for your specific model (e.g., Llama-3, Qwen)
     def torch_call(self, examples):
         # 1. Let the base class handle the heavy lifting (Image processing, Padding, etc.)
         # This returns a batch with 'input_ids', 'labels', 'pixel_values', 'attention_mask'
-        print(f"DEBUG PRE-COLLATE: {[(len(x['images']), x['images'][0].size) for x in examples if 'images' in x]}")
+        try:
+            print(f"DEBUG PRE-COLLATE: {[(len(x['images']), x['images'][0].size) for x in examples if 'images' in x]}")
+            
+            for x in examples:
+                size = x['images'][0].size
+                for image in x['images']:
+                    assert image.size==size
+            # print(f"DEBUG PRE-COLLATE: {[(len(x['messages'])) for x in examples]}")
+            # print(examples[0]['images'])
+        except Exception as e:
+            print(f"collator error! {e}")
+            print(examples[0]['images'])
         # print((len(examples[0]['messages'])-1)/2)
         batch = super().torch_call(examples)
         if "image_grid_thw" not in batch:
             print("!!! CRITICAL ERROR: 'image_grid_thw' MISSING in batch! Qwen is blind! !!!")
+        else:
+            # print(f"debug post collate: thw{batch['image_grid_thw'].shape}")
+            pass
+
+        # print(batch['pixel_values'].shape)
+        # print(batch['input_ids'].shape)
         # 2. Extract padded input_ids
         # Shape: (Batch_Size, Seq_Len)
         input_ids = batch["input_ids"]
+
         # print(input_ids.shape)
         # print(batch['pixel_values'].shape)
-        if input_ids.shape[1]>=self.max_length:
-            print("error! sequence somehow too long!")
+        if input_ids.shape[1]>=self.length_warning:
+            print("warning! sequence too long!")
             print(f"input ids: {batch['input_ids'].shape}")
-            print(f"image shape: {batch['pixel_values'].shape}")
+            # print(f"image shape: {batch['pixel_values'].shape}")
+        else:
+            print(f"input id shape: {input_ids.shape}")
+            # print(f"image shape: {batch['pixel_values'].shape}")
+
         # 3. Apply our "State Machine" Masking
         # We pass the padded input_ids directly.
         # The function returns a tensor of the same shape with user tokens set to -100.

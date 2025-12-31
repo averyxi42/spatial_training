@@ -316,7 +316,7 @@ class AllPairsPoseLoss(nn.Module):
             # === 5. LOSSES ===
             
             # Translation (Smooth L1 over all pairs)
-            trans_error = F.smooth_l1_loss(p_t_aligned, g_t_flat, beta=0.1,reduce='none')
+            trans_error = F.smooth_l1_loss(p_t_aligned, g_t_flat, beta=0.1,reduction='none').mean(dim=-1) 
             total_loss_trans += (trans_error * weights).sum() / weights_sum
             
             # Rotation (Cosine over all pairs)

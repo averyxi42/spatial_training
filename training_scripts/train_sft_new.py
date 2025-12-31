@@ -1,26 +1,61 @@
+import torch
+import datasets
+from torch.utils.data import DataLoader
+from functools import partial
+from transformers.utils import is_datasets_available
+from transformers.trainer_utils import seed_worker
+from transformers import Trainer
+
 import os
+import sys
+import argparse
+from pathlib import Path
+from PIL import Image as PILImage
+def validate_episode_images(example):
+    """
+    Checks if ALL images in the episode's sequence can be opened.
+    Returns False if even one image is broken or missing.
+    """
+    # We access 'images' because we rename 'rgb_paths' -> 'images' earlier in the pipeline
+    image_paths = example.get("images", [])
+    
+    if not image_paths:
+        return False 
+    
+    for path in image_paths:
+        try:
+            with PILImage.open(path) as img:
+                img.verify() 
+        except:
+            return False
+    return True
+
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+sys.modules["vllm"] = None
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 import torch.nn as nn
-from transformers import AutoModelForImageTextToText, AutoTokenizer, TrainingArguments,AutoProcessor
+from transformers import AutoModelForImageTextToText, AutoProcessor
 from trl import SFTTrainer, SFTConfig
-from peft import LoraConfig, get_peft_model, TaskType
-from datasets import Dataset,load_dataset
-from PIL import Image as PILImage
-import os
+from peft import LoraConfig
 # export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 # --- CONFIGURATION ---
-MODEL_ID = "Aasdfip/hw_sft_9500"#"/Projects/SG_VLN_HumanData/SG-VLN/sft_pipeline/text_adapted_model"#,"Qwen/Qwen3-VL-2B-Instruct" # Or your specific VLM backbone
+MODEL_ID = "Aasdfip/qwen3_webnav_0.1" #,"Qwen/Qwen3-VL-2B-Instruct" # Or your specific VLM backbone
 TARGET_SEQ_LEN = 1024                  # The 'L' we are testing
 BATCH_SIZE = 1                         # The 'B' we are testing
 GRADIENT_CHECKPOINTING = True          # Standard for VLM/LLM training
 USE_FLASH_ATTN = True                  # Highly recommended for A100
 
-SYSTEM_TOKENS = 190
-TURN_TOKENS = 30
-ORIG_H = 480
-ORIG_W = 640
-TOTAL_BUDGET = 32000#34000
+
+TRAIN_DATASET_DIR = None
+EVAL_DATASET_DIR = None
+OUTPUT_DIR = "./dump/uniform_400step"
+EVAL_MAX_SAMPLES = 40
 
 def get_peak_memory_gb():
     """Helper to get peak GPU memory in GB"""
@@ -37,19 +72,20 @@ def preprocess_logits_for_metrics(logits, labels):
     # Argmax on GPU, return integer IDs
     return logits.argmax(dim=-1)
 
-from utils.training_utils import SpatialFeatureExtractor,get_image_token_indices
-from utils.pose import AllPairsPoseLoss
+
+from utils.training_utils import SpatialFeatureExtractor, get_image_token_indices
+from utils.pose import SfMPoseLoss
 class PoseTrainer(SFTTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Hook is ephemeral, so we keep it here. 
         # Layer -6 is a good choice (High semantics, but before final reasoning).
         self.spatial_extractor = SpatialFeatureExtractor(self.model, layer_index=-12)
-        self.pose_loss = AllPairsPoseLoss()
+        self.pose_loss = SfMPoseLoss()
         self.loss_weights = {
-        "loss_scale": 0.02,  # Down-weight the noisy scale loss
-        "loss_grav": 0.2,    # Gravity is a regularization, keep it small
-        "loss_rot": 1,     # Explicitly stating 1.0 is fine for clarity
+        "loss_scale": 0.015,  # Down-weight the noisy scale loss
+        "loss_grav": 1.0,    # Gravity is a regularization, keep it small
+        "loss_rot": 1.0,     # Explicitly stating 1.0 is fine for clarity
         "loss_trans": 0.7
     }
 
@@ -83,7 +119,7 @@ class PoseTrainer(SFTTrainer):
                 {
                     "params": spatial_head_params,
                     "weight_decay": self.args.weight_decay,
-                    "lr": 1e-4,  # <--- CRITICAL: High LR for the scratch head #1e-3 default
+                    "lr": 1e-3,  # <--- CRITICAL: High LR for the scratch head
                 },
                 {
                     "params": decay_parameters,
@@ -149,7 +185,7 @@ class PoseTrainer(SFTTrainer):
         if "spatial loss" not in self._metrics[mode]:
             self._metrics[mode]["spatial loss"] = []
         self._metrics[mode]["spatial loss"].append(spatial_loss_scalar.item())
-        self._metrics[mode]["lm_loss"].append(loss.item())
+        
         # Log individual components
         for k, v in loss_components_dict.items():
             if k not in self._metrics[mode]:
@@ -158,32 +194,55 @@ class PoseTrainer(SFTTrainer):
 
         return (total_loss, outputs) if return_outputs else total_loss
 
-from utils.collators import PoseVLMCollator
+from utils.collators import ActionMaskingVLMCollator
 from utils.data_misc import make_dynamic_resize_transform
-from utils.training_utils import PoseRegressionHead
 SYSTEM_TOKENS = 190
-TURN_TOKENS = 36
+TURN_TOKENS = 33
 ORIG_H = 480
 ORIG_W = 640
-TOTAL_BUDGET = 32000#34000
+TOTAL_BUDGET = 39000#34000
 dynamic_resize_transform = make_dynamic_resize_transform(SYSTEM_TOKENS,TURN_TOKENS,ORIG_H,ORIG_W,TOTAL_BUDGET-600)
+
+def parse_args():
+    p = argparse.ArgumentParser(description="SFT training (minimal CLI: only overrides hardcoded paths)")
+    p.add_argument("--model_id", type=str, default=MODEL_ID, help="HF model id or local path")
+    p.add_argument("--train_dataset_dir", type=str, default=TRAIN_DATASET_DIR, help="load_from_disk() dir")
+    p.add_argument(
+        "--eval_dataset_dir",
+        type=str,
+        default=EVAL_DATASET_DIR,
+        help="load_from_disk() dir (use empty string to disable eval)",
+    )
+    p.add_argument("--output_dir", type=str, default=OUTPUT_DIR, help="Trainer output_dir")
+    p.add_argument("--eval_max_samples", type=int, default=EVAL_MAX_SAMPLES, help="Eval subset size")
+    p.add_argument("--print_config", action="store_true", help="Print config then exit")
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
+
+    if args.print_config:
+        print(vars(args))
+        return
+
     print(f"--- Starting Memory Profile ---")
-    print(f"Model: {MODEL_ID}")
-    print(f"Target Seq Len: {TARGET_SEQ_LEN}")
+    print(f"Model: {args.model_id}")
     print(f"Batch Size: {BATCH_SIZE}")
     
     # 1. Load Model in bfloat16 (No quantization)
     print("Loading model...")
     model = AutoModelForImageTextToText.from_pretrained(
-        MODEL_ID,
+        args.model_id,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2" if USE_FLASH_ATTN else "eager",
-        device_map="auto",
+        attn_implementation="flash_attention_2", # Changed from flash_attention_2 to sdpa to avoid extra dependencies
+        # device_map="auto",
+        # Force single-GPU placement
+        device_map={"": 0} if torch.cuda.is_available() else None,
         # use_cache=False # Important for training with gradient checkpointing
     )
     model.enable_input_require_grads()
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
+    processor = AutoProcessor.from_pretrained(args.model_id)
     tokenizer = processor.tokenizer
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -196,70 +255,95 @@ def main():
                 # modules_to_save=["multi_modal_projector"],
                 modules_to_save=["spatial_head"], 
     )
-    model.spatial_head = PoseRegressionHead().to(model.device).to(torch.bfloat16)
-    # 2. MANUALLY LOAD HEAD WEIGHTS (The Fix)
-    # Check if we are resuming from a checkpoint provided in args
-    # (You might need to parse args.resume_from_checkpoint or set a variable)
-    resume_path = None#"Aasdfip/qwen3_webnav_0.1" # Or None if starting fresh
 
-    if os.path.exists(resume_path):
-        from safetensors.torch import load_file
-        print(f"\n☢️  NUCLEAR LOAD: Forcing head weights from {resume_path}...")
-        
-        # 1. Take a fingerprint of current (random) weights
-        before_fingerprint = model.spatial_head.global_mlp[0].weight.sum().item()
-        
-        # 2. Load State Dict
-        if os.path.exists(os.path.join(resume_path, "adapter_model.safetensors")):
-            state_dict = load_file(os.path.join(resume_path, "adapter_model.safetensors"))
+    # Load data from HF
+    from datasets import load_from_disk, load_dataset, Sequence, Image,Value
+    from utils.data_misc import decode_image_sequence
+    use_streaming = True
+    if not os.path.exists(args.train_dataset_dir) and "/" in args.train_dataset_dir:
+        print(f"Loading Train (Streaming): {args.train_dataset_dir}")
+        train_dataset = load_dataset(args.train_dataset_dir, split="train", streaming=use_streaming)
+        # IterableDataset needs .shuffle with buffer_size
+        if use_streaming:
+            train_dataset = train_dataset.shuffle(seed=42, buffer_size=1000)
+            train_dataset = train_dataset.map(decode_image_sequence)
+            # print(f"length of images in sample before dynamic resize: {len(next(iter(train_dataset))['images'])}")
+            # train_dataset = train_dataset.map(dynamic_resize_transform, batched=True,batch_size=1)
+            # new_features = train_dataset.features.copy()
+            # new_features["images"] = Sequence(Image())
+
+            # 3. Resize
+            train_dataset = train_dataset.map(
+                dynamic_resize_transform, 
+                batched=True, 
+                batch_size=1,
+                # features=new_features # Explicitly pass the new schema
+            )
+            
+            # print(f"length of images in sample after dynamic resize: {len(next(iter(train_dataset))['images'])}")
         else:
-            state_dict = torch.load(os.path.join(resume_path, "adapter_model.bin"), map_location="cpu")
-            
-        # 3. Clean Keys (The most likely culprit)
-        # PEFT saves as "base_model.model.spatial_head..."
-        # We need "mlp.0.weight" etc.
-        head_sd = {}
-        for k, v in state_dict.items():
-            if "spatial_head" in k:
-                # Strip all possible prefixes to get to the module root
-                clean_k = k.replace("base_model.model.spatial_head.", "")
-                clean_k = clean_k.replace("spatial_head.", "") 
-                head_sd[clean_k] = v
-        
-        if len(head_sd) == 0:
-            raise ValueError("Nuclear Load Failed: No spatial_head keys in checkpoint!")
+            train_dataset = train_dataset.shuffle(seed=42)
+            train_dataset = train_dataset.cast_column("images", Sequence(Image(decode=True)))
+            train_dataset.set_transform(dynamic_resize_transform)
 
-        # 4. Load
-        missing, unexpected = model.spatial_head.load_state_dict(head_sd, strict=True)
-        
-        # 5. Verify Fingerprint
-        after_fingerprint = model.spatial_head.global_mlp[0].weight.sum().item()
-        
-        if before_fingerprint == after_fingerprint:
-            raise RuntimeError("CRITICAL: Weights did not change after loading! Is the checkpoint empty/random?")
+        # train_dataset = train_dataset.filter(lambda x: len(x['images']) <= 70)
+        # IterableDataset doesn't support set_transform directly, use map
+
+    else:
+        print(f"Loading Train (Disk): {args.train_dataset_dir}")
+        train_dataset = load_from_disk(args.train_dataset_dir)
+        train_dataset = train_dataset.cast_column('images',Sequence(Value(dtype='string')))
+        train_dataset = train_dataset.filter(validate_episode_images, num_proc=32, desc="Img Verify",batch_size=10)
+
+        # train_dataset = train_dataset.filter(lambda example:len(example['action_sequence'])>396,batch_size=10,writer_batch_size=10,num_proc=16)
+        train_dataset = train_dataset.cast_column("images", Sequence(Image(decode=True)))
+        train_dataset.set_transform(dynamic_resize_transform)
+    if args.eval_dataset_dir:
+        if not os.path.exists(args.eval_dataset_dir) and "/" in args.eval_dataset_dir:
+            print(f"Loading Eval (Streaming): {args.eval_dataset_dir}")
+            # Try to load 'validation' split, or fallback to 'train' if needed (user provided specific val repo)
+            try:
+                eval_dataset = load_dataset(args.eval_dataset_dir, split="validation", streaming=use_streaming)
+            except:
+                eval_dataset = load_dataset(args.eval_dataset_dir, split="train", streaming=use_streaming)
             
-        print(f"✅ Nuclear Load Success.")
-        print(f"   Fingerprint changed: {before_fingerprint:.4f} -> {after_fingerprint:.4f}")
-        print(f"   Missing Keys: {missing}")
-        print(f"   Unexpected Keys: {unexpected}\n")
-    from datasets import load_from_disk,load_dataset
-    # train_dataset = load_from_disk("/Projects/SG_VLN_HumanData/spatial_training/data/habitat_web_pose_v2/train") 
-    train_dataset = load_dataset('Aasdfip/habitat_web_pose_train')['train']
-    train_dataset.set_transform(dynamic_resize_transform)
-    
-    eval_dataset = load_dataset('Aasdfip/habitat_web_pose_val')['train']
-    # eval_dataset = load_from_disk("/Projects/SG_VLN_HumanData/spatial_training/data/habitat_web_pose_v2/validation").select(range(40)) 
-    eval_dataset.set_transform(dynamic_resize_transform)
+            if use_streaming:
+                eval_dataset = eval_dataset.map(decode_image_sequence)
+                print(f"length of images in sample before dynamic resize: {len(next(iter(eval_dataset))['images'])}")
+                eval_dataset = eval_dataset.map(dynamic_resize_transform, batched=True,batch_size=1)
+                print(f"length of images in sample: {len(next(iter(eval_dataset))['images'])}")
+            else:
+                eval_dataset.set_transform(dynamic_resize_transform)
+            # For eval, we need a finite number of samples
+            if args.eval_max_samples:
+                eval_dataset = eval_dataset.take(args.eval_max_samples)
+            
+        else:
+            print(f"Loading Eval (Disk): {args.eval_dataset_dir}")
+            eval_dataset = load_from_disk(args.eval_dataset_dir)
+            eval_dataset = eval_dataset.cast_column('images',Sequence(Value(dtype='string')))
+            eval_dataset = eval_dataset.filter(validate_episode_images, num_proc=32, desc="Img Verify",batch_size=10)
+
+            if args.eval_max_samples is not None and args.eval_max_samples > 0:
+                eval_dataset = eval_dataset.select(range(min(args.eval_max_samples, len(eval_dataset))))
+
+            eval_dataset = eval_dataset.cast_column("images", Sequence(Image()))
+            eval_dataset.set_transform(dynamic_resize_transform)
+    else:
+        eval_dataset = None
     # eval_dataset = None
 
     # 4. Training Arguments
     training_args = SFTConfig(
-        output_dir="/Projects/SG_VLN_HumanData/spatial_training/dump/allpose_training_v2",
+        accelerator_config={
+            "dispatch_batches":False
+        },
+        output_dir=args.output_dir,
         # run_name="qwen-vln-action-dropout",
         save_strategy="steps",        # Save checkpoints frequently
-        save_steps=300,          
+        save_steps=100,
                   # Save every 500 steps
-        eval_strategy="steps",        # Check validation loss periodically
+        eval_strategy="steps" if eval_dataset is not None else "no",
         eval_steps=100,               # Frequency: Every 100 steps
         per_device_eval_batch_size=1,
         
@@ -272,24 +356,29 @@ def main():
         bf16=True,     # Use bfloat16 for A100
         gradient_checkpointing=GRADIENT_CHECKPOINTING,
         # gradient_checkpointing_kwargs={"use_reentrant": False},
-        max_steps=40000,   # We only need a few steps to hit peak memory
+        max_steps=10000,   # We only need a few steps to hit peak memory
         report_to="tensorboard",
         # dataset_text_field="text",
-        shuffle_dataset=True,
+
 
         assistant_only_loss=False,
         optim="paged_adamw_8bit",
         # dataloader_num_workers=8
-        warmup_steps=12,
+
         remove_unused_columns=False,
-        resume_from_checkpoint=resume_path
+        # resume_from_checkpoint='/Projects/SG_VLN_HumanData/contrastive_training_5view_mlp/checkpoint-4050'
         # processing_class = processor
     )
 
     # 5. Initialize Trainer
-    trainer = PoseTrainer(
+    trainer = SFTTrainer(
         model=model,
-        data_collator = PoseVLMCollator(processor=processor,max_length=TOTAL_BUDGET,dropout=0.6),
+        data_collator=ActionMaskingVLMCollator(
+            processor=processor,
+            length_warning = TOTAL_BUDGET,
+            # max_length=TOTAL_BUDGET,
+            dropout=0.6,
+        ),
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,

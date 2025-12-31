@@ -13,6 +13,7 @@ import torch.nn as nn
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from trl import SFTTrainer, SFTConfig
 from peft import LoraConfig
+from utils.data_misc import decode_image_sequence
 # export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 # --- CONFIGURATION ---
 MODEL_ID = "/Projects/SG_VLN_HumanData/SG-VLN/sft_pipeline/text_adapted_model"#,"Qwen/Qwen3-VL-2B-Instruct" # Or your specific VLM backbone

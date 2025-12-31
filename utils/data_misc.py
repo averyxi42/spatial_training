@@ -2,6 +2,7 @@
 import numpy as np
 import math
 from PIL import Image as PILImage
+import io
 def get_max_scaling_factor(T: int,N: int=190, M: int=29, H: int=480, W: int=640, K: int=37060) -> float:
     """
     Calculates the maximum image scaling factor to fit a VLM history within a token budget.
@@ -63,7 +64,7 @@ def get_max_scaling_factor(T: int,N: int=190, M: int=29, H: int=480, W: int=640,
     return round(best_scale, 4)
 
 
-def make_dynamic_resize_transform(N: int=190, M: int=29, H: int=480, W: int=640, K: int=37060):
+def make_dynamic_resize_transform(N: int=190, M: int=29, H: int=480, W: int=640, K: int=37060,min_visual_tokens=70):
     """
     Calculates the maximum image scaling factor to fit a VLM history within a token budget.
 
@@ -100,8 +101,12 @@ def make_dynamic_resize_transform(N: int=190, M: int=29, H: int=480, W: int=640,
             W=W, 
             T=t, 
             K=K
-        )
+            )
 
+            min_scale = np.sqrt(min_visual_tokens/(H*W/32/32)) #hard coded, qwen doesn't allow <70 img tok
+            if scale < min_scale:
+                # print("hit image downscale limit.")
+                scale = min_scale
             
             # C. Calculate new integer dimensions
             new_w = int(W * scale)
@@ -147,4 +152,24 @@ def filter_corrupt_images(example):
         # Print path so you know what's broken
         print(f"Found broken image in episode, removing.") 
         return False
-import numpy as np
+
+
+
+def decode_image_sequence(example):
+    # 'images' is a list of dictionaries like {"bytes": b"...", "path": ...}
+    # We iterate through the sequence and decode each one
+    decoded_sequence = []
+    for img_dict in example["images"]:
+        if img_dict.get("bytes"):
+            # Decode from bytes (standard for streaming parquet/arrow)
+            image = PILImage.open(io.BytesIO(img_dict["bytes"]))
+        else:
+            # Fallback to path if bytes are empty
+            image = PILImage.open(img_dict["path"])
+            # FORCE RGB CONVERSION
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        decoded_sequence.append(image)
+        
+    example["images"] = decoded_sequence
+    return example

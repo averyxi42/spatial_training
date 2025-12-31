@@ -228,6 +228,6 @@ python build_pose_dataset.py \
   --image_root /Projects/SG_VLN_HumanData/SG-VLN/data/datasets/objectnav/objectnav_mp3d_thda_70k/objectnav_images \
   --output_dir /Projects/SG_VLN_HumanData/spatial_training/data/habitat_web_pose_v2 \
   --val_scene_count 8 \
-  --max_length 250 \
+  --max_length 400 \
   --num_proc 16
 '''
