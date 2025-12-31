@@ -10,17 +10,17 @@ from PIL import Image as PILImage
 import os
 # export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 # --- CONFIGURATION ---
-MODEL_ID = "Aasdfip/hw_sft_9500"#"/Projects/SG_VLN_HumanData/SG-VLN/sft_pipeline/text_adapted_model"#,"Qwen/Qwen3-VL-2B-Instruct" # Or your specific VLM backbone
+MODEL_ID = "Aasdfip/qwen3_webnav_0.1"#"/Projects/SG_VLN_HumanData/SG-VLN/sft_pipeline/text_adapted_model"#,"Qwen/Qwen3-VL-2B-Instruct" # Or your specific VLM backbone
 TARGET_SEQ_LEN = 1024                  # The 'L' we are testing
 BATCH_SIZE = 1                         # The 'B' we are testing
 GRADIENT_CHECKPOINTING = True          # Standard for VLM/LLM training
 USE_FLASH_ATTN = True                  # Highly recommended for A100
 
 SYSTEM_TOKENS = 190
-TURN_TOKENS = 30
+TURN_TOKENS = 33
 ORIG_H = 480
 ORIG_W = 640
-TOTAL_BUDGET = 32000#34000
+TOTAL_BUDGET = 39000#34000
 
 def get_peak_memory_gb():
     """Helper to get peak GPU memory in GB"""
@@ -161,11 +161,7 @@ class PoseTrainer(SFTTrainer):
 from utils.collators import PoseVLMCollator
 from utils.data_misc import make_dynamic_resize_transform
 from utils.training_utils import PoseRegressionHead
-SYSTEM_TOKENS = 190
-TURN_TOKENS = 36
-ORIG_H = 480
-ORIG_W = 640
-TOTAL_BUDGET = 32000#34000
+
 dynamic_resize_transform = make_dynamic_resize_transform(SYSTEM_TOKENS,TURN_TOKENS,ORIG_H,ORIG_W,TOTAL_BUDGET-600)
 def main():
     print(f"--- Starting Memory Profile ---")
@@ -202,7 +198,7 @@ def main():
     # (You might need to parse args.resume_from_checkpoint or set a variable)
     resume_path = None#"Aasdfip/qwen3_webnav_0.1" # Or None if starting fresh
 
-    if os.path.exists(resume_path):
+    if resume_path and os.path.exists(resume_path):
         from safetensors.torch import load_file
         print(f"\n☢️  NUCLEAR LOAD: Forcing head weights from {resume_path}...")
         
@@ -243,18 +239,18 @@ def main():
         print(f"   Missing Keys: {missing}")
         print(f"   Unexpected Keys: {unexpected}\n")
     from datasets import load_from_disk,load_dataset
-    # train_dataset = load_from_disk("/Projects/SG_VLN_HumanData/spatial_training/data/habitat_web_pose_v2/train") 
-    train_dataset = load_dataset('Aasdfip/habitat_web_pose_train')['train']
+    train_dataset = load_from_disk("~/scratch/qixin/dump/sft_datasets/interrim/train") 
+    # train_dataset = load_dataset('Aasdfip/habitat_web_pose_train')['train']
     train_dataset.set_transform(dynamic_resize_transform)
     
-    eval_dataset = load_dataset('Aasdfip/habitat_web_pose_val')['train']
-    # eval_dataset = load_from_disk("/Projects/SG_VLN_HumanData/spatial_training/data/habitat_web_pose_v2/validation").select(range(40)) 
+    # eval_dataset = load_dataset('Aasdfip/habitat_web_pose_val')['train']
+    eval_dataset = load_from_disk("~/scratch/qixin/dump/sft_datasets/interrim/validation").select(range(40)) 
     eval_dataset.set_transform(dynamic_resize_transform)
     # eval_dataset = None
 
     # 4. Training Arguments
     training_args = SFTConfig(
-        output_dir="/Projects/SG_VLN_HumanData/spatial_training/dump/allpose_training_v2",
+        output_dir="~/scratch/qixin/dump/training_results/train_pose_all_l400_interrim",
         # run_name="qwen-vln-action-dropout",
         save_strategy="steps",        # Save checkpoints frequently
         save_steps=300,          
@@ -289,7 +285,7 @@ def main():
     # 5. Initialize Trainer
     trainer = PoseTrainer(
         model=model,
-        data_collator = PoseVLMCollator(processor=processor,max_length=TOTAL_BUDGET,dropout=0.6),
+        data_collator = PoseVLMCollator(processor=processor,max_length=None,dropout=0.6),
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,

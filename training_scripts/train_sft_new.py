@@ -238,7 +238,7 @@ def main():
         attn_implementation="flash_attention_2", # Changed from flash_attention_2 to sdpa to avoid extra dependencies
         # device_map="auto",
         # Force single-GPU placement
-        device_map={"": 0} if torch.cuda.is_available() else None,
+        # device_map={"": 0} if torch.cuda.is_available() else None,
         # use_cache=False # Important for training with gradient checkpointing
     )
     model.enable_input_require_grads()
@@ -260,7 +260,7 @@ def main():
     from datasets import load_from_disk, load_dataset, Sequence, Image,Value
     from utils.data_misc import decode_image_sequence
     use_streaming = True
-    if not os.path.exists(args.train_dataset_dir) and "/" in args.train_dataset_dir:
+    if not os.path.exists(os.path.expanduser(args.train_dataset_dir)) and "/" in args.train_dataset_dir:
         print(f"Loading Train (Streaming): {args.train_dataset_dir}")
         train_dataset = load_dataset(args.train_dataset_dir, split="train", streaming=use_streaming)
         # IterableDataset needs .shuffle with buffer_size
@@ -299,7 +299,7 @@ def main():
         train_dataset = train_dataset.cast_column("images", Sequence(Image(decode=True)))
         train_dataset.set_transform(dynamic_resize_transform)
     if args.eval_dataset_dir:
-        if not os.path.exists(args.eval_dataset_dir) and "/" in args.eval_dataset_dir:
+        if not os.path.exists(os.path.expanduser(args.eval_dataset_dir)) and "/" in args.eval_dataset_dir:
             print(f"Loading Eval (Streaming): {args.eval_dataset_dir}")
             # Try to load 'validation' split, or fallback to 'train' if needed (user provided specific val repo)
             try:
