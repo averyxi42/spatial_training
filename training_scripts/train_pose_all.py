@@ -1,5 +1,32 @@
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# If this is not set, it defaults to the last entity you logged into, which might be wrong.
+# os.environ["WANDB_ENTITY"] = "axi42" 
+
+# --- 2. Project Organization ---
+# The name of the project as it will appear in the dashboard.
+os.environ["WANDB_PROJECT"] = "all_pose_uniform" 
+
+# --- 3. Artifact Logging (Optional but recommended) ---
+# "checkpoint" = log model weights every time the Trainer saves a checkpoint.
+# "end"        = log the model only at the end of training.
+# "false"      = disable model artifact logging (saves storage).
+os.environ["WANDB_LOG_MODEL"] = "false"
+
+# --- 4. Watch Gradients (Optional) ---
+# "gradients" = log histograms of gradients (good for debugging exploding grads).
+# "all"       = log gradients and parameters (can slow down training).
+# "false"     = default.
+os.environ["WANDB_WATCH"] = "false"
+from pathlib import Path
+import sys
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+
 import torch
 import torch.nn as nn
 from transformers import AutoModelForImageTextToText, AutoTokenizer, TrainingArguments,AutoProcessor
@@ -10,7 +37,7 @@ from PIL import Image as PILImage
 import os
 # export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 # --- CONFIGURATION ---
-MODEL_ID = "Aasdfip/qwen3_webnav_0.1"#"/Projects/SG_VLN_HumanData/SG-VLN/sft_pipeline/text_adapted_model"#,"Qwen/Qwen3-VL-2B-Instruct" # Or your specific VLM backbone
+MODEL_ID = "Aasdfip/hw_sft_9500"#"/Projects/SG_VLN_HumanData/SG-VLN/sft_pipeline/text_adapted_model"#,"Qwen/Qwen3-VL-2B-Instruct" # Or your specific VLM backbone
 TARGET_SEQ_LEN = 1024                  # The 'L' we are testing
 BATCH_SIZE = 1                         # The 'B' we are testing
 GRADIENT_CHECKPOINTING = True          # Standard for VLM/LLM training
@@ -130,8 +157,8 @@ class PoseTrainer(SFTTrainer):
         # 4. Spatial Forward
         batch_image_indices, _ = get_image_token_indices(inputs['input_ids'], self.processing_class)
         pred_t, pred_q = base_model.spatial_head(intermediate_hidden, batch_image_indices)
-        pred_t = pred_t.float()
-        pred_q = pred_q.float()
+        # pred_t = pred_t.float()
+        # pred_q = pred_q.float()
         # 5. Compute Spatial Loss Components
         loss_components_dict = self.pose_loss.forward(pred_t, pred_q, gt_t, gt_q, batch_image_counts)
         
@@ -175,7 +202,7 @@ def main():
         MODEL_ID,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2" if USE_FLASH_ATTN else "eager",
-        device_map="auto",
+        # device_map="auto",
         # use_cache=False # Important for training with gradient checkpointing
     )
     model.enable_input_require_grads()
@@ -196,9 +223,9 @@ def main():
     # 2. MANUALLY LOAD HEAD WEIGHTS (The Fix)
     # Check if we are resuming from a checkpoint provided in args
     # (You might need to parse args.resume_from_checkpoint or set a variable)
-    resume_path = None#"Aasdfip/qwen3_webnav_0.1" # Or None if starting fresh
+    resume_path = "/home/huyu/scratch/spatial_training/dump/allpose_training/checkpoint-15600"#"Aasdfip/qwen3_webnav_0.1" # Or None if starting fresh
 
-    if resume_path and os.path.exists(resume_path):
+    if resume_path:
         from safetensors.torch import load_file
         print(f"\n☢️  NUCLEAR LOAD: Forcing head weights from {resume_path}...")
         
@@ -239,21 +266,21 @@ def main():
         print(f"   Missing Keys: {missing}")
         print(f"   Unexpected Keys: {unexpected}\n")
     from datasets import load_from_disk,load_dataset
-    train_dataset = load_from_disk("~/scratch/qixin/dump/sft_datasets/interrim/train") 
+    train_dataset = load_from_disk("~/scratch/qixin/dump/sft_datasets/uniform_320/train") 
     # train_dataset = load_dataset('Aasdfip/habitat_web_pose_train')['train']
     train_dataset.set_transform(dynamic_resize_transform)
     
     # eval_dataset = load_dataset('Aasdfip/habitat_web_pose_val')['train']
-    eval_dataset = load_from_disk("~/scratch/qixin/dump/sft_datasets/interrim/validation").select(range(40)) 
+    eval_dataset = load_from_disk("~/scratch/qixin/dump/sft_datasets/uniform_320/validation").select(range(40)) 
     eval_dataset.set_transform(dynamic_resize_transform)
     # eval_dataset = None
 
     # 4. Training Arguments
     training_args = SFTConfig(
-        output_dir="~/scratch/qixin/dump/training_results/train_pose_all_l400_interrim",
-        # run_name="qwen-vln-action-dropout",
+        output_dir="~/scratch/qixin/dump/training_results/train_pose_all_uniform_bf16",
+        # run_name="train_pose_all_l400_nonum",
         save_strategy="steps",        # Save checkpoints frequently
-        save_steps=300,          
+        save_steps=100,          
                   # Save every 500 steps
         eval_strategy="steps",        # Check validation loss periodically
         eval_steps=100,               # Frequency: Every 100 steps
@@ -267,15 +294,15 @@ def main():
         packing=False, # FALSE is critical to strictly enforce batch_size x seq_len shape
         bf16=True,     # Use bfloat16 for A100
         gradient_checkpointing=GRADIENT_CHECKPOINTING,
-        # gradient_checkpointing_kwargs={"use_reentrant": False},
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         max_steps=40000,   # We only need a few steps to hit peak memory
-        report_to="tensorboard",
+        report_to="wandb",
         # dataset_text_field="text",
         shuffle_dataset=True,
 
         assistant_only_loss=False,
         optim="paged_adamw_8bit",
-        # dataloader_num_workers=8
+        dataloader_num_workers=3,
         warmup_steps=12,
         remove_unused_columns=False,
         resume_from_checkpoint=resume_path
