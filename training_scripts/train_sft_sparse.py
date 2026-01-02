@@ -4,8 +4,8 @@ from torch.utils.data import DataLoader
 from functools import partial
 from transformers.utils import is_datasets_available
 from transformers.trainer_utils import seed_worker
-from transformers import Trainer
-
+from transformers import AutoConfig, Trainer
+from utils.modeling import Qwen3VLSparseForConditionalGeneration
 import os
 import sys
 import argparse
@@ -42,7 +42,9 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from trl import SFTTrainer, SFTConfig
+from utils.trainers import PrunedSFTTrainer
 from peft import LoraConfig
+
 # export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 # --- CONFIGURATION ---
 MODEL_ID = "Aasdfip/qwen3_webnav_0.1" #,"Qwen/Qwen3-VL-2B-Instruct" # Or your specific VLM backbone
@@ -233,14 +235,35 @@ def main():
     
     # 1. Load Model in bfloat16 (No quantization)
     print("Loading model...")
-    model = AutoModelForImageTextToText.from_pretrained(
-        args.model_id,
+    # model = AutoModelForImageTextToText.from_pretrained(
+    #     args.model_id,
+    #     torch_dtype=torch.bfloat16,
+    #     attn_implementation="flash_attention_2", # Changed from flash_attention_2 to sdpa to avoid extra dependencies
+    #     # device_map="auto",
+    #     # Force single-GPU placement
+    #     device_map={"": 0} if torch.cuda.is_available() else None,
+    #     # use_cache=False # Important for training with gradient checkpointing
+    # )
+
+    
+    # 2. Instantiate our Custom Sparse Class
+    # This creates the model with random weights but the correct sparse architecture
+    # model = Qwen3VLSparseForConditionalGeneration(config)
+    
+    # 3. Load Pretrained Weights
+    # We use from_pretrained on our class, pointing to the original model directory.
+    # Because our attribute names (self.model, self.text_model) match the original,
+    # the weights map 1:1.
+    config = AutoConfig.from_pretrained(args.model_id, trust_remote_code=True)
+
+    model = Qwen3VLSparseForConditionalGeneration.from_pretrained(
+        args.model_id, 
+        config=config,
+        device_map={"": 0},
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2", # Changed from flash_attention_2 to sdpa to avoid extra dependencies
-        # device_map="auto",
-        # Force single-GPU placement
-        # device_map={"": 0} if torch.cuda.is_available() else None,
-        # use_cache=False # Important for training with gradient checkpointing
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+        attn_implementation = "flash_attention_2",
     )
     model.enable_input_require_grads()
     processor = AutoProcessor.from_pretrained(args.model_id)
@@ -285,7 +308,7 @@ def main():
         else:
             train_dataset = train_dataset.shuffle(seed=42)
             train_dataset = train_dataset.cast_column("images", Sequence(Image(decode=True)))
-            train_dataset.set_transform(dynamic_resize_transform)
+            # train_dataset.set_transform(dynamic_resize_transform)
 
         # train_dataset = train_dataset.filter(lambda x: len(x['images']) <= 70)
         # IterableDataset doesn't support set_transform directly, use map
@@ -298,7 +321,7 @@ def main():
 
         # train_dataset = train_dataset.filter(lambda example:len(example['action_sequence'])>396,batch_size=10,writer_batch_size=10,num_proc=16)
         train_dataset = train_dataset.cast_column("images", Sequence(Image(decode=True)))
-        train_dataset.set_transform(dynamic_resize_transform)
+        # train_dataset.set_transform(dynamic_resize_transform)
     if args.eval_dataset_dir:
         if not os.path.exists(os.path.expanduser(args.eval_dataset_dir)) and "/" in args.eval_dataset_dir:
             print(f"Loading Eval (Streaming): {args.eval_dataset_dir}")
@@ -314,7 +337,8 @@ def main():
                 eval_dataset = eval_dataset.map(dynamic_resize_transform, batched=True,batch_size=1)
                 print(f"length of images in sample: {len(next(iter(eval_dataset))['images'])}")
             else:
-                eval_dataset.set_transform(dynamic_resize_transform)
+                pass
+                # eval_dataset.set_transform(dynamic_resize_transform)
             # For eval, we need a finite number of samples
             if args.eval_max_samples:
                 eval_dataset = eval_dataset.take(args.eval_max_samples)
@@ -329,7 +353,7 @@ def main():
             eval_dataset = eval_dataset.filter(validate_episode_images, num_proc=32, desc="Img Verify",batch_size=10)
 
             eval_dataset = eval_dataset.cast_column("images", Sequence(Image()))
-            eval_dataset.set_transform(dynamic_resize_transform)
+            # eval_dataset.set_transform(dynamic_resize_transform)
     else:
         eval_dataset = None
     # eval_dataset = None
@@ -372,7 +396,7 @@ def main():
     )
 
     # 5. Initialize Trainer
-    trainer = SFTTrainer(
+    trainer = PrunedSFTTrainer(
         model=model,
         data_collator=ActionMaskingVLMCollator(
             processor=processor,

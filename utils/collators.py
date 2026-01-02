@@ -2,6 +2,8 @@ import torch
 from dataclasses import dataclass
 from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
 import torch
+from utils.bev_utils import *
+
 
 # Apply to dataset
 def mask_user_turns(input_ids, pad_token_id=151643):
@@ -184,7 +186,9 @@ class ActionMaskingVLMCollator(DataCollatorForVisionLanguageModeling):
     
 @dataclass 
 class PoseVLMCollator(ActionMaskingVLMCollator):
+
     def torch_call(self, examples):
+        
         # 1. Run standard VLM collation (Text + Images + Masking)
         batch = super().torch_call(examples)
 
@@ -238,6 +242,38 @@ class PoseVLMCollator(ActionMaskingVLMCollator):
             batch['gt_t'] = torch.empty(0, 3)
             batch['gt_q'] = torch.empty(0, 4)
             batch['batch_image_counts'] = torch.empty(0, dtype=torch.long)
+
+        return batch
+#        batch['vp_ids'] = torch.tensor([vp for ex in examples for vp in ex['vp_ids']], dtype=torch.long)
+
+
+@dataclass 
+class PcdVLMCollator(ActionMaskingVLMCollator):
+    canvas_size:int=250
+    def torch_call(self, examples):
+
+        # 1. Run standard VLM collation (Text + Images + Masking)
+        # print(examples)
+        keys = ['messages','images']
+        batch = super().torch_call([{k:example[k] for k in keys} for example in examples])
+        maps = []
+        for example in examples:
+            # batch['']
+            mats = pos_rots_to_matrix(np.array(example['pos_rots'])) @ get_cv_to_habitat_correction()
+            # rgbs = np.array(ds[ep_idx]['rgb_sequence'])
+            depths = load_depths(example)
+          
+            divisor = 1
+            ps = 32 //divisor
+            points = depth_to_pointcloud(depths,fov_degrees=79)
+            patch_coords = patch_average_einops(points,patch_size=ps)
+            patch_coords_world = transform_points_batch(patch_coords,mats)
+            patch_coords_discrete = (patch_coords_world/0.15).astype(int)
+            pc_pt = torch.tensor(patch_coords_discrete)
+            maps.append(get_thw(pc_pt))
+
+        pos_ids = get_pos_id(batch['input_ids'],torch.stack(maps),self.processor,canvas_size=self.canvas_size)
+        batch['position_ids'] = pos_ids
 
         return batch
 #        batch['vp_ids'] = torch.tensor([vp for ex in examples for vp in ex['vp_ids']], dtype=torch.long)
