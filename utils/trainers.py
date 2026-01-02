@@ -128,44 +128,44 @@ class PrunedSFTTrainer(SFTTrainer):
         #     self._total_train_tokens += num_tokens_in_batch
         # self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
 
-        # # Compute Accuracy
-        # if self.args.use_liger_kernel:
-        #     # Liger handles its own accuracy internally, assuming it received pruned inputs inside forward
-        #     token_accuracy = self.accelerator.gather_for_metrics(outputs.token_accuracy).mean().item()
-        #     self._metrics[mode]["mean_token_accuracy"].append(token_accuracy)
-        # else:
-        #     with torch.no_grad():
-        #         if "shift_labels" in inputs:
-        #             shift_logits = outputs.logits.contiguous()
-        #             shift_labels = inputs["shift_labels"]
-        #         else:
-        #             shift_logits = outputs.logits[..., :-1, :].contiguous()
-        #             shift_labels = labels[..., 1:].contiguous()
+        # Compute Accuracy
+        if self.args.use_liger_kernel:
+            # Liger handles its own accuracy internally, assuming it received pruned inputs inside forward
+            token_accuracy = self.accelerator.gather_for_metrics(outputs.token_accuracy).mean().item()
+            self._metrics[mode]["mean_token_accuracy"].append(token_accuracy)
+        else:
+            with torch.no_grad():
+                if "shift_labels" in inputs:
+                    shift_logits = outputs.logits.contiguous()
+                    shift_labels = inputs["shift_labels"]
+                else:
+                    shift_logits = outputs.logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
 
-        #         if (
-        #             self.num_virtual_tokens > 0
-        #             and model.peft_config[model.active_adapter].peft_type != PeftType.PREFIX_TUNING
-        #         ):
-        #             shift_logits = shift_logits[:, self.num_virtual_tokens :, :]
+                if (
+                    self.num_virtual_tokens > 0
+                    and model.peft_config[model.active_adapter].peft_type != PeftType.PREFIX_TUNING
+                ):
+                    shift_logits = shift_logits[:, self.num_virtual_tokens :, :]
 
-        #         # Shape Safety Check before argmax
-        #         min_len = min(shift_logits.shape[1], shift_labels.shape[1])
-        #         shift_logits = shift_logits[:, :min_len, :]
-        #         shift_labels = shift_labels[:, :min_len]
+                # Shape Safety Check before argmax
+                min_len = min(shift_logits.shape[1], shift_labels.shape[1])
+                shift_logits = shift_logits[:, :min_len, :]
+                shift_labels = shift_labels[:, :min_len]
 
-        #         predictions = shift_logits.argmax(dim=-1)
-        #         mask = shift_labels != -100
+                predictions = shift_logits.argmax(dim=-1)
+                mask = shift_labels != -100
 
-        #         correct_predictions = (predictions == shift_labels) & mask
-        #         total_tokens = mask.sum()
-        #         correct_tokens = correct_predictions.sum()
+                correct_predictions = (predictions == shift_labels) & mask
+                total_tokens = mask.sum()
+                correct_tokens = correct_predictions.sum()
 
-        #         correct_tokens = self.accelerator.gather_for_metrics(correct_tokens)
-        #         total_tokens = self.accelerator.gather_for_metrics(total_tokens)
+                correct_tokens = self.accelerator.gather_for_metrics(correct_tokens)
+                total_tokens = self.accelerator.gather_for_metrics(total_tokens)
 
-        #         total_sum = total_tokens.sum()
-        #         accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
-        #         self._metrics[mode]["mean_token_accuracy"].append(accuracy)
+                total_sum = total_tokens.sum()
+                accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
+                self._metrics[mode]["mean_token_accuracy"].append(accuracy)
 
         # if self.aux_loss_enabled:
         #     aux_loss = outputs.aux_loss
