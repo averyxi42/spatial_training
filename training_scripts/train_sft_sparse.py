@@ -218,6 +218,7 @@ def parse_args():
     p.add_argument("--output_dir", type=str, default=OUTPUT_DIR, help="Trainer output_dir")
     p.add_argument("--eval_max_samples", type=int, default=EVAL_MAX_SAMPLES, help="Eval subset size")
     p.add_argument("--print_config", action="store_true", help="Print config then exit")
+    p.add_argument("--resume_path", type=str, default="",help = "checkpoint to resume")
     return p.parse_args()
 
 
@@ -283,7 +284,7 @@ def main():
     from datasets import load_from_disk, load_dataset, Sequence, Image,Value
     from utils.data_misc import decode_image_sequence
     use_streaming = True
-    if not os.path.exists(args.train_dataset_dir) and "/" in args.train_dataset_dir:
+    if not os.path.exists(os.path.expanduser(args.train_dataset_dir)) and "/" in args.train_dataset_dir:
         print(f"Loading Train (Streaming): {args.train_dataset_dir}")
         train_dataset = load_dataset(args.train_dataset_dir, split="train", streaming=use_streaming)
         # IterableDataset needs .shuffle with buffer_size
@@ -315,14 +316,14 @@ def main():
     else:
         print(f"Loading Train (Disk): {args.train_dataset_dir}")
         train_dataset = load_from_disk(args.train_dataset_dir)
-        train_dataset = train_dataset.cast_column('images',Sequence(Value(dtype='string')))
-        train_dataset = train_dataset.filter(validate_episode_images, num_proc=32, desc="Img Verify",batch_size=10)
+        # train_dataset = train_dataset.cast_column('images',Sequence(Value(dtype='string')))
+        # train_dataset = train_dataset.filter(validate_episode_images, num_proc=32, desc="Img Verify",batch_size=10)
 
         # train_dataset = train_dataset.filter(lambda example:len(example['action_sequence'])>396,batch_size=10,writer_batch_size=10,num_proc=16)
         train_dataset = train_dataset.cast_column("images", Sequence(Image(decode=True)))
         # train_dataset.set_transform(dynamic_resize_transform)
     if args.eval_dataset_dir:
-        if not os.path.exists(args.eval_dataset_dir) and "/" in args.eval_dataset_dir:
+        if not os.path.exists(os.path.expanduser(args.eval_dataset_dir)) and "/" in args.eval_dataset_dir:
             print(f"Loading Eval (Streaming): {args.eval_dataset_dir}")
             # Try to load 'validation' split, or fallback to 'train' if needed (user provided specific val repo)
             try:
@@ -346,10 +347,10 @@ def main():
             print(f"Loading Eval (Disk): {args.eval_dataset_dir}")
             eval_dataset = load_from_disk(args.eval_dataset_dir)
             eval_dataset = eval_dataset.cast_column('images',Sequence(Value(dtype='string')))
-            eval_dataset = eval_dataset.filter(validate_episode_images, num_proc=32, desc="Img Verify",batch_size=10)
 
             if args.eval_max_samples is not None and args.eval_max_samples > 0:
                 eval_dataset = eval_dataset.select(range(min(args.eval_max_samples, len(eval_dataset))))
+            eval_dataset = eval_dataset.filter(validate_episode_images, num_proc=32, desc="Img Verify",batch_size=10)
 
             eval_dataset = eval_dataset.cast_column("images", Sequence(Image()))
             # eval_dataset.set_transform(dynamic_resize_transform)
@@ -379,15 +380,15 @@ def main():
         packing=False, # FALSE is critical to strictly enforce batch_size x seq_len shape
         bf16=True,     # Use bfloat16 for A100
         gradient_checkpointing=GRADIENT_CHECKPOINTING,
-        # gradient_checkpointing_kwargs={"use_reentrant": False},
-        max_steps=10000,   # We only need a few steps to hit peak memory
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        max_steps=60000,   # We only need a few steps to hit peak memory
         report_to="wandb",
         # dataset_text_field="text",
 
-
+        resume_from_checkpoint=args.resume_path,
         assistant_only_loss=False,
         optim="paged_adamw_8bit",
-        # dataloader_num_workers=8
+        dataloader_num_workers=2,
 
         remove_unused_columns=False,
         # resume_from_checkpoint='/Projects/SG_VLN_HumanData/contrastive_training_5view_mlp/checkpoint-4050'

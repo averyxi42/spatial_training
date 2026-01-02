@@ -165,7 +165,7 @@ def main():
     ds = ds.map(temporal_shift, num_proc=args.num_proc, desc="Temporal Shift")
     
     # Filter out empty episodes created by shift
-    ds = ds.filter(lambda x: len(x["images"]) > 0, num_proc=args.num_proc)
+    # ds = ds.filter(lambda x: len(x["images"]) > 0, num_proc=args.num_proc)
     # 4. Filter by Length
     print(f"Filtering episodes > {args.max_length} steps...")
     ds = ds.filter(lambda x: len(x["action_sequence"]) <= args.max_length, 
@@ -174,7 +174,7 @@ def main():
     # 5. Filter Corrupt Images
     print(f"Validating image integrity (this may take a while)... starting with {len(ds)} samples")
     ds = ds.cast_column('images',Sequence(Value(dtype='string')))
-    ds = ds.filter(validate_episode_images, num_proc=args.num_proc, desc="Img Verify",batch_size=10)
+    # ds = ds.filter(validate_episode_images, num_proc=args.num_proc, desc="Img Verify",batch_size=10)
     
     print(f"Valid Count: {len(ds)}")
 
@@ -224,9 +224,9 @@ if __name__ == "__main__":
 
 '''
 python build_pose_dataset.py \
-  --input_dir /Projects/SG_VLN_HumanData/SG-VLN/data/datasets/objectnav/objectnav_mp3d_thda_70k/train_pose.jsonl.parts \
-  --image_root /Projects/SG_VLN_HumanData/SG-VLN/data/datasets/objectnav/objectnav_mp3d_thda_70k/objectnav_images \
-  --output_dir /Projects/SG_VLN_HumanData/spatial_training/data/habitat_web_pose_v2 \
+  --input_dir ~/scratch/qixin/dump/train_all_pose_depth_lt500.jsonl.parts \
+  --image_root ~/scratch/qixin/dump/habitat_web_image_depth \
+  --output_dir ~/scratch/qixin/dump/sft_datasets/interrim \
   --val_scene_count 8 \
   --max_length 400 \
   --num_proc 16
