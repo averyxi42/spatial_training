@@ -1,72 +1,11 @@
 import argparse
 import os
 import json
-import numpy as np
 from pathlib import Path
 from collections import Counter
-from datasets import load_dataset, DatasetDict, Features, Value, Sequence, concatenate_datasets
+from datasets import load_dataset, DatasetDict, Features, Value, Sequence
 from PIL import Image, UnidentifiedImageError
 import textwrap
-
-def sample_uniformly_by_length(dataset, step_range=(0, 400), total_samples=10000, num_bins=20, num_proc=4):
-    """
-    Samples data to create a uniform distribution across action sequence lengths.
-    
-    Args:
-        dataset: The Hugging Face dataset object.
-        step_range: Tuple of (min_steps, max_steps).
-        total_samples: The target total number of samples.
-        num_bins: How many buckets to divide the range into.
-        num_proc: Number of processes for filtering.
-    """
-    min_step, max_step = step_range
-    samples_per_bin = total_samples // num_bins
-    
-    print(f"Targeting {total_samples} samples across {num_bins} bins ({samples_per_bin} per bin).")
-
-    # 1. Initial Range Filter
-    ds_filtered = dataset.filter(
-        lambda x: min_step <= len(x["action_sequence"]) <= max_step,
-        num_proc=num_proc,
-        desc=f"Filtering range {min_step}-{max_step}"
-    )
-
-    # 2. Pre-calculate all lengths (to avoid repeated len() calls)
-    # Using .with_format("numpy") or list comprehension for speed
-    all_lengths = np.array([len(x) for x in ds_filtered["action_sequence"]])
-    
-    bin_edges = np.linspace(min_step, max_step, num_bins + 1)
-    sampled_shards = []
-
-    # 3. Stratified Sampling
-    for i in range(num_bins):
-        low, high = bin_edges[i], bin_edges[i+1]
-        
-        # Find indices of episodes that fall within this specific length bin
-        bin_indices = np.where((all_lengths >= low) & (all_lengths < high))[0]
-        
-        n_available = len(bin_indices)
-        if n_available == 0:
-            print(f"  Bin [{int(low)}-{int(high)}]: 0 samples found. Skipping.")
-            continue
-            
-        # Determine how many to take
-        n_to_take = min(n_available, samples_per_bin)
-        
-        # Randomly select indices from this bin
-        chosen_indices = np.random.choice(bin_indices, n_to_take, replace=False)
-        sampled_shards.append(ds_filtered.select(chosen_indices))
-        
-        print(f"  Bin [{int(low):3}-{int(high):3}]: Sampled {n_to_take}/{n_available}")
-
-    # 4. Finalize
-    if not sampled_shards:
-        raise ValueError("No data found within the specified range!")
-        
-    final_ds = concatenate_datasets(sampled_shards).shuffle(seed=42)
-    print(f"Final dataset size: {len(final_ds)}")
-    
-    return final_ds
 
 # ------------------------------------------------------------------------------
 # 1. USER PROVIDED LOGIC (Reused)
@@ -107,13 +46,7 @@ def to_convo(example):
     for i, action in enumerate(example['action_sequence']):
         convo += [
              {"role": "user", "content": [
-                # Text Item: explicit None for image
-                {"type": "text", "text": f"Observation {i}:"}, 
-
                 {"type": "image", "text": None},
-                
-                # Text Item
-                {"type": "text", "text": f"Action {i}:"}
             ]},
             {"role": "assistant", "content": [
                 {"type": "text", "text": f"**{action}**"}
@@ -138,7 +71,7 @@ def validate_episode_images(example):
         try:
             with Image.open(path) as img:
                 img.verify() 
-        except (OSError, UnidentifiedImageError, FileNotFoundError):
+        except:
             return False
     return True
 
@@ -190,7 +123,6 @@ def main():
         ds = ds.rename_column("actions", "action_sequence")
         
     print(f"Initial Count: {len(ds)}")
-    ds = sample_uniformly_by_length(ds, step_range=(0, args.max_length), total_samples=50000, num_bins=20, num_proc=args.num_proc)
 
     # 3. Fix Paths (Relative -> Absolute)
     # We do this before filtering so validation checks valid absolute paths
@@ -225,13 +157,18 @@ def main():
         return example
 
     ds = ds.map(temporal_shift, num_proc=args.num_proc, desc="Temporal Shift")
-   
-
     
+    # Filter out empty episodes created by shift
+    # ds = ds.filter(lambda x: len(x["images"]) > 0, num_proc=args.num_proc)
+    # 4. Filter by Length
+    print(f"Filtering episodes > {args.max_length} steps...")
+    ds = ds.filter(lambda x: len(x["action_sequence"]) <= args.max_length, 
+                   num_proc=args.num_proc, desc="Len Filter")
 
     # 5. Filter Corrupt Images
-    print("Validating image integrity (this may take a while)...")
-    # ds = ds.filter(validate_episode_images, num_proc=args.num_proc, desc="Img Verify",batch_size=10,writer_batch_size=10)
+    print(f"Validating image integrity (this may take a while)... starting with {len(ds)} samples")
+    ds = ds.cast_column('images',Sequence(Value(dtype='string')))
+    # ds = ds.filter(validate_episode_images, num_proc=args.num_proc, desc="Img Verify",batch_size=10)
     
     print(f"Valid Count: {len(ds)}")
 
@@ -279,21 +216,12 @@ def main():
 if __name__ == "__main__":
     main()
 
-# python build_pose_dataset.py \
-#   --input_dir /Projects/SG_VLN_HumanData/SG-VLN/data/datasets/objectnav/objectnav_mp3d_thda_70k/train_pose.jsonl.parts \
-#   --image_root /Projects/SG_VLN_HumanData/SG-VLN/data/datasets/objectnav/objectnav_mp3d_thda_70k/objectnav_images \
-#   --output_dir /Projects/SG_VLN_HumanData/spatial_training/data/habitat_web_pose_v1 \
-#   --val_scene_count 8 \
-#   --max_length 250 \
-#   --num_proc 16
-
-
 '''
-python build_uniform_dataset.py \
+python build_pose_dataset_nonum.py \
   --input_dir ~/scratch/qixin/dump/train_all_pose_depth_lt500.jsonl.parts \
   --image_root ~/scratch/qixin/dump/habitat_web_image_depth \
-  --output_dir ~/scratch/qixin/dump/sft_datasets/uniform_350 \
+  --output_dir ~/scratch/qixin/dump/sft_datasets/nonum \
   --val_scene_count 8 \
-  --max_length 350 \
+  --max_length 400 \
   --num_proc 16
 '''
