@@ -267,7 +267,7 @@ class Qwen3VLSparseTextModel(Qwen3VLTextModel):
                         continue
                         
                     # Get indices of embeddings to KEEP (relative to the visual segments)
-                    embeds_to_keep_rel_idx = filter_embeds(image_embeds,limit=27000,threshold=0.94) #TODO: eliminate magic numbers
+                    embeds_to_keep_rel_idx = filter_embeds(image_embeds,limit=27000,threshold=0.95) #TODO: eliminate magic numbers
                     
                     # MAP RELATIVE INDICES -> GLOBAL INDICES
                     # Get global indices where this batch has visual tokens
@@ -369,7 +369,7 @@ class Qwen3VLSparseForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs()
+    @check_model_inputs
     def forward(
         self,
         input_ids: torch.LongTensor = None,

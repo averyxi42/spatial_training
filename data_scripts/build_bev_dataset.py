@@ -157,7 +157,9 @@ def parse_args():
                         help="Filter out episodes longer than this")
     parser.add_argument("--num_proc", type=int, default=16, 
                         help="Number of CPU workers for mapping/filtering")
-    
+    parser.add_argument("--total_samples", type=int, default=10000, 
+                        help="Number of samples to target")
+    parser.add_argument("--verify_imgs", type = bool, default=False)
     return parser.parse_args()
 
 def main():
@@ -190,7 +192,7 @@ def main():
     # We do this before filtering so validation checks valid absolute paths
     print("Fixing image paths...")
     def make_absolute(example):
-        example["images"] = [os.path.join(args.image_root, p) for p in example["rgb_paths"]]
+        example["images"] = [os.path.join(args.image_root, p) for p in example["images"]]
         example["depth_sequence"] = [os.path.join(args.image_root,p) for p in example['depth_paths']]
         return example
     
@@ -229,14 +231,14 @@ def main():
     # ds = ds.filter(lambda x: len(x["action_sequence"]) <= args.max_length, 
     #                num_proc=args.num_proc, desc="Len Filter")
 
-    ds = sample_uniformly_by_length(ds, step_range=(0, args.max_length), total_samples=10000, num_bins=20, num_proc=args.num_proc)
+    ds = sample_uniformly_by_length(ds, step_range=(0, args.max_length), total_samples=args.total_samples, num_bins=20, num_proc=args.num_proc)
     
 
     # 5. Filter Corrupt Images
-    print("Validating image integrity (this may take a while)...")
-    ds = ds.filter(validate_episode_images, num_proc=args.num_proc, desc="Img Verify",batch_size=10,writer_batch_size=10)
-    
-    print(f"Valid Count: {len(ds)}")
+    if args.verify_imgs:
+        print("Validating image integrity (this may take a while)...")
+        ds = ds.filter(validate_episode_images, num_proc=args.num_proc, desc="Img Verify",batch_size=10,writer_batch_size=10)
+        print(f"Valid Count: {len(ds)}")
 
     # 6. Create Splits (By Scene)
     print("Calculating split based on scene density...")
@@ -283,11 +285,12 @@ if __name__ == "__main__":
     main()
 
 '''
-python build_bev_dataset.py \
-  --input_dir /Projects/SG_VLN_HumanData/SG-VLN/data/datasets/objectnav/objectnav_mp3d_thda_70k/train_pose.jsonl.parts \
-  --image_root /Projects/SG_VLN_HumanData/SG-VLN/data/datasets/objectnav/objectnav_mp3d_thda_70k/objectnav_images \
-  --output_dir /Projects/SG_VLN_HumanData/spatial_training/data/habitat_web_pose_v1 \
+python data_scripts/build_bev_dataset.py \
+  --input_dir ~/scratch/qixin/dump/train_all_pose_depth_lt500.jsonl.parts \
+  --image_root ~/scratch/qixin/dump/habitat_web_image_depth \
+  --output_dir ~/scratch/qixin/dump/sft_datasets/depth_unifrom_400l_30ks \
   --val_scene_count 8 \
   --max_length 400 \
-  --num_proc 16
+  --num_proc 16 \
+  --total_samples 30000
 '''
