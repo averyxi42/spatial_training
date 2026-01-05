@@ -1,3 +1,8 @@
+from pathlib import Path
+import sys
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 import torch
 import datasets
 from torch.utils.data import DataLoader
@@ -259,7 +264,7 @@ def main():
     model = Qwen3VLSparseForConditionalGeneration.from_pretrained(
         args.model_id, 
         config=config,
-        device_map={"": 0},
+        # device_map={"": 0},
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
@@ -402,7 +407,7 @@ def main():
             processor=processor,
             length_warning = TOTAL_BUDGET,
             # max_length=TOTAL_BUDGET,
-            dropout=0.6,
+            dropout=0.3,
         ),
         args=training_args,
         train_dataset=train_dataset,

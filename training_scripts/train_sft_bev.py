@@ -425,7 +425,12 @@ def main():
     # 6. Run Training & Measure
     torch.cuda.reset_peak_memory_stats()
     print("Starting training loop...")
-    trainer.train()
+    resume = (args.resume_path != "")
+    if resume:
+        print(f"resuming from {args.resume_path}")
+    else:
+        print("training from scratch")
+    trainer.train(resume_from_checkpoint = args.resume_path if resume else False)
     # try:
         
     # except Exception as e:

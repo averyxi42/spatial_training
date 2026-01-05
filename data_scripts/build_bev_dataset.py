@@ -71,6 +71,14 @@ def sample_uniformly_by_length(dataset, step_range=(0, 400), total_samples=10000
 # ------------------------------------------------------------------------------
 # 1. USER PROVIDED LOGIC (Reused)
 # ------------------------------------------------------------------------------
+def remap_action(action):
+    mapping_dict = {"MOVE_FORWARD":"forward","TURN_RIGHT":"right","TURN_LEFT":"left","STOP":"stop","LOOK_UP":"up","LOOK_DOWN":"down"}
+    return mapping_dict[action]
+
+def remap_actions(example):
+    new_actions = [remap_action(action) for action in example['action_sequence']]
+    example['action_sequence'] = new_actions
+    return example
 
 def to_convo(example):
    
@@ -84,15 +92,15 @@ def to_convo(example):
     You will receive a sequence of observations showing your movement history up to the current moment.
 
     **Action Space:**
-    [STOP, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT, LOOK_UP, LOOK_DOWN]
+    [stop, forward, left, right, up, down]
 
     **Your Mission:**
     1. Analyze the observation history to understand your current location and orientation.
     2. Select the next discrete action to navigate efficiently towards the goal.
 
     **Critical Constraints:**
-    * **Collision Detection:** If your previous action was MOVE_FORWARD but the visual observation did not change significantly, you have collided. You MUST turn or move away immediately. Do not keep pushing forward.
-    * **Success Condition:** Output **STOP** ONLY when the target is plainly in view, centered, and within 1 meter (close enough to touch).
+    * **Collision Detection:** If your previous action was **forward** but the visual observation did not change significantly, you have collided. You MUST turn or move away immediately. Do not keep pushing forward.
+    * **Success Condition:** Output **stop** ONLY when the target is plainly in view, centered, and within 1 meter (close enough to touch).
 
     **Output Format:**
     Respond with the selected action inside double asterisks.
@@ -265,8 +273,12 @@ def main():
     # Note: We filter instead of using .train_test_split to ensure strict scene separation
     train_ds = ds.filter(is_train, num_proc=args.num_proc, desc="Split Train")
     val_ds = ds.filter(is_val, num_proc=args.num_proc, desc="Split Val")
-
+    
+    print("Remapping Actions")
+    train_ds = train_ds.map(remap_actions, num_proc=args.num_proc, desc="Remap Train")
+    val_ds = val_ds.map(remap_actions, num_proc=args.num_proc, desc="Remap Val")
     # 7. Apply Formatting (to_convo)
+
     print("Applying VLM formatting...")
     train_ds = train_ds.map(to_convo, num_proc=args.num_proc, desc="Format Train")
     val_ds = val_ds.map(to_convo, num_proc=args.num_proc, desc="Format Val")
@@ -288,7 +300,7 @@ if __name__ == "__main__":
 python data_scripts/build_bev_dataset.py \
   --input_dir ~/scratch/qixin/dump/train_all_pose_depth_lt500.jsonl.parts \
   --image_root ~/scratch/qixin/dump/habitat_web_image_depth \
-  --output_dir ~/scratch/qixin/dump/sft_datasets/depth_unifrom_400l_30ks \
+  --output_dir ~/scratch/qixin/dump/sft_datasets/depth_uniform_400l_30ks_single_action \
   --val_scene_count 8 \
   --max_length 400 \
   --num_proc 16 \
