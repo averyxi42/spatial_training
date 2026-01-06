@@ -1,3 +1,4 @@
+from typing import Any, Dict
 import ray
 import wandb
 import numpy as np
@@ -5,7 +6,6 @@ import os
 import sys
 import subprocess
 
-@ray.remote
 class WandbLoggerActor:
     def __init__(self, wandb_init_kwargs, run_config=None, log_raw=False, commit_interval=5):
         """
@@ -49,37 +49,43 @@ class WandbLoggerActor:
         else:
             self.run.log(metrics)
 
-    def log_row(self, row):
+    def log_row(self, row:Dict[str,Any]):
         """
-        Processes a single episode row (Worker side).
+        Processes a single episode row with namespace-based media detection.
         """
         processed_row = {}
         
         # --- 1. Process & Filter ---
         for k, v in row.items():
+            # A. Raw Data Toggle
             if k.startswith('raw/') and not self.log_raw:
                 continue
             
-            # Handle Media
-            if k == 'thumbnail' and v is not None:
+            # B. Dynamic Media Namespaces
+            if k.startswith('img/') and v is not None:
+                # Wraps numpy arrays or paths into WandB Images
                 processed_row[k] = wandb.Image(v)
-            elif k == 'video_path' and v is not None:
-                processed_row[k] = wandb.Video(v, fps=4, format="mp4")
+            elif k.startswith('vid/') and v is not None:
+                # Wraps paths into WandB Videos (expects shared filesystem)
+                processed_row[k] = wandb.Video(v, format="mp4")
             else:
+                # C. Pass-through (Scalars, Strings, Lists, or None values)
                 processed_row[k] = v
 
         # --- 2. Lazy Table Init ---
         if self.table is None:
             self.columns = sorted(list(processed_row.keys()))
-            self.table = wandb.Table(columns=self.columns)
+            self.table = wandb.Table(columns=self.columns,allow_mixed_types=True,log_mode='MUTABLE')
 
         # --- 3. Add to Buffer ---
+        # Use .get() to handle potential schema drift (though rare in this setup)
         table_row = [processed_row.get(c, None) for c in self.columns]
         self.table.add_data(*table_row)
         self.rows_since_last_commit += 1
 
         # --- 4. Log Live Scalars ---
-        # Filter out heavy objects
+        # Filter out heavy objects (Lists, Arrays, and the new Media objects)
+        # This keeps the "Run Overview" page clean and fast.
         log_payload = {
             k: v for k, v in processed_row.items() 
             if not isinstance(v, (list, np.ndarray, wandb.Image, wandb.Video))
@@ -120,6 +126,19 @@ class WandbLoggerActor:
             pass
 
         return meta
+
+    def alert(self, message: str):
+        """
+        Error logging.
+        Args:
+            message: The error string.
+            alert: If True, triggers a WandB Alert (useful for cluster failures).
+        """       
+        self.run.alert(
+            title="Distributed Worker Error", 
+            text=message, 
+            level=wandb.AlertLevel.ERROR
+        )
 
     def close(self):
         # Flush the table one last time
