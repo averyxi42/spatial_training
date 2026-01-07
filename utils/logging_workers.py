@@ -138,18 +138,23 @@ class WandbLoggerActor:
 
         return meta
 
-    def alert(self, message: str):
+    def alert(self, 
+        title: str,
+        text: str,
+        level):
         """
         Error logging.
         Args:
             message: The error string.
+            level: ERROR, INFO, WARN
             alert: If True, triggers a WandB Alert (useful for cluster failures).
         """       
         self.run.alert(
-            title="Distributed Worker Error", 
-            text=message, 
-            level=wandb.AlertLevel.ERROR
-        )
+            title=title, 
+            text=text, 
+            level=level
+        )  
+        
 
     def close(self):
         # Flush the table one last time

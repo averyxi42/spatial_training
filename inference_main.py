@@ -195,7 +195,7 @@ def main():
             "temperature": 1.2, # Sweet spot
             "convo_start_template": CONVO_START_TEMPLATE, #template for the initial conversation chunk
             "convo_turn_template": CONVO_TURN_TEMPLATE, #template for the recurrent conversation chunks
-            "fp_guard": False, # use oracle to prevent incorrect stop actions
+            "fp_guard": True, # use oracle to prevent incorrect stop actions
             "fn_guard": False, # use oracle to automatically perform stop action
             "action_space":action_space_list,
             "action_space_str":"[stop, forward, left, right, up, down]"
@@ -205,8 +205,9 @@ def main():
             "prefix":'<|im_start|>assistant\n**',
             "postfix":'**<|im_end|>\n',
             "vocab":action_space_list, # restrict vocab to remove dangerous up/down actions
-            "offload_cache":True #offload the kv cache layers to save VRAM
-        }
+            "offload_cache":False #offload the kv cache layers to save VRAM
+        },
+        
     }
 
     if args.wandb_project != "":
@@ -306,6 +307,12 @@ def main():
                 f.write(json.dumps(metric)+"\n")
             
         logger.info(f"Success! Metrics saved to {out_file}")
+        
+        if wandb_logger is not None:
+            import time
+            print("waiting 2 minutes for wandb logger to finalize!")
+            time.sleep(120) #TODO: this is so dumb...
+            ray.get(wandb_logger.close.remote())
 
     except KeyboardInterrupt:
         logger.warning("Job interrupted by user.")
