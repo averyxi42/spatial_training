@@ -641,6 +641,9 @@ class LoggingHabitatWorker(HabitatWorker):
         """
         Orchestrates saving heavy artifacts to disk and sending lightweight references to Ray.
         """
+        if len(self.steps['action'])==0:
+            print("erroneous log flush called, no step cache")
+            return
         # 1. Resolve Naming & Directory
         # Use first step info for stable IDs (scene, episode)
         first_info = self.steps['info'][0] if self.steps['info'] else {}
@@ -704,11 +707,17 @@ class LoggingHabitatWorker(HabitatWorker):
         # 6. Send to Global Logger
         if self.logger_actor:
             self.logger_actor.log_row.remote(row=payload)
+
     def reset(self, episode_id=None,output_schema=None,logging_schema=None):
         if len(self.steps['action'])>0:
             self._flush_logs_to_disk()
         return super().reset(episode_id,output_schema,logging_schema)
 
+    def assign_shard(self, assigned_episode_labels=None):
+        if len(self.steps['action'])>0:
+            self._flush_logs_to_disk()
+        return super().assign_shard(assigned_episode_labels)
+    
 if __name__ == "__main__":
     import time
     import numpy as np

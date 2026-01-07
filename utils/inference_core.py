@@ -35,15 +35,17 @@ def substitute_convo_template(conversation_template: List[Dict], substitutions: 
                 text_obj = new_item["text"]
                 
                 # CASE A: It's a Template object (from the config)
-                if isinstance(text_obj, Template):
+                if "$" in text_obj:
                     try:
+                        text_template = Template(text_obj)
                         # Perform the substitution
-                        new_item["text"] = text_obj.substitute(substitutions)
+                        new_item["text"] = text_template.substitute(substitutions)
                     except KeyError as e:
+                        raise
                         # Fallback to safe_substitute to prevent crashing on missing keys,
                         # but log it so we know something is wrong.
-                        print(f"Warning: Missing substitution key {e} in template.")
-                        new_item["text"] = text_obj.safe_substitute(substitutions)
+                        # print(f"Warning: Missing substitution key {e} in template.")
+                        # new_item["text"] = text_template.safe_substitute(substitutions)
                         
                 # CASE B: It's already a str (static text)
                 elif isinstance(text_obj, str):
@@ -294,16 +296,9 @@ def run_inference_driver(
                     new_reset_ref = hab.reset.remote()
                     pending_resets[new_reset_ref] = hab
                 except StopIteration:
+                    ray.get(hab._flush_logs_to_disk.remote())
                     # No more work available. Retire the Habitat worker.
                     print(f"Worker finished and no shards remain. Retiring.")
                     pass
-    print("out of episodes to run, cleaning up...")
-    for sim_handle in sim_handles:
-        try:
-            sim_handle.reset.remote()
-        except:
-            print("cannot reset habitat!")
-            # Worker is retired immediately if no work exists
-            pass
     print(f"Inference complete. Processed {len(results)} episodes.")
     return results

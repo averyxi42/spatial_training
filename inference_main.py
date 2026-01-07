@@ -8,11 +8,12 @@ import textwrap
 # Import your workers and driver (assuming they are in `driver.py` or similar)
 from utils.inference_core import run_inference_driver,VLMRayWorker,HabitatRayWorker
 from utils.logging_workers import WandbLoggerActor
-from string import Template
 
 '''
 Eval Usage Example
 python3 inference_main.py --model-id Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800 --ray-address local --shard-size 6 --subset-label sample400_a --num-vlms 2 --num-sims 3 --attn-impl='flash_attention_2' --dtype='float16' --max-steps 300 --wandb-project 'single_action_eval' --run-name float16fa2
+python3 inference_main.py --model-id Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800 --ray-address local --shard-size 6 --subset-label sample400_a --num-vlms 1 --num-sims 2 --attn-impl='flash_attention_2' --dtype='bfloat16' --max-steps 300 --wandb-project 'single_action_eval' --run-name bfloat16fa2
+
 '''
 '''
 Debug Usage Example
@@ -45,7 +46,7 @@ CONVO_TURN_TEMPLATE = [
     {
         "role": "assistant",
         "content":[
-            {"type":"text","text": Template("**$action**")} # tell the agent what its last action was with substitution
+            {"type":"text","text": "**$action**"} # tell the agent what its last action was with substitution
         ]
     },
     {
@@ -62,8 +63,7 @@ CONVO_TURN_TEMPLATE = [
     }
 ]
 
-SYSTEM_PROMPT_TEMPLATE= Template(
-textwrap.dedent("""\
+SYSTEM_PROMPT_TEMPLATE= textwrap.dedent("""\
 You are a visual navigation agent tasked with finding "$goal_name" in an unknown environment.
 You will receive a sequence of observations showing your movement history up to the current moment.
 
@@ -81,7 +81,7 @@ $action_space_str
 **Output Format:**
 Respond with the selected action inside double asterisks.
 """)
-)
+
 
 
 CONVO_START_TEMPLATE = [
@@ -249,7 +249,7 @@ def main():
     RemoteVLMWorker = VLMRayWorker.options(resources={args.vlm_resource_tag: 1},num_cpus=4,num_gpus=0.7,runtime_env=
             {"conda": VLM_CONDA_ENV,
                 "env_vars":{
-                "CUDA_VISIBLE_DEVICES":"0,1"
+                # "CUDA_VISIBLE_DEVICES":"0,1"
                 }
                 # "env_vars": {
                 #     "GLOG_minloglevel": "2",  # 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL
@@ -257,7 +257,7 @@ def main():
                 #     "HABITAT_SIM_LOG": "quiet" # Silences Habitat Sim specific logs
                 # }
             })
-    RemoteHabitatWorker = HabitatRayWorker.options(resources={args.sim_resource_tag: 1},num_cpus=4,num_gpus=0.2,
+    RemoteHabitatWorker = HabitatRayWorker.options(resources={args.sim_resource_tag: 1},num_cpus=4,num_gpus=0.14,
         runtime_env={
             "conda": HABITAT_CONDA_ENV,
             "env_vars":{
