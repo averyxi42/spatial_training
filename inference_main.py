@@ -12,7 +12,7 @@ from string import Template
 
 '''
 python3 inference_main.py --model-id Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800 --ray-address local --wandb-project 'test_mp' --shard-size 20 --subset-label sample400_a --num-vlms 1 --num-sims 2 --attn-impl='flash_attention_2' --dtype='bfloat16'
-python3 inference_main.py --model-id Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800 --ray-address local --shard-size 0 --subset-label sample400_a --num-vlms 1 --num-sims 1 --attn-impl='flash_attention_2' --dtype='bfloat16'
+python3 inference_main.py --model-id Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800 --ray-address local --shard-size 0 --subset-label sample400_a --num-vlms 1 --num-sims 1 --attn-impl='flash_attention_2' --dtype='bfloat16' --max-steps 200
 
 '''
 # If you have a dedicated logger actor
@@ -39,7 +39,7 @@ CONVO_TURN_TEMPLATE = [
     {
         "role": "assistant",
         "content":[
-            {"type":"text","text": "**$action**"} # tell the agent what its last action was with substitution
+            {"type":"text","text": Template("**$action**")} # tell the agent what its last action was with substitution
         ]
     },
     {
@@ -56,13 +56,13 @@ CONVO_TURN_TEMPLATE = [
     }
 ]
 
-SYSTEM_PROMPT_TEMPLATE= Template(textwrap.dedent(
-f"""\
+SYSTEM_PROMPT_TEMPLATE= Template(
+textwrap.dedent("""\
 You are a visual navigation agent tasked with finding "$goal_name" in an unknown environment.
 You will receive a sequence of observations showing your movement history up to the current moment.
 
 **Action Space:**
-$action_space
+$action_space_str
 
 **Your Mission:**
 1. Analyze the observation history to understand your current location and orientation.
@@ -74,7 +74,8 @@ $action_space
 
 **Output Format:**
 Respond with the selected action inside double asterisks.
-"""))
+""")
+)
 
 
 CONVO_START_TEMPLATE = [
@@ -84,7 +85,19 @@ CONVO_START_TEMPLATE = [
             {"type": "text", "text": SYSTEM_PROMPT_TEMPLATE},
         ],
     },
-] + CONVO_TURN_TEMPLATE
+    {
+        "role": "user",
+        "content": [ # Placeholder for the pixel data
+            {"type": "image"}
+        ],
+    },
+    {
+        "role": "assistant",
+        "content":[
+            {"type":"text","text": "**forward**"} # placeholder action to infer logprob during forward pass
+        ]
+    }
+]
 
 # --- Logging Setup ---
 def get_console_logger():
@@ -175,15 +188,15 @@ def main():
             "temperature": 1.2, # Sweet spot
             "convo_start_template": CONVO_START_TEMPLATE, #template for the initial conversation chunk
             "convo_turn_template": CONVO_TURN_TEMPLATE, #template for the recurrent conversation chunks
-            "fp_guard": True, # use oracle to prevent incorrect stop actions
-            "fn_guard": False, # use oracle to automatically perform stop action
+            "fp_guard": False, # use oracle to prevent incorrect stop actions
+            "fn_guard": True, # use oracle to automatically perform stop action
             "action_space":action_space_list,
-            "action_space_str":str(action_space_list)
+            "action_space_str":"[stop, forward, left, right, up, down]"
         },
         "vlm_config":{
             #prefix and postfixes to "sandwich" the decision token
             "prefix":'<|im_start|>assistant\n**',
-            "postfix":'**<|im_end|>',
+            "postfix":'**<|im_end|>\n',
             "vocab":action_space_list, # restrict vocab to remove dangerous up/down actions
             "offload_cache":True #offload the kv cache layers to save VRAM
         }
@@ -227,7 +240,7 @@ def main():
 
     # 3. Bootstrap Workers
     # Pass custom resource tags dynamically
-    RemoteVLMWorker = VLMRayWorker.options(resources={args.vlm_resource_tag: 1},num_cpus=24,num_gpus=0.7,runtime_env=
+    RemoteVLMWorker = VLMRayWorker.options(resources={args.vlm_resource_tag: 1},num_cpus=4,num_gpus=0.7,runtime_env=
             {"conda": VLM_CONDA_ENV,
                 "env_vars":{
                 "CUDA_VISIBLE_DEVICES":"0,1"
@@ -238,11 +251,11 @@ def main():
                 #     "HABITAT_SIM_LOG": "quiet" # Silences Habitat Sim specific logs
                 # }
             })
-    RemoteHabitatWorker = HabitatRayWorker.options(resources={args.sim_resource_tag: 1},num_cpus=24,num_gpus=0.2,
+    RemoteHabitatWorker = HabitatRayWorker.options(resources={args.sim_resource_tag: 1},num_cpus=4,num_gpus=0.2,
         runtime_env={
             "conda": HABITAT_CONDA_ENV,
             "env_vars":{
-                "CUDA_VISIBLE_DEVICES":"2"
+                # "CUDA_VISIBLE_DEVICES":"2"
             }
         })
 

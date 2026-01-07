@@ -62,15 +62,13 @@ class EpisodeRolloutMixin:
             # 1. Resolve the initial state (Blocking wait for reset to finish)
             # Ray automatically waits for initial_state_ref to be ready before starting this task,
             # but we call ray.get to access the data.
-            try:
-                rgb,state_dict = ray.get(initial_state_ref)
-            except:
-                rgb,state_dict = initial_state_ref
-
+            rgb,state_dict = initial_state_ref
             step_count = 0
             done = False
-            messages = substitute_convo_template(self.rollout_config['convo_start_template'],state_dict['obs'] | {"action_space": self.rollout_config['action_space_str']})
+            messages = substitute_convo_template(self.rollout_config['convo_start_template'],state_dict['obs'] | self.rollout_config)
             # 2. The Interaction Loop
+            vlm_logs={}
+
             while not done and step_count < self.rollout_config['max_steps']:
                 # A. Prepare VLM Input
                 # (Assuming your formatting logic is here)
@@ -82,21 +80,24 @@ class EpisodeRolloutMixin:
                 # print(messages)
                 t0 = time.time()
                 action_probs = self.infer_probs(images=[rgb_pil],messages=messages,temperature = self.rollout_config['temperature'])
-                vlm_logs = {'mean/vlm_latency':time.time()-t0}
-                print(f"vlm step{step_count}")
+                vlm_logs |= {'mean/vlm_latency':time.time()-t0,'min/vlm_latency':time.time()-t0,'max/vlm_latency':time.time()-t0}
+                # print(f"vlm step{step_count}")
                 # print("done")
                 #except for the first turn, all messages follow the exact same template.
                 action_id = np.random.choice(len(action_probs),p=action_probs) # sampling
                 entropy = -np.sum(action_probs * np.log(action_probs + 1e-9))
                 vlm_logs |= {'mean/entropy':entropy,'mean/action_prob':action_probs[action_id]} 
+                del rgb,state_dict
 
                 # D. Step Simulator (Blocking) ---------------------------RAY----------------------------- 
+                t0 = time.time()
                 rgb,state_dict = ray.get(habitat_handle.step.remote(action_id,supplementary_logs=vlm_logs))
+                vlm_logs = {'mean/sim_latency':time.time()-t0,'min/sim_latency':time.time()-t0,'max/sim_latency':time.time()-t0}
+
                 messages = substitute_convo_template(self.rollout_config['convo_turn_template'],{"action":self.rollout_config['action_space'][action_id]})
-                print(f"sim step{step_count}")
+                # print(f"sim step{step_count}")
                 done = state_dict['done']
                 step_count += 1
-                del rgb,state_dict
 
             return ray.get_runtime_context().current_actor,habitat_handle,state_dict['is_exhausted'], state_dict['info']
         except Exception as e:

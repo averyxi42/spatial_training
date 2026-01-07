@@ -1,5 +1,8 @@
 # import os
 import numpy as np
+import torch
+import time
+import gc
 # from transformers.models.qwen3_vl.modeling_qwen3_vl import rotate_half
 
 class VLMWorker:
@@ -29,12 +32,16 @@ class VLMWorker:
         self.reset()
         
     def reset(self):
-        from transformers import DynamicCache
+        from transformers import DynamicCache,StaticCache
         import torch
-        self.past_key_values=DynamicCache(config=self.model.config, offloading=self.offload_cache)
+        # self.past_key_values=StaticCache(config=self.model.config, offloading=self.offload_cache,max_cache_len=70000)
+        self.past_key_values=None#DynamicCache(config=self.model.config, offloading=self.offload_cache)
+
         self.cumulative_attention_mask = None
         self.offset = 0
+        self.previous_history_len = 0
         self.output_list = []
+        self.input_history = []
         torch.cuda.empty_cache()
 
     def load_model(self):
@@ -60,7 +67,7 @@ class VLMWorker:
         )
         return inputs
     
-    def _get_sandwich_indices(self, input_ids,find_last=True):
+    def _get_sandwich_indices(self, input_ids):
         import torch
         """
         Locates the indices of the logits that predict the sandwiched tokens.
@@ -73,10 +80,10 @@ class VLMWorker:
         seq = input_ids[0].cpu().numpy()
         
         # Helper: NumPy sliding window search
-        def search_sequence_numpy(arr, sub, find_last=True):
+        def search_sequence_numpy(arr, sub):
             window_size = len(sub)
             if len(arr) < window_size:
-                return -1
+                return [-1]
             # Create strided view for O(1) comparison
             shape = (arr.shape[0] - window_size + 1, window_size)
             strides = (arr.strides[0], arr.strides[0])
@@ -86,13 +93,11 @@ class VLMWorker:
             matches = np.all(windows == sub, axis=1)
             indices = np.where(matches)[0]
             
-            if indices.size > 0:
-                return indices[-1] if find_last else indices[0]
-            return -1
-
+            return indices
         # 2. Find Prefix End
         prefix_np = np.array(self.prefix_ids)
-        prefix_start = search_sequence_numpy(seq, prefix_np,find_last=find_last)
+        prefix_starts = search_sequence_numpy(seq, prefix_np)
+        prefix_start = prefix_starts[-1]
         if prefix_start == -1:
             return None, None
         prefix_end = prefix_start + len(prefix_np)
@@ -100,7 +105,10 @@ class VLMWorker:
         # 3. Find Postfix Start (Search after prefix)
         postfix_np = np.array(self.postfix_ids)
         seq_suffix = seq[prefix_end:] 
-        postfix_relative_start = search_sequence_numpy(seq_suffix, postfix_np,find_last=False)
+        postfix_relative_start = search_sequence_numpy(seq_suffix, postfix_np)
+        assert(len(postfix_relative_start)==1) #1 prefix 1 postfix!
+        postfix_relative_start=postfix_relative_start[0]
+
         if postfix_relative_start == -1:
             return None, None
         postfix_start = prefix_end + postfix_relative_start
@@ -115,8 +123,7 @@ class VLMWorker:
 
         # Create the indices tensor to pass to the model
         logit_indices = torch.arange(logit_start, logit_end, device='cpu', dtype=torch.long)
-        mask_indices = torch.arange(prefix_start,postfix_start+len(postfix_np), device='cpu', dtype=torch.long) # mask for the entire sequence with postfix and prefix
-        return logit_indices, mask_indices
+        return logit_indices, prefix_starts, search_sequence_numpy(seq, postfix_np)
 
     def _vocab_to_ids(self,vocab):
         ids = []
@@ -126,13 +133,29 @@ class VLMWorker:
             raise("input vocabulary is not valid token list!")
         return ids
     
-    def infer_step(self,messages,images,full_logprobs=False,temperature=1.2,check_probs=True,crop_after_prefix=True):
-        import torch
+    def infer_step(self,messages,images,full_logprobs=False,temperature=1.2,check_probs=True,crop_inputs=True):
         if self.model is None:
             self.load_model()
             self.reset()
         inputs = self.tokenize_inputs(messages,images)
-        logit_indices,mask_indices = self._get_sandwich_indices(inputs['input_ids'])
+        logit_indices,prefix_starts,postfix_starts = self._get_sandwich_indices(inputs['input_ids'])
+        if crop_inputs:
+            if len(prefix_starts)>1:
+                # print(self.processor.tokenizer.decode(inputs["input_ids"][0,logit_indices[0]]))
+                inputs['attention_mask'] = inputs['attention_mask'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)]
+                inputs["input_ids"] = inputs['input_ids'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)]
+                # print(self.processor.tokenizer.decode(inputs["input_ids"][0,0]))
+                # print(self.processor.tokenizer.decode(inputs["input_ids"][0,-1]))
+            else:
+                # print(self.processor.tokenizer.decode(inputs["input_ids"][0,logit_indices[0]]))
+                inputs['attention_mask'] = inputs['attention_mask'][:,:(postfix_starts[-1]-1)]
+                inputs["input_ids"] = inputs['input_ids'][:,:(postfix_starts[-1]-1)]
+                # print(self.processor.tokenizer.decode(inputs["input_ids"][0,0]))
+                # print(self.processor.tokenizer.decode(inputs["input_ids"][0,-1]))
+            # print(self.processor.batch_decode([inputs['input_ids'][0][inputs['input_ids'][0]!=self.processor.image_token_id]]))
+            # self.input_history+=list(inputs['input_ids'][0])
+                # print(inputs["input_ids"][0,-1])
+
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         input_ids = inputs['input_ids']
         image_grid_thw = inputs['image_grid_thw']
@@ -148,6 +171,8 @@ class VLMWorker:
         inputs['position_ids'] = position_ids+self.offset
         chunk_attention_mask = inputs['attention_mask']
 
+        if crop_inputs:
+            logit_indices = torch.tensor([inputs['input_ids'].shape[1]-1],device=self.model.device)
         # Update the cumulative mask
         if self.cumulative_attention_mask is None:
             self.cumulative_attention_mask = chunk_attention_mask
@@ -157,37 +182,27 @@ class VLMWorker:
                 [self.cumulative_attention_mask, chunk_attention_mask], 
                 dim=1
             )
-
         inputs['attention_mask'] = self.cumulative_attention_mask # torch.ones(1,seql,device=self.device)
-        previous_history_len = self.past_key_values.get_seq_length() if self.past_key_values.get_seq_length() is not None else 0
+
         with torch.inference_mode():
+            t0 = time.time()
             outputs = self.model(
                 **inputs,
                 past_key_values=self.past_key_values,
                 use_cache=True,
                 logits_to_keep = logit_indices.to(self.model.device)
             )
-            self.past_key_values = outputs.past_key_values
+            # print(f"latency: {time.time()-t0}")
+            self.past_key_values = outputs['past_key_values']
             if self.cache_outputs:
                 self.output_list.append(outputs)
                 # Compute logprobs directly (1-to-1 mapping)
             relevant_logits = outputs.logits[0].float()
             all_logprobs = torch.log_softmax(relevant_logits/temperature, dim=-1)
 
-        if crop_after_prefix:
-            absolute_crop_index = previous_history_len + mask_indices[0].item()
-            # 2. Crop KV Cache (In-place)
-            self.past_key_values.crop(absolute_crop_index)
-            # 3. Crop the Cumulative Attention Mask
-            # We must discard the corresponding columns in the mask
-            if self.cumulative_attention_mask is not None:
-                self.cumulative_attention_mask = self.cumulative_attention_mask[:, :absolute_crop_index]
-            # 4. Reset Offset
-            # The next generation should start exactly where we cropped
-            self.offset += mask_indices[0].item()
-        else:
-            # Normal behavior: advance offset by the full input length
-            self.offset += len(inputs['input_ids'][0])
+        self.offset += len(inputs['input_ids'][0])
+        self.previous_history_len+= len(inputs['input_ids'][0])
+
         self.offset+=deltas.item() # this is ok because assistant generations don't contain images so no effect on deltas
 
         if check_probs:
@@ -201,12 +216,13 @@ class VLMWorker:
         else:
             return all_logprobs[:,self.vocab_ids].cpu().float().numpy()
 
-    def infer_probs(self,messages,images,temperature=1.2,check_probs=False):
+    def infer_probs(self,messages,images,temperature=1.2,check_probs=True):
         logprobs = self.infer_step(messages,images,temperature=temperature, check_probs=check_probs)
         assert(len(logprobs)==1) #ensure there is a unique token position for decision making
         logprobs = logprobs[0]
         probs = np.exp(logprobs)
         probs /= np.sum(probs)
+        print(probs)
         return probs
 
 
@@ -221,6 +237,8 @@ if __name__ == "__main__":
     print("running inference test")
     # --- Constants ---
     MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
+    # MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
+
     IMAGE_WIDTH = 640
     IMAGE_HEIGHT = 480
 
@@ -246,6 +264,7 @@ if __name__ == "__main__":
             # Construct a standalone prompt for this step
             # We simulate the user asking for a move
             messages = [
+
                 {
                     "role": "user",
                     "content": [
@@ -258,10 +277,21 @@ if __name__ == "__main__":
             ]
             return messages, [image]
 
-    worker = VLMWorker()
+    worker = VLMWorker(model_id=MODEL_ID,attn_implementation='flash_attention_2', dtype='bfloat16',offload_cache=False)
     generator = DataGenerator(IMAGE_WIDTH, IMAGE_HEIGHT, worker.processor)
     worker.reset()
     from tqdm import tqdm
-    for i in tqdm(range(100)):
+    # torch.cuda.memory._record_memory_history(
+    #    max_entries=3
+    # )
+    for i in tqdm(range(40)):
         messages,images = generator._prepare_turn_inputs(i)
         action = worker.infer_probs(messages,images)
+    # print(worker.processor.batch_decode([worker.input_history]))
+    # try:
+    #    torch.cuda.memory._dump_snapshot(f"profile.pickle")
+    # except Exception as e:
+    #     print(f"Failed to capture memory snapshot {e}")
+
+    # Stop recording memory snapshot history.
+    # torch.cuda.memory._record_memory_history(enabled=None)

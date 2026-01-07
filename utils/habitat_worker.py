@@ -698,11 +698,11 @@ class LoggingHabitatWorker(HabitatWorker):
 
         # 6. Send to Global Logger
         if self.logger_actor:
-            self.logger_actor.log_row.remote(payload)
+            self.logger_actor.log_row.remote(row=payload)
     def reset(self, episode_id=None,output_schema=None,logging_schema=None):
         if len(self.steps['action'])>0:
             self._flush_logs_to_disk()
-        return HabitatWorker.reset(self,episode_id,output_schema,logging_schema)
+        return super().reset(episode_id,output_schema,logging_schema)
 
 if __name__ == "__main__":
     import time
