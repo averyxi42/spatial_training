@@ -11,9 +11,6 @@ class VLMWorker:
         fa_utils._is_packed_sequence = patched
         import torch
         from transformers import AutoProcessor
-
-
-
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.vocab = vocab
         self.vocab_ids = self._vocab_to_ids(vocab)
@@ -62,7 +59,8 @@ class VLMWorker:
             return_tensors="pt"
         )
         return inputs
-    def _get_sandwich_indices(self, input_ids):
+    
+    def _get_sandwich_indices(self, input_ids,find_last=True):
         import torch
         """
         Locates the indices of the logits that predict the sandwiched tokens.
@@ -75,7 +73,7 @@ class VLMWorker:
         seq = input_ids[0].cpu().numpy()
         
         # Helper: NumPy sliding window search
-        def search_sequence_numpy(arr, sub):
+        def search_sequence_numpy(arr, sub, find_last=True):
             window_size = len(sub)
             if len(arr) < window_size:
                 return -1
@@ -83,14 +81,18 @@ class VLMWorker:
             shape = (arr.shape[0] - window_size + 1, window_size)
             strides = (arr.strides[0], arr.strides[0])
             windows = np.lib.stride_tricks.as_strided(arr, shape=shape, strides=strides)
-            # Find first match
+            
+            # Find all matches
             matches = np.all(windows == sub, axis=1)
             indices = np.where(matches)[0]
-            return indices[0] if indices.size > 0 else -1
+            
+            if indices.size > 0:
+                return indices[-1] if find_last else indices[0]
+            return -1
 
         # 2. Find Prefix End
         prefix_np = np.array(self.prefix_ids)
-        prefix_start = search_sequence_numpy(seq, prefix_np)
+        prefix_start = search_sequence_numpy(seq, prefix_np,find_last=find_last)
         if prefix_start == -1:
             return None, None
         prefix_end = prefix_start + len(prefix_np)
@@ -98,7 +100,7 @@ class VLMWorker:
         # 3. Find Postfix Start (Search after prefix)
         postfix_np = np.array(self.postfix_ids)
         seq_suffix = seq[prefix_end:] 
-        postfix_relative_start = search_sequence_numpy(seq_suffix, postfix_np)
+        postfix_relative_start = search_sequence_numpy(seq_suffix, postfix_np,find_last=False)
         if postfix_relative_start == -1:
             return None, None
         postfix_start = prefix_end + postfix_relative_start
@@ -113,8 +115,8 @@ class VLMWorker:
 
         # Create the indices tensor to pass to the model
         logit_indices = torch.arange(logit_start, logit_end, device='cpu', dtype=torch.long)
-        
-        return logit_indices
+        mask_indices = torch.arange(prefix_start,postfix_start+len(postfix_np), device='cpu', dtype=torch.long) # mask for the entire sequence with postfix and prefix
+        return logit_indices, mask_indices
 
     def _vocab_to_ids(self,vocab):
         ids = []
@@ -124,13 +126,13 @@ class VLMWorker:
             raise("input vocabulary is not valid token list!")
         return ids
     
-    def infer_step(self,messages,images,full_logprobs=False,temperature=1.2,check_probs=True):
+    def infer_step(self,messages,images,full_logprobs=False,temperature=1.2,check_probs=True,crop_after_prefix=True):
         import torch
         if self.model is None:
             self.load_model()
             self.reset()
         inputs = self.tokenize_inputs(messages,images)
-        logit_indices = self._get_sandwich_indices(inputs['input_ids'])
+        logit_indices,mask_indices = self._get_sandwich_indices(inputs['input_ids'])
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         input_ids = inputs['input_ids']
         image_grid_thw = inputs['image_grid_thw']
@@ -157,6 +159,7 @@ class VLMWorker:
             )
 
         inputs['attention_mask'] = self.cumulative_attention_mask # torch.ones(1,seql,device=self.device)
+        previous_history_len = self.past_key_values.get_seq_length() if self.past_key_values.get_seq_length() is not None else 0
         with torch.inference_mode():
             outputs = self.model(
                 **inputs,
@@ -170,8 +173,23 @@ class VLMWorker:
                 # Compute logprobs directly (1-to-1 mapping)
             relevant_logits = outputs.logits[0].float()
             all_logprobs = torch.log_softmax(relevant_logits/temperature, dim=-1)
-        self.offset+=len(inputs['input_ids'][0])
-        self.offset+=deltas.item()     
+
+        if crop_after_prefix:
+            absolute_crop_index = previous_history_len + mask_indices[0].item()
+            # 2. Crop KV Cache (In-place)
+            self.past_key_values.crop(absolute_crop_index)
+            # 3. Crop the Cumulative Attention Mask
+            # We must discard the corresponding columns in the mask
+            if self.cumulative_attention_mask is not None:
+                self.cumulative_attention_mask = self.cumulative_attention_mask[:, :absolute_crop_index]
+            # 4. Reset Offset
+            # The next generation should start exactly where we cropped
+            self.offset += mask_indices[0].item()
+        else:
+            # Normal behavior: advance offset by the full input length
+            self.offset += len(inputs['input_ids'][0])
+        self.offset+=deltas.item() # this is ok because assistant generations don't contain images so no effect on deltas
+
         if check_probs:
             try:
                 assert(torch.argmax(all_logprobs,dim=-1).item() in self.vocab_ids)

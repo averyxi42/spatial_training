@@ -1,20 +1,20 @@
 import ray
 from collections import deque
-from typing import List, Dict, Any, Iterator
+from typing import List, Dict, Any, Iterator,Tuple
 from string import Template
 from PIL import Image
-# from utils.habitat_worker import HabitatWorker
-# from utils.vlm_worker import VLMWorker
+from utils.habitat_worker import LoggingHabitatWorker
+from utils.vlm_worker import VLMWorker
 import numpy as np
 
-def substitute_convo_template(conversation_template: List[Dict], obs: Dict[str, Any]) -> List[Dict]:
+def substitute_convo_template(conversation_template: List[Dict], substitutions: Dict[str, Any]) -> List[Dict]:
     """
     Traverses the conversation template and substitutes any string.Template 
     objects found in 'text' fields using values from the 'obs' dictionary.
     
     Args:
         conversation_template: List of message dicts (role, content).
-        obs: Dictionary containing substitution keys (e.g., 'goal_name').
+        substitutions: Dictionary containing substitution keys (e.g., 'goal_name').
         
     Returns:
         A new conversation list with strings substituted.
@@ -38,12 +38,12 @@ def substitute_convo_template(conversation_template: List[Dict], obs: Dict[str, 
                 if isinstance(text_obj, Template):
                     try:
                         # Perform the substitution
-                        new_item["text"] = text_obj.substitute(obs)
+                        new_item["text"] = text_obj.substitute(substitutions)
                     except KeyError as e:
                         # Fallback to safe_substitute to prevent crashing on missing keys,
                         # but log it so we know something is wrong.
                         print(f"Warning: Missing substitution key {e} in template.")
-                        new_item["text"] = text_obj.safe_substitute(obs)
+                        new_item["text"] = text_obj.safe_substitute(substitutions)
                         
                 # CASE B: It's already a str (static text)
                 elif isinstance(text_obj, str):
@@ -55,64 +55,133 @@ def substitute_convo_template(conversation_template: List[Dict], obs: Dict[str, 
         
     return new_conversation
 
-@ray.remote(num_cpus=2) # Very lightweight
-def run_episode_supervisor(vlm_handle, habitat_handle, initial_state_ref, rollout_config):
-    """
-    Manages one episode loop between a paired VLM and Habitat worker.
-    """
-    import time
-    # DEBUG: Check what we actually received
-    try:
-        # 1. Resolve the initial state (Blocking wait for reset to finish)
-        # Ray automatically waits for initial_state_ref to be ready before starting this task,
-        # but we call ray.get to access the data.
+class EpisodeRolloutMixin:
+    def run_episode(self,habitat_handle, initial_state_ref):
+        import time
         try:
-            curr_state = ray.get(initial_state_ref)
-        except:
-            curr_state = initial_state_ref
+            # 1. Resolve the initial state (Blocking wait for reset to finish)
+            # Ray automatically waits for initial_state_ref to be ready before starting this task,
+            # but we call ray.get to access the data.
+            try:
+                rgb,state_dict = ray.get(initial_state_ref)
+            except:
+                rgb,state_dict = initial_state_ref
 
-        step_count = 0
-        done = False
-        messages = substitute_convo_template(rollout_config['convo_start_template'],curr_state['obs'])
-        # 2. The Interaction Loop
-        while not done and step_count < rollout_config['max_steps']:
-            # A. Prepare VLM Input
-            # (Assuming your formatting logic is here)
-            rgb_numpy = curr_state['obs']['rgb']
-            rgb_pil = Image.fromarray(rgb_numpy)
-            # B. Call VLM (Blocking)
-            # We must wait for the answer to decide the next step
-            # print("inferring VLM with messages:")
-            # print(messages)
-            t0 = time.time()
-            action_probs = ray.get(vlm_handle.infer_probs.remote(images=[rgb_pil],messages=messages,temperature = rollout_config['temperature']))
-            vlm_logs = {'mean/vlm_latency':time.time()-t0}
-            print(f"vlm step{step_count}")
+            step_count = 0
+            done = False
+            messages = substitute_convo_template(self.rollout_config['convo_start_template'],state_dict['obs'] | {"action_space": self.rollout_config['action_space_str']})
+            # 2. The Interaction Loop
+            while not done and step_count < self.rollout_config['max_steps']:
+                # A. Prepare VLM Input
+                # (Assuming your formatting logic is here)
+                rgb_numpy = rgb
+                rgb_pil = Image.fromarray(rgb_numpy)
+                # B. Call VLM (Blocking)
+                # We must wait for the answer to decide the next step
+                # print("inferring VLM with messages:")
+                # print(messages)
+                t0 = time.time()
+                action_probs = self.infer_probs(images=[rgb_pil],messages=messages,temperature = self.rollout_config['temperature'])
+                vlm_logs = {'mean/vlm_latency':time.time()-t0}
+                print(f"vlm step{step_count}")
+                # print("done")
+                #except for the first turn, all messages follow the exact same template.
+                action_id = np.random.choice(len(action_probs),p=action_probs) # sampling
+                entropy = -np.sum(action_probs * np.log(action_probs + 1e-9))
+                vlm_logs |= {'mean/entropy':entropy,'mean/action_prob':action_probs[action_id]} 
 
-            # print("done")
-            #except for the first turn, all messages follow the exact same template.
-            messages = substitute_convo_template(rollout_config['convo_turn_template'],curr_state['obs'])
-            action_id = np.random.choice(len(action_probs),p=action_probs) # sampling
-            entropy = -np.sum(action_probs * np.log(action_probs + 1e-9))
-            vlm_logs |= {'mean/entropy':entropy,'mean/action_prob':action_probs[action_id]} 
-            # D. Step Simulator (Blocking)
-            curr_state = ray.get(habitat_handle.step.remote(action_id))
-            print(f"sim step{step_count}")
-            done = curr_state['done']
-            step_count += 1
-        vlm_handle.reset.remote() #reset the kv cache to prepare for next sequence.
-        needs_reshard = ray.get(habitat_handle.is_exhausted.remote())
-        return vlm_handle, habitat_handle, needs_reshard, curr_state['info']
+                # D. Step Simulator (Blocking) ---------------------------RAY----------------------------- 
+                rgb,state_dict = ray.get(habitat_handle.step.remote(action_id,supplementary_logs=vlm_logs))
+                messages = substitute_convo_template(self.rollout_config['convo_turn_template'],{"action":self.rollout_config['action_space'][action_id]})
+                print(f"sim step{step_count}")
+                done = state_dict['done']
+                step_count += 1
+                del rgb,state_dict
 
-    except Exception as e:
-        print(f"Episode failed: {e}")
-        # Return handles anyway so we don't leak resources (or handle crash logic)
-        return vlm_handle, habitat_handle, False, None
+            return ray.get_runtime_context().current_actor,habitat_handle,state_dict['is_exhausted'], state_dict['info']
+        except Exception as e:
+            print(f"Episode failed: {e}")
+            # Return handles anyway so we don't leak resources (or handle crash logic)
+            return ray.get_runtime_context().current_actor,habitat_handle,False, None
+        finally:
+            self.reset()
+
+
+
+# from utils.logging_worker import LoggingHabitatWorker
+
+@ray.remote
+class HabitatRayWorker(LoggingHabitatWorker):
+    """
+    Ray Actor wrapper for the LoggingHabitatWorker.
+    
+    Optimizations:
+    1. Interface Shaping: Separates heavy RGB arrays from lightweight scalar state.
+    2. RPC Reduction: Injects 'is_exhausted' into the state dictionary.
+    """
+
+    def reset(self) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        Returns:
+            rgb: The heavy image array.
+            state_dict: {'obs': ..., 'is_exhausted': ...}
+        """
+        # Base worker returns a single dict (typically just the observations for reset)
+        obs = super().reset()['obs']
+        
+        # 1. Extract the heavy asset (modifies dict in place)
+        rgb = obs.pop("rgb")
+        
+        # 2. Package the lightweight state
+        # We wrap it in an 'obs' key to match the structure expected by the Mixin
+        state_dict = {
+            "obs": obs,
+            "is_exhausted": self.is_exhausted(),
+            # Optional: Add placeholders if your Mixin checks these on reset
+            "done": False, 
+            "info": {}
+        }
+        
+        return rgb, state_dict
+
+    def step(self, action: int, supplementary_logs: Dict[str, Any] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        Returns:
+            rgb: The heavy image array.
+            state_dict: {'obs': ..., 'reward': ..., 'done': ..., 'info': ..., 'is_exhausted': ...}
+        """
+        # Base worker returns a single dict containing keys: 'obs', 'reward', 'done', 'info'
+        result = super().step(action, supplementary_logs=supplementary_logs)
+        # 1. Extract the heavy asset from the nested observation dict
+        # We modify the dictionary in-place to avoid copying data
+        rgb = result['obs'].pop("rgb")
+        # 2. Inject the exhaustion flag
+        result['is_exhausted'] = self.is_exhausted()
+        # 'result' now acts as our 'state_dict' (sans the heavy RGB)
+        return rgb, result
+
+@ray.remote
+class VLMRayWorker(VLMWorker, EpisodeRolloutMixin):
+    def __init__(self, rollout_config: Dict[str, Any], **vlm_kwargs):
+        """
+        Explicitly handles argument separation to avoid MRO issues.
+        
+        Args:
+            rollout_config: Arguments intended for the EpisodeRolloutMixin.
+            **vlm_kwargs: All other arguments (model_id, dtype, etc.) passed to VLMWorker.
+        """
+        # 1. Initialize the VLM Worker (The Heavy Lifter)
+        # We pass only the relevant VLM args to avoid 'unexpected keyword argument' errors.
+        VLMWorker.__init__(self, **vlm_kwargs)
+        
+        # 2. Initialize the Mixin State
+        # Since the Mixin's __init__ was just setting this variable, we can do it here directly
+        # effectively bypassing the need for cooperative inheritance in the parents.
+        self.rollout_config = rollout_config
 
 def run_inference_driver(
     sim_handles: List[Any],
     vlm_handles: List[Any],
-    rollout_config: Dict[str, Any],
     shard_iterator: Iterator[List[str]]
 ) -> List[Dict]:
     """
@@ -172,11 +241,10 @@ def run_inference_driver(
             
             # LAUNCH SUPERVISOR
             # The supervisor coordinates the interaction between VLM and Habitat for ONE episode.
-            print("dispatching episode supervisor!")
-            sup_ref = run_episode_supervisor.remote(
-                vlm, hab, init_state_ref, rollout_config=rollout_config
+            print("dispatching episode!")
+            sup_ref = vlm.run_episode.remote(
+                hab, init_state_ref
             )
-            print("episode done!")
             
             active_episodes[sup_ref] = "running"
 
@@ -208,6 +276,7 @@ def run_inference_driver(
                 # Retrieve the recycled actors and signals
                 # needs_reshard: bool indicating if the worker finished its assigned shard
                 vlm, hab, needs_reshard, stats = ray.get(ref)
+                print(f"[new results!] :{stats}")
                 results.append(stats)
                 # 1. Recycle VLM (It becomes idle immediately)
                 idle_vlms.append(vlm)

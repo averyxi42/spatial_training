@@ -2,12 +2,14 @@ from collections import defaultdict
 import numpy as np
 import regex as re
 import os
-import ray
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-import os
 import time
 from contextlib import contextmanager
-
+import json
+import uuid
+from PIL import Image
+import time
+import numpy as np
+from typing import Optional, Any
 @contextmanager
 def suppress_cpp_output():
     """
@@ -54,9 +56,9 @@ def apply_schema(data, schema):
     return result
 
 
-def save_video_task(steps_data, filename, output_dir, fps=4, quality=3,return_thumbnail=True):
+def save_run_video(steps_data, filename, output_dir, fps=4, quality=6,return_thumbnail=True):
     """
-    Stateless Ray task to render video.
+    Stateless helper function to render video.
     """
     from habitat.utils.visualizations import utils as vut
 
@@ -135,14 +137,14 @@ default_logging_schema = {
             "fog_of_war_mask": True,
             "agent_map_coord": True,
             "agent_angle": True
-        }
+        },
+        "pos_rots":True
     },
     
     # 3. Top-Level Primitives (Required for Metrics/Video)
     "action": True,    # Needed for text overlay
     "reward": True,    # Needed for 'mean_distance_reward' metric
     "done": True,      # Standard
-    
     # 4. Extras (Injected by your Worker)
     "timestamp": True, # Needed for 'throughput' calculation
     "stuck": True,     # Needed for 'collision_rate'
@@ -150,9 +152,9 @@ default_logging_schema = {
     "fn_stop": True    # Needed for guard metrics
 }
 
-def handle_supplementary_logging(episode_data,result_row):
+def supplementary_logging_helper(episode_data,result_row):
     # --- Supplemental Logs (User Defined Reductions) ---
-    # Pattern: "sup/<reduction_type>/<name>"
+    # Pattern: "sup/<reduction_type>/<name>s"
     # Supported: mean, max, min, median, sum, prod
     reduction_map = {
         "mean": np.mean,
@@ -187,37 +189,50 @@ def handle_supplementary_logging(episode_data,result_row):
                 print(f"Failed to reduce user key {key}: {e}")
                 continue
 
-def default_habitat_log_task(actor_handle,episode_data,output_dir,**video_kwargs):
-    from PIL import Image
-    result_row = apply_schema(episode_data['info'][-1],summary_schema) 
+def habitat_logging_helper(episode_data):
+    '''
+    Docstring for habitat_logging_helper
+    
+    :param episode_data: Description
+
+    returns: 
+    - episode_logs: dictionary of scalar data for the entire episode
+    - sequence_logs dictionary of lists/arrays for granular sequence data
+    '''
+    episode_logs = apply_schema(episode_data['info'][-1],summary_schema) 
     #TODO: check safety. does habitat change the internal episode the moment step(stop) is called? if so, we are in trouble
     # safety overrides for now, using first step guarantees correctness
-    result_row['episode_label'] = episode_data['info'][0]['episode_label']
-    result_row['scene_id'] = episode_data['info'][0]['scene_id']
-    result_row['goal_name'] = episode_data['obs'][0]['goal_name'] #need this for obvious reasons
+    episode_logs['episode_label'] = episode_data['info'][0]['episode_label']
+    episode_logs['scene_id'] = episode_data['info'][0]['scene_id']
+    episode_logs['goal_name'] = episode_data['obs'][0]['goal_name'] #need this for obvious reasons
 
-    result_row['steps'] = len(episode_data['action'])
-    result_row['duration'] = episode_data['timestamp'][-1]-episode_data['timestamp'][0]
-    result_row['throughput'] = result_row['steps']/max(result_row['duration'],1e-5)
+    episode_logs['steps'] = len(episode_data['action'])
+    episode_logs['duration'] = episode_data['timestamp'][-1]-episode_data['timestamp'][0]
+    episode_logs['throughput'] = episode_logs['steps']/max(episode_logs['duration'],1e-5)
 
-    result_row['fpg_trigger_count'] = np.sum(np.array(episode_data['fp_stop'])) #works thanks to defaultdict shenanigans
-    result_row['fng_trigger_count'] = np.sum(np.array(episode_data['fn_stop'])) #works thanks to defaultdict shenanigans
+    episode_logs['fpg_trigger_count'] = np.sum(np.array(episode_data['fp_stop'])) #works thanks to defaultdict shenanigans
+    episode_logs['fng_trigger_count'] = np.sum(np.array(episode_data['fn_stop'])) #works thanks to defaultdict shenanigans
 
     # sequence level logs
     raw_collisions = episode_data.get('stuck',[]) #this is already aligned to actions, no need to slice. 
-    # result_row['raw/actions'] = episode_data['action']
-    # result_row['raw/positions'] = [info['pos_rots'][:3] for info in episode_data['info'][:-1]] #final position is redundant due to stop action
-    # result_row['raw/quaterions'] = [info['pos_rots'][3:] for info in episode_data['info'][:-1]] #doubt this is meaningful in wandb but it can't cost that much storage right?
-
     # auxiliary performance metrics
-    result_row['collision_rate'] = np.sum(np.array(raw_collisions))/result_row['steps']
-    result_row['mean_distance_reward'] = np.mean(np.array(episode_data['reward'][1:-1])) # slice to exclude the terminal reward
+    episode_logs['collision_rate'] = np.sum(np.array(raw_collisions))/episode_logs['steps']
+    episode_logs['mean_distance_reward'] = np.mean(np.array(episode_data['reward'][1:-1])) # slice to exclude the terminal reward
     # save the video.
-    handle_supplementary_logging(episode_data,result_row)
-    vid_path,img = save_video_task(episode_data,result_row['episode_label'],output_dir,return_thumbnail=True, **video_kwargs) 
-    result_row['vid/episode_video'] = vid_path
-    result_row['img/thumbnail'] = Image.fromarray(img)
-    actor_handle.log_row.remote(row=result_row) # generic table logging interface. 
+    supplementary_logging_helper(episode_data,episode_logs)
+
+    sequence_logs = {}
+    sequence_logs['actions'] = episode_data['action']
+    sequence_logs['positions'] = [info['pos_rots'][:3] for info in episode_data['info'][:-1]] #final position is redundant due to stop action
+    sequence_logs['quaterions'] = [info['pos_rots'][3:] for info in episode_data['info'][:-1]] #doubt this is meaningful in wandb but it can't cost that much storage right?
+    sequence_logs['collision_events'] = raw_collisions
+
+    return episode_logs, sequence_logs
+
+
+    # vid_path,img = save_run_video(episode_data,result_row['episode_label'],output_dir,return_thumbnail=True, **video_kwargs) 
+    # result_row['vid/episode_video'] = vid_path
+    # result_row['img/thumbnail'] = Image.fromarray(img)
 
 # # from collections import deque
 # # --- Helper Function ---
@@ -227,7 +242,6 @@ def default_habitat_log_task(actor_handle,episode_data,output_dir,**video_kwargs
 #     return scene_id
 # robust version
 def get_scene_id(scene_path):
-
     # os.path.basename handles both "/" and "\" correctly
     filename = os.path.basename(scene_path)
     # Optional: Make regex handle both .basis.glb and standard .glb
@@ -301,15 +315,6 @@ class HabitatWorker:
         )
         self.assign_shard(assigned_episode_labels)
 
-    def enable_logging(self,logging_actor,
-        logging_task_handle=default_habitat_log_task, # The raw @ray.remote function
-        logging_task_config=None):
-
-        self.logging_actor = logging_actor
-        self.logging_task_handle = logging_task_handle
-        # Default to empty dict if None to prevent TypeError in ** unpacking
-        self.task_config = logging_task_config if logging_task_config else {}
-
     def assign_shard(self,assigned_episode_labels = None):
         from habitat.core.dataset import EpisodeIterator
         from habitat.gym import make_gym_from_config
@@ -341,9 +346,9 @@ class HabitatWorker:
 
         # Initialize Env
         # self.env = Env(self.config_env, dataset)
-        with suppress_cpp_output():
-            self.env = make_gym_from_config(self.config_env,dataset)
-        # self.env = make_gym_from_config(self.config_env,dataset)
+        # with suppress_cpp_output():
+        #     self.env = make_gym_from_config(self.config_env,dataset)
+        self.env = make_gym_from_config(self.config_env,dataset)
 
         # Setup Iterator 
         self.env.habitat_env.episode_iterator = EpisodeIterator(
@@ -426,7 +431,6 @@ class HabitatWorker:
             output_schema: use and set the step output schema
         """
         # Access the habitat core environment
-        self.invoke_logging()
         self.steps = defaultdict(list)  # Clear video cache for new episode
 
         if episode_id is not None:
@@ -459,79 +463,11 @@ class HabitatWorker:
         self.last_step = step_dict
         return self._apply_schema(step_dict,self.output_schema)
 
-    def save_video(self, output_dir, prefix="ep",fps=4,quality = 3):
-        from habitat.utils.visualizations import utils as vut
-
-        """
-        Renders the cached video to disk using Habitat's utils.
-        Returns the path to the saved file.
-        - quality: 0-10
-        -
-        """
-        if not self.steps:
-            return None
-
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-
-        # Construct filename
-        current_ep_id = self.env.current_episode().episode_id
-        scene_id = get_scene_id(self.env.current_episode().scene_id)
-        filename = f"{prefix}_{scene_id}_{current_ep_id}"
-        obs_schema = {"rgb":True}
-        action_list = ["STOP","MOVE_FORWARD","TURN_LEFT","TURN_RIGHT","LOOK_UP","LOOK_DOWN"]
-        images = [vut.observations_to_image(self._apply_schema(obs,obs_schema),info) for obs,info in zip(self.steps['obs'],self.steps['info'])]
-        self.steps['action'].append(0)
-        texts = [   [
-                    f"episode: {self.steps['info'][0]['episode_label']} step: {idx}",
-                    action_list[int(action)],
-                    f"distance_to_goal: {info['distance_to_goal']}",
-                    f"distance_reward: {info['distance_to_goal_reward']}",
-                    f"goal: {obs['goal_name']}",
-                    f"spl: {self.steps['info'][-1]['spl']}",
-                    ]
-                for idx, (action,obs,info) in enumerate(zip(self.steps['action'],self.steps['obs'],self.steps['info']))]
-        images = [vut.overlay_text_to_image(image,text) for image,text in zip(images,texts)]
-        # Use Habitat's video utility
-        
-        vut.images_to_video(
-            images=images,
-            # primary_image_key="rgb",
-            output_dir=output_dir,
-            video_name=filename,
-            fps=fps,
-            quality = quality,
-            verbose=False
-        )
+    def save_video(self, output_dir, fps=4,quality = 3):
+        filename = self.steps['info'][0]['episode_label']
+        video_path,thumbnail = save_run_video(self.steps,filename,output_dir,fps,quality)
         # self.steps = defaultdict(list) # clear buffer after save
-        return os.path.join(output_dir, filename + ".mp4")
-        
-    def invoke_logging(self):
-        """
-        Invokes the logging task with strict Node Affinity to prevent data transfer costs.
-        """
-        if not self.logging_actor or not self.logging_task_handle or not self.steps:
-            return
-        # 1. Capture and Clear (Earliest Safe Time)
-        raw_episode_data = self.steps
-        self.steps = defaultdict(list)
-        # 2. Get Current Node ID for Affinity
-        # We must ensure the processing task runs on THIS node to process the 
-        # large 'raw_episode_data' locally before sending the summary to the actor.
-        current_node_id = ray.get_runtime_context().get_node_id()
-
-        # We unroll 'self.task_config' here. This satisfies the "baking" requirement
-        # while keeping the handle raw so we can access .options().
-        self.logging_task_handle.options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=current_node_id, 
-                soft=False # Force strict locality
-            )
-        ).remote(
-            actor_handle=self.logging_actor,
-            episode_data=raw_episode_data,
-            **self.task_config # e.g. contains output_dir="/tmp/logs"
-        )
+        return video_path, thumbnail
 
     def _cache_step(self, step):
         """Internal helper to format observations for make_video."""
@@ -673,128 +609,218 @@ class HabitatWorker:
             return np.array(list(data))
         # 5. Handle Basic Primitives (int, float, str, bool, None)
         return data
+
+# Inherit from your existing base worker
+# from your_project import HabitatWorker, default_habitat_log_task
+
+class LoggingHabitatWorker(HabitatWorker):
     
+    def __init__(
+        self, 
+        *args, 
+        logging_output_dir: str,
+        logger_actor: Any = None,
+        **kwargs
+    ):
+        from pathlib import Path
+        self.log_dir = Path(logging_output_dir).resolve()
+
+        # Use the new default_logging_schema provided in your prompt if none is passed
+            
+        super().__init__(*args, **kwargs)
+        
+        self.logger_actor = logger_actor
+        os.makedirs(self.log_dir, exist_ok=True)
+
+    def _flush_logs_to_disk(self):
+        """
+        Orchestrates saving heavy artifacts to disk and sending lightweight references to Ray.
+        """
+        # 1. Resolve Naming & Directory
+        # Use first step info for stable IDs (scene, episode)
+        first_info = self.steps['info'][0] if self.steps['info'] else {}
+        scene_id = first_info.get('scene_id', 'unknown_scene')
+        ep_label = first_info.get('episode_label', f"ep_{int(time.time())}")
+        
+        # Create dedicated folder: /logs/scene_X/episode_label/
+        # This keeps artifacts (video, thumb, json) grouped together
+        save_dir = os.path.join(self.log_dir, scene_id, str(ep_label))
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 2. Calculate Metrics & Split Data
+        # Returns scalars (episode_logs) and raw lists (sequence_logs)
+        episode_logs, sequence_logs = habitat_logging_helper(self.steps)
+
+        # 3. Generate & Save Video + Thumbnail
+        # Uses your helper. Returns (video_path_string, PIL_Image)
+        vid_path, thumb_img = save_run_video(
+            steps_data=self.steps,
+            filename="video", # save_run_video adds extension
+            output_dir=save_dir,
+            quality=3,
+            return_thumbnail=True
+        )
+        
+        # Manually save the thumbnail object to disk
+        thumb_path = os.path.join(save_dir, "thumbnail.jpg")
+        Image.fromarray(thumb_img).save(thumb_path, quality=85)
+
+        # 4. Save Raw Sequence Data (The "Raw Data" Fix)
+        # Dump trajectory/actions to JSON so we don't lose granular history
+        seq_path = os.path.join(save_dir, "trace.json")
+        
+        # Convert numpy types to native python for JSON serialization
+        def default_serializer(obj):
+            if isinstance(obj, np.integer): return int(obj)
+            if isinstance(obj, np.floating): return float(obj)
+            if isinstance(obj, np.ndarray): return obj.tolist()
+            return str(obj)
+
+        with open(seq_path, 'w') as f:
+            json.dump(sequence_logs, f, default=default_serializer)
+
+        with open(os.path.join(self.log_dir,"results"),'a') as f:
+            f.write(json.dumps(episode_logs,default=default_serializer)+"\n") #save the result
+
+        # 5. Construct Global Payload (Paths + Scalars)
+        # Merge the scalar metrics with the file paths
+        payload = {
+            **episode_logs,
+            "vid/episode_video": vid_path,  # Path for WandB Video
+            "img/thumbnail": thumb_path,    # Path for WandB Image
+            "raw/trace": seq_path,          # Path for WandB Artifact/File
+            
+            # System Metadata
+            "worker_pid": os.getpid(),
+            "node": os.uname().nodename,
+            "timestamp": time.time()
+        }
+
+        # 6. Send to Global Logger
+        if self.logger_actor:
+            self.logger_actor.log_row.remote(payload)
+    def reset(self, episode_id=None,output_schema=None,logging_schema=None):
+        if len(self.steps['action'])>0:
+            self._flush_logs_to_disk()
+        return HabitatWorker.reset(self,episode_id,output_schema,logging_schema)
+
 if __name__ == "__main__":
-    # --- Performance Benchmark Section ---
     import time
     import numpy as np
-    import sys
+    import os
 
-    # Settings
-    WARMUP_STEPS = 5
-    BENCHMARK_STEPS = 300
-    
-    print(f"=== Starting Vanilla HabitatWorker Benchmark ===")
-    
-    # 1. Init
-    # We use workspace=None to assume we are running in the correct CWD
-    # We ENABLE caching and postprocessing to mimic the full production overhead
-    print("Initializing Worker (Full Config)...")
-    worker = HabitatWorker(
-        workspace='/Projects/SG_VLN_HumanData/SG-VLN', 
-        enable_caching=True, 
-        postprocess=True
-    )
-    
-    print("Resetting Environment...")
-    first_obs = worker.reset()
-    
-    # 2. Payload Inspection (Crucial for Ray optimization)
-    # If this number is high (>5MB), that explains Ray latency (serialization cost)
-    print("\n--- Payload Analysis ---")
-    if 'obs' in first_obs and 'rgb' in first_obs['obs']:
-        rgb = first_obs['obs']['rgb']
-        print(f"RGB Shape: {rgb.shape}, Type: {rgb.dtype}")
-        print(f"RGB Raw Size: {rgb.nbytes / 1024 / 1024:.2f} MB")
-    else:
-        print("Warning: No RGB data found in observation.")
-    print("------------------------\n")
 
-    # 3. Warmup
-    print(f"Warming up for {WARMUP_STEPS} steps...")
-    for _ in range(WARMUP_STEPS):
-        worker.step(1) 
-        
-    # 4. Perf Loop
-    print(f"Running Benchmark for {BENCHMARK_STEPS} steps...")
-    steps_completed = 0
-    t_start = time.time()
+    # --- Configuration ---
+    LOG_OUTPUT_DIR = "/Projects/SG_VLN_HumanData/spatial_training/dump/test"
+    MAX_TEST_STEPS = 100 # Safety cap
     
-    for i in range(BENCHMARK_STEPS):
-        # Sample action 1-3 (Move/Turn) to keep episode active
-        # We assume discrete action space
-        action = int(np.random.randint(1, 4))
-        
-        res = worker.step(action)
-        steps_completed += 1
-        
-        # Handle natural episode endings
-        if res.get('done', False):
-            worker.reset()
 
-    t_end = time.time()
-    duration = t_end - t_start
-    sps = steps_completed / duration
-    
-    print(f"\n=== Results ===")
-    print(f"Total Time: {duration:.4f}s")
-    print(f"Total Steps: {steps_completed}")
-    print(f"Throughput: {sps:.2f} Steps/Sec")
-    # --- Logging & Video Generation Benchmark (Vanilla) ---
-    print("\n=== Testing Logging & Video Generation (Vanilla) ===")
-    
-    # 1. Mock the Logging Actor
-    # Since we stripped @ray.remote, we need a dummy object that accepts 
-    # .remote() calls to simulate the Ray actor interface.
+    print(f"\n=== Starting LoggingHabitatWorker Test ===")
+
+    # 1. Mock the Ray Logging Actor
+    # This simulates the remote receiving end of your pipeline
     class MockLoggingActor:
         class RemoteHandle:
             def remote(self, row):
-                print("\n[MockLogger] SUCCESS! Received Log Row:")
+                print(f"\n[MockLogger] >> SIGNAL RECEIVED! Worker sent payload:")
                 for k, v in row.items():
-                    # Truncate long strings/paths for clean output
-                    val_str = str(v)
-                    if len(val_str) > 100: val_str = val_str[:97] + "..."
-                    print(f"  {k:<25}: {val_str}")
-        
+                    # Check if it's a path or a scalar
+                    val_type = "SCALAR"
+                    if isinstance(v, str) and (os.path.sep in v or "." in v):
+                        val_type = "PATH  "
+                    print(f"  [{val_type}] {k:<25}: {v}")
+
         def __init__(self):
             self.log_row = self.RemoteHandle()
 
     mock_actor = MockLoggingActor()
 
-    # # 2. Collect a fresh, short episode for the test
-    # # We use a custom schema here just to verify the worker accepts it,
-    # # though the logging task will use the raw cached steps.
-    # test_schema = {
-    #     "obs": {"rgb": True, "goal_name": True},
-    #     "info": {"top_down_map": {"map": True}, "distance_to_goal": True},
-    #     "action": True, "done": True
-    # }
-    
-    # print("Collecting short episode data (20 steps)...")
-    # worker.reset(output_schema=test_schema)
-    # for _ in range(20):
-    #     worker.step(1) # Move forward
-    
-    # 3. Prepare Data
-    # worker.steps contains the raw buffer (dict of lists)
-    episode_data = worker.steps
-    
-    # Force the episode label to "test_video" so the output filename is predictable
-    if len(episode_data['info']) > 0:
-        episode_data['info'][0]['episode_label'] = "test_video"
-
-    # 4. Run the Log Task (Synchronously)
-    print("Running default_habitat_log_task (Video Generation + Metrics)...")
-    t0_log = time.time()
-    
-    # We pass '.' as output_dir to save to current directory
-    default_habitat_log_task(
-        actor_handle=mock_actor,
-        episode_data=episode_data,
-        output_dir=".", 
-        quality=1 # Low quality for speed in benchmark
+    # 2. Initialize the New Worker
+    # We pass the default schema explicitly to ensure the worker captures 
+    # exactly what we expect (RGB + Metrics + Map)
+    print("Initializing LoggingHabitatWorker...")
+    worker = LoggingHabitatWorker(
+        workspace='/Projects/SG_VLN_HumanData/SG-VLN', 
+        enable_caching=True, 
+        postprocess=True,
+        logging_output_dir=LOG_OUTPUT_DIR,
+        logger_actor=mock_actor,
+        logging_schema=default_logging_schema # Defined in your script above
     )
     
-    print(f"Task Duration: {time.time() - t0_log:.4f}s")
-    print(f"Video saved to: {os.path.abspath('test_video.mp4')}")
+    print("Resetting Environment...")
+    first_obs = worker.reset()
+
+    # 3. Payload Check (Sanity Check)
+    # Ensure the worker is actually producing RGB data to log
+    if 'obs' in worker.steps and len(worker.steps['obs']) > 0:
+        rgb_sample = worker.steps['obs'][0].get('rgb')
+        if rgb_sample is not None:
+            print(f"Worker is buffering RGB: {rgb_sample.shape} | {rgb_sample.nbytes / 1024**2:.2f} MB")
+        else:
+            print("WARNING: RGB not found in worker buffer!")
+
+    # 4. Run Execution Loop (Until Done)
+    print(f"\nRunning Episode (Max {MAX_TEST_STEPS} steps)...")
+    
+    t_start = time.time()
+    steps_completed = 0
+    done = False
+    
+    while not done and steps_completed < MAX_TEST_STEPS:
+        # Action 1 = Move Forward (usually)
+        # We mix in some turns (2, 3) to make the video interesting
+        action = np.random.choice([1, 2, 3], p=[0.8, 0.1, 0.1])
+        
+        # === THE CRITICAL PART ===
+        # The worker.step() method contains the trigger logic.
+        # When 'done' becomes True, it will auto-flush to disk.
+        step = worker.step(action)
+        reward = step['reward']
+        done = step['done']
+        steps_completed += 1
+        
+        if steps_completed % 10 == 0:
+            print(f"Step {steps_completed}: Action {action}, Reward {reward:.4f}...", end='\r')
+
+    t_end = time.time()
+    duration = t_end - t_start
+    
+    print(f"\n\n=== Episode Finished ===")
+    print(f"Status: {'DONE (Natural)' if done else 'STOPPED (Max Steps)'}")
+    print(f"Steps: {steps_completed}")
+    print(f"Duration: {duration:.4f}s (FPS: {steps_completed/duration:.2f})")
+
+    # 5. Verification
+    # If the episode finished naturally, the MockLogger should have printed above.
+    # We also verify the files exist on disk.
+    worker._flush_logs_to_disk() # Uncomment to force test if needed
+
+    print("\n=== Verifying Artifacts on Disk ===")
+    
+    # Find the generated folder (it uses scene_id/episode_label structure)
+    # We just walk the log dir to find it
+    found_video = False
+    found_trace = False
+    
+    for root, dirs, files in os.walk(LOG_OUTPUT_DIR):
+        for file in files:
+            path = os.path.join(root, file)
+            size_mb = os.path.getsize(path) / 1024 / 1024
+            
+            if file.endswith(".mp4"):
+                print(f"  [VIDEO] Found: {file} ({size_mb:.2f} MB)")
+                found_video = True
+            elif file.endswith(".json"):
+                print(f"  [TRACE] Found: {file} ({size_mb:.2f} MB)")
+                found_trace = True
+            elif file.endswith(".jpg"):
+                print(f"  [THUMB] Found: {file} ({size_mb:.2f} MB)")
+
+    if not done:
+        print("\nNOTE: Episode did not finish naturally, so flush may not have triggered.")
+        print("To test flush manually, you can call: worker._flush_logs_to_disk()")
+
+    print("\nTest Complete.")
     worker.close()
+
