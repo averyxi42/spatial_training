@@ -242,7 +242,7 @@ def run_inference_driver(
             
             # LAUNCH SUPERVISOR
             # The supervisor coordinates the interaction between VLM and Habitat for ONE episode.
-            print("dispatching episode!")
+            print("dispatching new episode!")
             sup_ref = vlm.run_episode.remote(
                 hab, init_state_ref
             )
@@ -265,7 +265,7 @@ def run_inference_driver(
             # --- CASE 1: A Habitat Finished Resetting ---
             if ref in pending_resets:
                 sim_handle = pending_resets.pop(ref)
-                
+                print("new habitat worker ready!")
                 # The worker is now ready for a VLM.
                 # We store the ref (initial observation) to pass to the supervisor.
                 ready_habitats.append((sim_handle, ref))
@@ -285,6 +285,7 @@ def run_inference_driver(
                 # 2. Recycle Habitat
                 try:
                     if needs_reshard:
+                        print("worker depleted! trying to assigning new shard")
                         # Pull new work from the iterator
                         new_shard = next(shard_iterator)
                         hab.assign_shard.remote(new_shard)
@@ -296,6 +297,13 @@ def run_inference_driver(
                     # No more work available. Retire the Habitat worker.
                     print(f"Worker finished and no shards remain. Retiring.")
                     pass
-
+    print("out of episodes to run, cleaning up...")
+    for sim_handle in sim_handles:
+        try:
+            sim_handle.reset.remote()
+        except:
+            print("cannot reset habitat!")
+            # Worker is retired immediately if no work exists
+            pass
     print(f"Inference complete. Processed {len(results)} episodes.")
     return results

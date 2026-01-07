@@ -138,7 +138,8 @@ default_logging_schema = {
             "agent_map_coord": True,
             "agent_angle": True
         },
-        "pos_rots":True
+        "pos_rots":True,
+        "success": True
     },
     
     # 3. Top-Level Primitives (Required for Metrics/Video)
@@ -313,7 +314,10 @@ class HabitatWorker:
         self.full_dataset = make_dataset(
             self.config_env.habitat.dataset.type, config=self.config_env.habitat.dataset
         )
-        self.assign_shard(assigned_episode_labels)
+        if assigned_episode_labels is not None:
+            self.assign_shard(assigned_episode_labels)
+        else:
+            print("skipping sim initialization since no shards provided, please call assign_shard")
 
     def assign_shard(self,assigned_episode_labels = None):
         from habitat.core.dataset import EpisodeIterator
@@ -346,9 +350,9 @@ class HabitatWorker:
 
         # Initialize Env
         # self.env = Env(self.config_env, dataset)
-        # with suppress_cpp_output():
-        #     self.env = make_gym_from_config(self.config_env,dataset)
-        self.env = make_gym_from_config(self.config_env,dataset)
+        with suppress_cpp_output():
+            self.env = make_gym_from_config(self.config_env,dataset)
+        # self.env = make_gym_from_config(self.config_env,dataset)
 
         # Setup Iterator 
         self.env.habitat_env.episode_iterator = EpisodeIterator(
@@ -379,8 +383,9 @@ class HabitatWorker:
         if self.fp_guard and action==0 and last_distance > 0.1:
             action = np.random.choice([1,2,3]) #chose random non stop action
             extras['fp_stop'] = 1 #record the false positive incident
-        if self.fn_guard and last_distance<0.1 and action!=0:
-            action = 0
+        if last_distance<0.1 and action!=0:
+            if self.fn_guard: 
+                action = 0
             extras['fn_stop'] = 1
         import time
         # t0 = time.time()

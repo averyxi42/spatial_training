@@ -39,6 +39,8 @@ class WandbLoggerActor:
         self.columns = None
         self.rows_since_last_commit = 0
 
+        self.defined_metrics = set()
+
     def log_global_metrics(self, metrics: dict, step=None):
         """
         For Driver-side metrics: Training Loss, Learning Rate, Epoch, etc.
@@ -71,7 +73,8 @@ class WandbLoggerActor:
             else:
                 # C. Pass-through (Scalars, Strings, Lists, or None values)
                 processed_row[k] = v
-
+                 # --- New: Accumulate Summary Stats ---
+                # Check if the value is a scalar (int, float, or numpy number)
         # --- 2. Lazy Table Init ---
         if self.table is None:
             self.columns = sorted(list(processed_row.keys()))
@@ -90,6 +93,14 @@ class WandbLoggerActor:
             k: v for k, v in processed_row.items() 
             if not isinstance(v, (list, np.ndarray, wandb.Image, wandb.Video))
         }
+        for k, v in log_payload.items():
+            if k not in self.defined_metrics:
+                # Filter for numeric types (exclude bools, strings, and None)
+                if isinstance(v, (int, float, np.number)) and not isinstance(v, bool):
+                    self.run.define_metric(k, summary="mean")
+                    self.run.define_metric(k, summary="max")
+                    self.run.define_metric(k, summary="min")
+                    self.defined_metrics.add(k)
 
         # --- 5. Conditional Commit ---
         if self.rows_since_last_commit >= self.commit_interval:

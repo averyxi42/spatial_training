@@ -11,9 +11,15 @@ from utils.logging_workers import WandbLoggerActor
 from string import Template
 
 '''
+Eval Usage Example
+python3 inference_main.py --model-id Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800 --ray-address local --shard-size 6 --subset-label sample400_a --num-vlms 2 --num-sims 3 --attn-impl='flash_attention_2' --dtype='float16' --max-steps 300 --wandb-project 'single_action_eval' --run-name float16fa2
+'''
+'''
+Debug Usage Example
+
 python3 inference_main.py --model-id Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800 --ray-address local --wandb-project 'test_mp' --shard-size 20 --subset-label sample400_a --num-vlms 1 --num-sims 2 --attn-impl='flash_attention_2' --dtype='bfloat16'
 python3 inference_main.py --model-id Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800 --ray-address local --shard-size 0 --subset-label sample400_a --num-vlms 1 --num-sims 1 --attn-impl='flash_attention_2' --dtype='bfloat16' --max-steps 200
-
+python3 inference_main.py --model-id Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800 --ray-address local --shard-size 30 --subset-label sample400_a --num-vlms 2 --num-sims 3 --attn-impl='flash_attention_2' --dtype='float16' --max-steps 300 --wandb-project 'test_mp'
 '''
 # If you have a dedicated logger actor
 # from utils.logger import LoggingActor 
@@ -188,8 +194,8 @@ def main():
             "temperature": 1.2, # Sweet spot
             "convo_start_template": CONVO_START_TEMPLATE, #template for the initial conversation chunk
             "convo_turn_template": CONVO_TURN_TEMPLATE, #template for the recurrent conversation chunks
-            "fp_guard": False, # use oracle to prevent incorrect stop actions
-            "fn_guard": True, # use oracle to automatically perform stop action
+            "fp_guard": True, # use oracle to prevent incorrect stop actions
+            "fn_guard": False, # use oracle to automatically perform stop action
             "action_space":action_space_list,
             "action_space_str":"[stop, forward, left, right, up, down]"
         },

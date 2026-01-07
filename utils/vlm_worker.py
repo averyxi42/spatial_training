@@ -222,7 +222,6 @@ class VLMWorker:
         logprobs = logprobs[0]
         probs = np.exp(logprobs)
         probs /= np.sum(probs)
-        print(probs)
         return probs
 
 
