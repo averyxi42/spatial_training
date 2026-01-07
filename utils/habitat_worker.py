@@ -129,6 +129,7 @@ default_logging_schema = {
         "distance_to_goal": True,
         "distance_to_goal_reward": True,
         "spl": True,
+        "soft_spl":True,
         "episode_label": True,
         "scene_id": True,
         # Critical for drawing the map overlay in vut.observations_to_image
@@ -642,7 +643,7 @@ class LoggingHabitatWorker(HabitatWorker):
         Orchestrates saving heavy artifacts to disk and sending lightweight references to Ray.
         """
         if len(self.steps['action'])==0:
-            print("erroneous log flush called, no step cache")
+            print("log flush called, but step cache is empty! skipping...")
             return
         # 1. Resolve Naming & Directory
         # Use first step info for stable IDs (scene, episode)
@@ -665,7 +666,7 @@ class LoggingHabitatWorker(HabitatWorker):
             steps_data=self.steps,
             filename="video", # save_run_video adds extension
             output_dir=save_dir,
-            quality=3,
+            quality=4,
             return_thumbnail=True
         )
         

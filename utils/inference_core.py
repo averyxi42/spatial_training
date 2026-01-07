@@ -6,6 +6,7 @@ from PIL import Image
 from utils.habitat_worker import LoggingHabitatWorker
 from utils.vlm_worker import VLMWorker
 import numpy as np
+from tqdm import tqdm
 
 def substitute_convo_template(conversation_template: List[Dict], substitutions: Dict[str, Any]) -> List[Dict]:
     """
@@ -70,7 +71,7 @@ class EpisodeRolloutMixin:
             messages = substitute_convo_template(self.rollout_config['convo_start_template'],state_dict['obs'] | self.rollout_config)
             # 2. The Interaction Loop
             vlm_logs={}
-
+            goal_name = state_dict['obs']['goal_name']
             while not done and step_count < self.rollout_config['max_steps']:
                 # A. Prepare VLM Input
                 # (Assuming your formatting logic is here)
@@ -101,15 +102,13 @@ class EpisodeRolloutMixin:
                 done = state_dict['done']
                 step_count += 1
 
-            return ray.get_runtime_context().current_actor,habitat_handle,state_dict['is_exhausted'], state_dict['info']
+            return ray.get_runtime_context().current_actor,habitat_handle,state_dict['is_exhausted'], state_dict['info'] | {"steps":step_count, "goal_name":goal_name}
         except Exception as e:
             print(f"Episode failed: {e}")
             # Return handles anyway so we don't leak resources (or handle crash logic)
             return ray.get_runtime_context().current_actor,habitat_handle,False, None
         finally:
             self.reset()
-
-
 
 # from utils.logging_worker import LoggingHabitatWorker
 
@@ -267,7 +266,7 @@ def run_inference_driver(
             # --- CASE 1: A Habitat Finished Resetting ---
             if ref in pending_resets:
                 sim_handle = pending_resets.pop(ref)
-                print("new habitat worker ready!")
+                print("new habitat worker ready!",end=" ")
                 # The worker is now ready for a VLM.
                 # We store the ref (initial observation) to pass to the supervisor.
                 ready_habitats.append((sim_handle, ref))
@@ -301,4 +300,8 @@ def run_inference_driver(
                     print(f"Worker finished and no shards remain. Retiring.")
                     pass
     print(f"Inference complete. Processed {len(results)} episodes.")
+    print(f"Cleaning up by forcing log flush...")
+    for sim_handle in tqdm(sim_handles):
+        ray.get(sim_handle._flush_logs_to_disk.remote())
+    print("done flushing!")
     return results

@@ -129,6 +129,7 @@ def create_shard_iterator(
     # Simple list slicing generator
     for i in range(0, len(all_episodes), shard_size):
         yield all_episodes[i : i + shard_size]
+
 def trivial_shard_iterator():
     '''
     yields the trivial shard (None) once.
@@ -194,7 +195,7 @@ def main():
             "temperature": 1.2, # Sweet spot
             "convo_start_template": CONVO_START_TEMPLATE, #template for the initial conversation chunk
             "convo_turn_template": CONVO_TURN_TEMPLATE, #template for the recurrent conversation chunks
-            "fp_guard": True, # use oracle to prevent incorrect stop actions
+            "fp_guard": False, # use oracle to prevent incorrect stop actions
             "fn_guard": False, # use oracle to automatically perform stop action
             "action_space":action_space_list,
             "action_space_str":"[stop, forward, left, right, up, down]"
@@ -298,10 +299,11 @@ def main():
             shard_iterator=shard_iter
         )
         # 6. Save Final Results
-        out_file = os.path.join(args.output_dir, f"{args.run_name}","metrics.json")
+        out_file = os.path.join(args.output_dir, f"{args.run_name}","metrics.jsonl")
         os.makedirs(os.path.dirname(out_file), exist_ok=True)
-        with open(out_file, 'w') as f:
-            json.dump(metrics, f, indent=2)
+        with open(out_file, 'a') as f:
+            for metric in metrics:
+                f.write(json.dumps(metric)+"\n")
             
         logger.info(f"Success! Metrics saved to {out_file}")
 
