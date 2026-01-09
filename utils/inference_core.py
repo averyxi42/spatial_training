@@ -65,7 +65,15 @@ class EpisodeRolloutMixin:
             # 1. Resolve the initial state (Blocking wait for reset to finish)
             # Ray automatically waits for initial_state_ref to be ready before starting this task,
             # but we call ray.get to access the data.
-            rgb,state_dict = initial_state_ref
+            pos_id_kwargs={
+                "mode": "standard"
+            }
+            if len(initial_state_ref)==2:
+                rgb,state_dict = initial_state_ref
+            elif len(initial_state_ref)==3:
+                rgb,patch_coords,state_dict = initial_state_ref
+                pos_id_kwargs['patch_coords'] = patch_coords
+                pos_id_kwargs['mode'] = "bev"
             step_count = 0
             done = False
             messages = substitute_convo_template(self.rollout_config['convo_start_template'],state_dict['obs'] | self.rollout_config)
@@ -82,7 +90,7 @@ class EpisodeRolloutMixin:
                 # print("inferring VLM with messages:")
                 # print(messages)
                 t0 = time.time()
-                action_probs = self.infer_probs(images=[rgb_pil],messages=messages,temperature = self.rollout_config['temperature'])
+                action_probs = self.infer_probs(images=[rgb_pil],messages=messages,temperature = self.rollout_config['temperature'],pos_id_kwargs=pos_id_kwargs)
                 vlm_logs |= {'mean/vlm_latency':time.time()-t0,'min/vlm_latency':time.time()-t0,'max/vlm_latency':time.time()-t0}
                 # print(f"vlm step{step_count}")
                 # print("done")
@@ -94,7 +102,13 @@ class EpisodeRolloutMixin:
 
                 # D. Step Simulator (Blocking) ---------------------------RAY----------------------------- 
                 t0 = time.time()
-                rgb,state_dict = ray.get(habitat_handle.step.remote(action_id,supplementary_logs=vlm_logs))
+                state_ref = ray.get(habitat_handle.step.remote(action_id,supplementary_logs=vlm_logs))
+                if len(state_ref)==2:
+                    rgb,state_dict = state_ref
+                elif len(state_ref)==3:
+                    rgb,patch_coords,state_dict = state_ref
+                    pos_id_kwargs['patch_coords'] = patch_coords
+                    pos_id_kwargs['mode'] = "bev"
                 vlm_logs = {'mean/sim_latency':time.time()-t0,'min/sim_latency':time.time()-t0,'max/sim_latency':time.time()-t0}
 
                 messages = substitute_convo_template(self.rollout_config['convo_turn_template'],{"action":self.rollout_config['action_space'][action_id]})
@@ -105,6 +119,8 @@ class EpisodeRolloutMixin:
             return ray.get_runtime_context().current_actor,habitat_handle,state_dict['is_exhausted'], state_dict['info'] | {"steps":step_count, "goal_name":goal_name}
         except Exception as e:
             print(f"Episode failed: {e}")
+            import traceback
+            traceback.print_exc()
             # Return handles anyway so we don't leak resources (or handle crash logic)
             return ray.get_runtime_context().current_actor,habitat_handle,False, None
         finally:
@@ -144,7 +160,12 @@ class HabitatRayWorker(LoggingHabitatWorker):
             "info": {}
         }
         
-        return rgb, state_dict
+        if self.voxel_kwargs is None:
+            return rgb, state_dict
+        else:
+            patch_coords = state_dict['obs'].pop('patch_coords')
+            return rgb,patch_coords,state_dict
+
 
     def step(self, action: int, supplementary_logs: Dict[str, Any] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
@@ -160,7 +181,11 @@ class HabitatRayWorker(LoggingHabitatWorker):
         # 2. Inject the exhaustion flag
         result['is_exhausted'] = self.is_exhausted()
         # 'result' now acts as our 'state_dict' (sans the heavy RGB)
-        return rgb, result
+        if self.voxel_kwargs is None:
+            return rgb, result
+        else:
+            patch_coords = result['obs'].pop('patch_coords')
+            return rgb,patch_coords,result
 
 @ray.remote
 class VLMRayWorker(VLMWorker, EpisodeRolloutMixin):

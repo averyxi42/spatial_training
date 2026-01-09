@@ -1,8 +1,7 @@
 import numpy as np
 from PIL import Image as PILImage
 from pathlib import Path
-from einops import reduce
-import numpy as np
+import einops
 
 
 def load_depth(
@@ -57,9 +56,6 @@ def patch_average_einops(points: np.ndarray, patch_size: int) -> np.ndarray:
         p2=patch_size
     )
 
-import numpy as np
-import einops
-
 def depth_to_pointcloud(depth: np.ndarray, fov_degrees: float = 90.0) -> np.ndarray:
     """
     Vectorized unprojection.
@@ -105,7 +101,6 @@ def depth_to_pointcloud(depth: np.ndarray, fov_degrees: float = 90.0) -> np.ndar
     
     return points
 
-import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 def pos_rots_to_matrix(pos_rots: np.ndarray) -> np.ndarray:
@@ -137,6 +132,7 @@ def pos_rots_to_matrix(pos_rots: np.ndarray) -> np.ndarray:
     T[..., :3, 3] = pos
     
     return T
+
 def get_cv_to_habitat_correction() -> np.ndarray:
     """
     Returns the static 4x4 matrix converting CV Frame -> Habitat Frame.
@@ -163,6 +159,7 @@ def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     
     # 3. Crop back to 3D
     return points_transformed[..., :3]
+
 def transform_points_batch(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     """
     Applies a batch of transforms to a batch of point clouds.
@@ -205,8 +202,8 @@ def convert_cv_points_to_world(points_cv: np.ndarray, pos_rots: np.ndarray) -> n
     # 4. Apply
     return transform_points(points_cv, T_world_cv)
 
-import open3d as o3d
 def create_colored_pointcloud(points, rgb_image):
+    import open3d as o3d
     # ... (Same reshaping/normalization logic as before) ...
     if rgb_image.ndim == 3:
         colors = rgb_image.reshape(-1, 3)
@@ -351,18 +348,17 @@ def get_pos_id(input_ids,map_coords,processor,canvas_size=2000):
         pos_id[:,vision_origin:][:,trailing_text_mask] = torch.arange(trailing_text_num).repeat(3,1)+vision_origin+canvas_size
     return pos_ids
 
-def get_patch_coords(example):
+def get_patch_coords(pos_rots,depths,patch_size=32,resolution=0.15,fov_degrees=79):
     '''
-    example must contain: 
-    - pos_rots [[x,y,z,qx,qy,qz,w]...
-    - depth_sequence [valid paths to depth pngs]
+    maps square patches of the depth image to voxel grid positions in world frame.
+    note: patch size MUST divide the image dimensions.
+    - pos_rots: B by 7 poses
+    - depths: B by H by W depth image
+    - resolution: size of each voxel
     '''
-    mats = pos_rots_to_matrix(np.array(example['pos_rots'])) @ get_cv_to_habitat_correction()
-    depths = load_depths(example)
-    divisor = 1
-    ps = 32 //divisor
-    points = depth_to_pointcloud(depths,fov_degrees=79)
-    patch_coords = patch_average_einops(points,patch_size=ps)
+    mats = pos_rots_to_matrix(pos_rots) @ get_cv_to_habitat_correction()
+    points = depth_to_pointcloud(depths,fov_degrees=fov_degrees)
+    patch_coords = patch_average_einops(points,patch_size=patch_size)
     patch_coords_world = transform_points_batch(patch_coords,mats)
-    patch_coords_discrete = (patch_coords_world/0.15).astype(int)
+    patch_coords_discrete = np.round(patch_coords_world/resolution).astype(int) #TODO: need to round to closest grid. 
     return patch_coords_discrete

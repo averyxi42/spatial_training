@@ -5,7 +5,6 @@ from typing import Any, Callable, Optional, TypedDict, Union
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 import torch.nn as nn
 from transformers import AutoConfig
-
 def load_sparse_model(model_path, **kwargs):
     # 1. Load the Config
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
@@ -30,7 +29,6 @@ def load_sparse_model(model_path, **kwargs):
     )
     
     return model
-
 
 def extract_contiguous_segments(tensor, mask):
     """
@@ -77,140 +75,109 @@ def extract_contiguous_segments(tensor, mask):
 
     return results
 
-def filter_embeds(image_embeds, limit=None, threshold=0.8):
+def filter_embeds(
+    image_embeds, 
+    past_image_embeds=None, 
+    min_local_keep=30, 
+    max_local_keep=None, 
+    max_global_keep=None, 
+    threshold=0.8
+):
+    '''
+    warning: this function assumes all image_embeds are from the same sequence. if your batch size > 1, 
+    you must split the global image embeds list by batch.
+
+    :param image_embeds: list of num_image tensors of N_patch_in_image by N_hidden
+    :param past_image_embeds: tensor of N_patch_in_past by N_hidden. MUST BE NORMALIZED
+    :param min_local_keep: minimum number of patches kept per image
+    :param max_local_keep: maximum number of patches kept per image
+    :param max_global_keep: maximum number of patches kept for the entire input sequence
+    :param threshold: Description
+    '''
     import torch
     import torch.nn.functional as F
 
     device = image_embeds[0].device
-    # Normalize and Flatten
+    if past_image_embeds is not None:
+        past_image_embeds = past_image_embeds.to(device)
+    # 1. Normalize and Flatten
+    # We keep the list 'image_embeds' for the loop, but need a flat version for the DB
     image_embeds = [F.normalize(emb, p=2, dim=1) for emb in image_embeds]
     image_embeds_flat = torch.cat(image_embeds, dim=0)
     
     total_patches = image_embeds_flat.shape[0]
-    
-    # Pre-allocate mask (1 byte per patch, negligible memory)
     keep_mask = torch.zeros(total_patches, dtype=torch.bool, device=device)
     
-    # Initialize cursor and set first image as kept
-    cursor = image_embeds[0].shape[0]
-    keep_mask[:cursor] = True
+    cursor = 0
 
-    for embeds in image_embeds[1:]:
-        # Select currently kept embeddings using the mask slice
-        # Note: This limits the gather operation to only valid history up to 'cursor'
-        db = image_embeds_flat[:cursor][keep_mask[:cursor]]
-
-        # Similarity check
-        sim = (db @ embeds.T).amax(dim=0)
+    for embeds in image_embeds:
+        n_tokens = embeds.shape[0]
         
-        # Update mask directly (No concatenation overhead)
-        local_unique = sim < threshold
-        keep_mask[cursor : cursor + embeds.shape[0]] = local_unique
-        
-        cursor += embeds.shape[0]
+        # --- A. Compute Similarity vs HISTORY (if exists) ---
+        # We do this per-image to avoid allocating a massive (Past x Total_Seq) matrix
+        if past_image_embeds is not None and past_image_embeds.shape[0] > 0:
+            # (N_past, D) @ (D, N_curr) -> (N_past, N_curr) -> Max over past
+            hist_sim = (past_image_embeds @ embeds.T).amax(dim=0)
+        else:
+            hist_sim = torch.zeros(n_tokens, device=device)
 
-    # Convert mask to indices
+        # --- B. Compute Similarity vs LOCAL CONTEXT ---
+        # Slice the flattened array to get all *kept* tokens seen so far in this sequence
+        valid_history_mask = keep_mask[:cursor]
+        
+        if valid_history_mask.any():
+            local_db = image_embeds_flat[:cursor][valid_history_mask]
+            # (N_local_kept, D) @ (D, N_curr) -> Max over local
+            local_sim = (local_db @ embeds.T).amax(dim=0)
+            
+            # Token is redundant if it matches History OR Local Context
+            final_sim = torch.maximum(hist_sim, local_sim)
+        else:
+            # First image, or previous images were entirely dropped
+            final_sim = hist_sim
+        # --- C. Determine Keepers & Apply Local Limits ---
+        
+        # 1. Identify natural keepers based on threshold
+        # (Low similarity = Unique = Keep)
+        should_keep = final_sim < threshold
+        num_keep = should_keep.sum()
+        
+        # 2. Calculate target count based on limits
+        target_count = num_keep
+        
+        if min_local_keep is not None:
+            target_count = max(target_count, min_local_keep)
+        if max_local_keep is not None:
+            target_count = min(target_count, max_local_keep)
+            
+        # Ensure target doesn't exceed actual token count
+        target_count = min(target_count, n_tokens)
+        
+        # 3. If limits force a change, assume "Lowest Similarity" -> "Most Unique/Important"
+        if target_count != num_keep:
+            # Sort by similarity ascending (0.1, 0.2, ... 0.9)
+            # We want to keep the lowest values.
+            _, sorted_indices = torch.sort(final_sim, descending=False)
+            
+            # Reset mask and pick top k unique
+            should_keep = torch.zeros_like(should_keep)
+            should_keep[sorted_indices[:target_count]] = True
+
+        # --- D. Update Global Mask ---
+        keep_mask[cursor : cursor + n_tokens] = should_keep
+        cursor += n_tokens
+
+    # --- E. Handle Global Limit ---
     embeds_to_keep_idx = torch.nonzero(keep_mask).squeeze()
-
-    # Handle Limit
-    if limit is not None and embeds_to_keep_idx.numel() > limit:
-        subset = torch.randperm(embeds_to_keep_idx.numel(), device=device)[:limit]
+    
+    if max_global_keep is not None and embeds_to_keep_idx.numel() > max_global_keep:
+        # For global limit, we randomly sample to preserve distribution across images
+        # (Or you could implement a global priority queue, but random is standard here)
+        subset = torch.randperm(embeds_to_keep_idx.numel(), device=device)[:max_global_keep]
         embeds_to_keep_idx = embeds_to_keep_idx[subset]
         embeds_to_keep_idx, _ = embeds_to_keep_idx.sort()
 
-    return embeds_to_keep_idx
-
-# def filter_embeds(image_embeds, limit=None, threshold=0.8):
-#     import torch
-#     import torch.nn.functional as F
-
-#     # 1. Normalize upfront (In-place if possible to save memory, though F.normalize creates copy)
-#     # We process them one by one to avoid creating one giant 'image_embeds_flat' initially if possible,
-#     # but since we need to return global indices later, we need to track offsets.
-    
-#     device = image_embeds[0].device
-    
-#     # Store kept segments to avoid re-allocating the 'db' tensor every loop
-#     # kept_history_chunks[i] = tensor of shape (N_kept_in_image_i, Dim)
-#     kept_history_chunks = []
-    
-#     # We still need to track which *original* indices we kept. 
-#     # Let's just store the integer indices directly.
-#     kept_global_indices = []
-    
-#     current_offset = 0
-    
-#     # Handle first image (Always keep all)
-#     first_img = F.normalize(image_embeds[0], p=2, dim=1)
-#     kept_history_chunks.append(first_img)
-    
-#     # Create indices for first image [0, 1, ... N-1]
-#     n_first = first_img.shape[0]
-#     kept_global_indices.append(torch.arange(n_first, device=device))
-#     current_offset += n_first
-
-#     # Iterate through subsequent images
-#     for i in range(1, len(image_embeds)):
-#         # Current candidate image
-#         curr_img_raw = image_embeds[i]
-#         curr_img = F.normalize(curr_img_raw, p=2, dim=1)
-#         n_curr = curr_img.shape[0]
-        
-#         # We need to find max similarity of each token in curr_img 
-#         # against ALL tokens in kept_history_chunks.
-        
-#         # Initialize max_sim with -1 (or very small)
-#         # Shape: (N_curr,)
-#         global_max_sim = torch.full((n_curr,), -1.0, device=device, dtype=curr_img.dtype)
-        
-#         # Compare against history chunks (Streaming)
-#         for chunk in kept_history_chunks:
-#             # chunk: (N_hist, D)
-#             # curr_img: (N_curr, D)
-#             # sim_chunk: (N_hist, N_curr) -> This is much smaller than (Total_Hist, N_curr)
-            
-#             # We want max over history dimension (dim 0)
-#             # Optimization: We don't need the full matrix, just the max values.
-#             # But torch.matmul is fastest way.
-            
-#             sim_chunk = torch.matmul(chunk, curr_img.T)
-#             max_sim_chunk = sim_chunk.amax(dim=0) # Shape (N_curr,)
-            
-#             # Update global max
-#             global_max_sim = torch.maximum(global_max_sim, max_sim_chunk)
-            
-#         # Determine which tokens to keep in current image
-#         local_keep_mask = global_max_sim < threshold
-        
-#         # 1. Add kept tokens to history for FUTURE images
-#         # Only slice and store what we need. 
-#         if local_keep_mask.any():
-#             kept_tokens = curr_img[local_keep_mask]
-#             kept_history_chunks.append(kept_tokens)
-            
-#             # 2. Record global indices
-#             # Local indices of kept tokens
-#             local_indices = torch.nonzero(local_keep_mask).squeeze(-1)
-#             # Convert to global scope
-#             global_indices = local_indices + current_offset
-#             kept_global_indices.append(global_indices)
-        
-#         current_offset += n_curr
-
-#     # Concatenate all indices at the very end
-#     if not kept_global_indices:
-#         return torch.tensor([], device=device, dtype=torch.long)
-        
-#     embeds_to_keep_idx = torch.cat(kept_global_indices)
-
-#     # Handle Limit (Post-process)
-#     if limit is not None and embeds_to_keep_idx.numel() > limit:
-#         # Random subset
-#         subset = torch.randperm(embeds_to_keep_idx.numel(), device=device)[:limit]
-#         embeds_to_keep_idx = embeds_to_keep_idx[subset]
-#         embeds_to_keep_idx, _ = embeds_to_keep_idx.sort()
-
-#     return embeds_to_keep_idx
+    return embeds_to_keep_idx, image_embeds_flat[embeds_to_keep_idx].detach()
 
 class Qwen3VLSparseTextModel(Qwen3VLTextModel):
     def forward(
@@ -225,6 +192,8 @@ class Qwen3VLSparseTextModel(Qwen3VLTextModel):
         # args for deepstack
         visual_pos_masks: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+        past_image_embeds = None,
+        save_image_db = False,
         **kwarg,
     ):
         # print(input_ids.shape)
@@ -261,14 +230,18 @@ class Qwen3VLSparseTextModel(Qwen3VLTextModel):
                 
                 # C. Extract and Filter
                 image_embeds_list = extract_contiguous_segments(inputs_embeds, visual_pos_masks)
-                
+                # TODO: Implement 'ds_cursor' offset logic here to support Batch Size > 1. 
+                # Currently, 'embeds_to_keep_rel_idx' resets to 0 for every batch item, 
+                # which causes index collisions in 'ds_keep_mask' if B > 1.
+                self.kept_visual_embeds = []
                 for b, image_embeds in enumerate(image_embeds_list):
                     if not image_embeds: # Handle cases with no images
+                        # TODO: Append empty placeholder to self.kept_visual_embeds to maintain alignment for B > 1
                         continue
-                        
                     # Get indices of embeddings to KEEP (relative to the visual segments)
-                    embeds_to_keep_rel_idx = filter_embeds(image_embeds,limit=27000,threshold=0.95) #TODO: eliminate magic numbers, previously 0.95
-                    
+                    embeds_to_keep_rel_idx,filtered_embeds = filter_embeds(image_embeds,past_image_embeds[b] if past_image_embeds is not None else None,max_global_keep=27000,threshold=0.95) #TODO: eliminate magic numbers, previously 0.95
+                    if save_image_db:
+                        self.kept_visual_embeds.append(filtered_embeds.cpu().clone())
                     # MAP RELATIVE INDICES -> GLOBAL INDICES
                     # Get global indices where this batch has visual tokens
                     global_visual_indices = torch.nonzero(visual_pos_masks[b]).squeeze()
@@ -299,7 +272,20 @@ class Qwen3VLSparseTextModel(Qwen3VLTextModel):
             return t # Fallback for shapes that don't match S
 
         input_ids = apply_mask(input_ids)
-        attention_mask = apply_mask(attention_mask)#.detach()
+        if attention_mask is not None:
+            if attention_mask.shape[1] > S:
+                # 1. Split history (already sparse) from current chunk (dense)
+                past_mask = attention_mask[:, :-S]
+                curr_mask = attention_mask[:, -S:]
+                
+                # 2. Apply sparsity mask ONLY to the current chunk
+                curr_mask = curr_mask[:, final_keep_mask]
+                
+                # 3. Recombine
+                attention_mask = torch.cat([past_mask, curr_mask], dim=1)
+            else:
+                # Fallback: If mask length equals chunk length (e.g. first step), filter normally
+                attention_mask = attention_mask[:, final_keep_mask]
         position_ids = position_ids[:,:,final_keep_mask]#.detach()
         input_embeds = apply_mask(inputs_embeds)#.detach()
         # input_embeds.requires_grad_()
@@ -320,16 +306,6 @@ class Qwen3VLSparseTextModel(Qwen3VLTextModel):
         self.seq_keep_mask = final_keep_mask.cpu()
         self.vis_keep_mask = ds_keep_mask.cpu()
         return outputs
-        # print("assigning hidden states")
-        # last_hidden_state = torch.zeros(B,S,outputs.last_hidden_state.shape[-1],dtype=self.dtype,device=outputs.last_hidden_state.device)
-        # print("initialized empty hidden")
-        # last_hidden_state[:,final_keep_mask]=outputs.last_hidden_state
-        # return BaseModelOutputWithPast(
-        #     last_hidden_state=last_hidden_state,
-        #     past_key_values=outputs.past_key_values,
-        # )
-
-        # return outputs
 
 # --- 2. The Middle Man (The Composite Model) ---
 class Qwen3VLSparseModel(Qwen3VLModel):
@@ -369,7 +345,6 @@ class Qwen3VLSparseForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -431,3 +406,4 @@ class Qwen3VLSparseForConditionalGeneration(Qwen3VLForConditionalGeneration):
             "rope_deltas": outputs.rope_deltas,
             "seq_keep_mask": self.model.language_model.seq_keep_mask
         })
+

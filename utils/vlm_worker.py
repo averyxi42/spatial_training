@@ -3,11 +3,11 @@ import numpy as np
 import torch
 import time
 import gc
+import copy
 # from transformers.models.qwen3_vl.modeling_qwen3_vl import rotate_half
 
 class VLMWorker:
-
-    def __init__(self, model_id="Qwen/Qwen3-VL-2B-Instruct",attn_implementation='sdpa',dtype='float16', prefix = '<|im_start|>assistant\n**',postfix = '**<|im_end|>',vocab=["stop","forward","left","right","up","down"],cache_outputs=False,load_model=True,offload_cache=False):
+    def __init__(self, model_id="Qwen/Qwen3-VL-2B-Instruct",attn_implementation='sdpa',dtype='float16', prefix = '<|im_start|>assistant\n**',postfix = '**<|im_end|>',vocab=["stop","forward","left","right","up","down"],cache_outputs=False,load_model=True,offload_cache=False,use_sparse=False,bev_canvas_size=2000):
         import transformers.modeling_flash_attention_utils as fa_utils
         def patched(position_ids, batch_size):
             return False
@@ -25,6 +25,8 @@ class VLMWorker:
         self.prefix_ids = self.processor.tokenizer.encode(prefix)
         self.postfix_ids = self.processor.tokenizer.encode(postfix)
         self.offload_cache = offload_cache
+        self.use_sparse = use_sparse
+        self.bev_canvas_size = bev_canvas_size
         # Warmup the CUDA allocator
         if load_model:
             self.load_model()
@@ -36,24 +38,39 @@ class VLMWorker:
         import torch
         # self.past_key_values=StaticCache(config=self.model.config, offloading=self.offload_cache,max_cache_len=70000)
         self.past_key_values=None#DynamicCache(config=self.model.config, offloading=self.offload_cache)
-
-        self.cumulative_attention_mask = None
-        self.offset = 0
-        self.previous_history_len = 0
         self.output_list = []
-        self.input_history = []
+        self.cumulative_inputs = None
+        self.seq_keep_mask = None
+        self.past_image_embeds = None #per batch list of image embed tensors of the form N_patch by N_hidden
         torch.cuda.empty_cache()
 
     def load_model(self):
-        from transformers import AutoModelForImageTextToText
-        print(f"Loading {self.model_id}...")
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            self.model_id,
-            dtype=self.dtype,
-            attn_implementation=self.attn_implementation,#"sdpa",
-            device_map="cuda",
-        ).eval()
-        self.device = self.model.device
+        if not self.use_sparse:
+            from transformers import AutoModelForImageTextToText
+            print(f"Loading {self.model_id}...")
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                self.model_id,
+                dtype=self.dtype,
+                attn_implementation=self.attn_implementation,#"sdpa",
+                device_map="cuda",
+            ).eval()
+            self.device = self.model.device
+        else:
+            from transformers import AutoConfig
+            from utils.modeling import Qwen3VLSparseForConditionalGeneration
+            config = AutoConfig.from_pretrained(self.model_id, trust_remote_code=True)
+            print(f"Loading {self.model_id} with sparsifying patch...")
+            self.model = Qwen3VLSparseForConditionalGeneration.from_pretrained(
+                self.model_id, 
+                config=config,
+                device_map="cuda",
+                dtype=self.dtype,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+                attn_implementation = self.attn_implementation).eval()
+            self.device = self.model.device
+
+    
 
     def tokenize_inputs(self,messages,images):
                 # Process ONLY this turn's data
@@ -133,64 +150,97 @@ class VLMWorker:
             raise("input vocabulary is not valid token list!")
         return ids
     
-    def infer_step(self,messages,images,full_logprobs=False,temperature=1.2,check_probs=True,crop_inputs=True):
+    # requires full inputs to work.
+    def _accumulate_inputs(self,inputs):
+        if self.cumulative_inputs is None:
+            self.cumulative_inputs = dict(inputs.to('cpu'))
+        else:
+            self.cumulative_inputs['attention_mask'] = torch.cat([self.cumulative_inputs['attention_mask'],inputs['attention_mask']],dim=-1)
+            # self.cumulative_inputs['position_ids'] = torch.cat([self.cumulative_inputs['position_ids'],inputs['position_ids']],dim=-1)
+            self.cumulative_inputs['input_ids'] = torch.cat([self.cumulative_inputs['input_ids'],inputs['input_ids']],dim=-1)
+            self.cumulative_inputs['image_grid_thw'] = torch.cat([self.cumulative_inputs['image_grid_thw'],inputs['image_grid_thw']],dim=0) # N_image by Hidden Size (16*16*6 ?)
+
+    def _accumulate_custom_inputs(self,inputs,dim=0):
+        if self.cumulative_inputs is None:
+            self.cumulative_inputs = dict(inputs.to('cpu'))
+        else:
+            for k,v in inputs.items():
+                if k in self.cumulative_inputs.keys():
+                    self.cumulative_inputs[k] = torch.cat([self.cumulative_inputs[k],v],dim=dim)
+                else:
+                    self.cumulative_inputs[k] = v
+
+    def render_cumulative_inputs(self,summarize_images = True):
+        if not summarize_images:
+            return self.processor.batch_decode(self.cumulative_inputs['input_ids'])
+        else:
+            # image_mask = self.cumulative_inputs['input_ids'] == self.processor.image_token_id
+            sequences = [torch.unique_consecutive(sequence,return_counts=True) for sequence in self.cumulative_inputs['input_ids'].numpy()]
+            return self.processor.batch_decode(sequences)
+    
+    def _calculate_pos_id(self,pos_id_kwargs=None):
+        if pos_id_kwargs is None or pos_id_kwargs['mode'] == "standard":
+            input_ids = self.cumulative_inputs['input_ids']
+            image_grid_thw = self.cumulative_inputs['image_grid_thw']
+            attention_mask = self.cumulative_inputs['attention_mask']
+            # 1. Ask Qwen to calculate the 3D layout for this chunk
+            # This returns positions starting at T=0, H=0, W=0 relative to this chunk
+            position_ids, deltas = self.model.model.get_rope_index(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw, 
+                video_grid_thw=None,
+                attention_mask=attention_mask
+            )
+        elif pos_id_kwargs['mode'] == 'bev':
+            from utils.bev_utils import get_pos_id
+            self._accumulate_custom_inputs({'patch_coords':torch.tensor(pos_id_kwargs['patch_coords']).unsqueeze(0)},dim=0) 
+            patch_coords = self.cumulative_inputs['patch_coords'] # N_image by H by W by 3
+            patch_coords = patch_coords-torch.amin(patch_coords[:1],dim=[1,2],keepdim=True) 
+            w,t,h = patch_coords[...,0],patch_coords[...,1],patch_coords[...,2] # horrific mess here
+            w = w.reshape(-1)
+            t = t.reshape(-1)
+            h = h.reshape(-1)
+
+            patch_coords = torch.stack([t,t+h,t+w],dim=0).reshape(1,3,-1)
+            patch_coords = self.bev_canvas_size//2*torch.ones(1,3,1)
+            position_ids = get_pos_id(self.cumulative_inputs['input_ids'],patch_coords.to(self.cumulative_inputs['input_ids'].dtype),self.processor,self.bev_canvas_size)
+        return position_ids
+
+    def infer_step(self,messages,images,full_logprobs=False,temperature=1.2,check_probs=True,crop_inputs=True,pos_id_kwargs=None):
         if self.model is None:
             self.load_model()
             self.reset()
-        inputs = self.tokenize_inputs(messages,images)
-        logit_indices,prefix_starts,postfix_starts = self._get_sandwich_indices(inputs['input_ids'])
+        turn_inputs = self.tokenize_inputs(messages,images)
+        # First we must crop the sequence so the turns properly lign up.
+        logit_indices,prefix_starts,postfix_starts = self._get_sandwich_indices(turn_inputs['input_ids'])
         if crop_inputs:
             if len(prefix_starts)>1:
-                # print(self.processor.tokenizer.decode(inputs["input_ids"][0,logit_indices[0]]))
-                inputs['attention_mask'] = inputs['attention_mask'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)]
-                inputs["input_ids"] = inputs['input_ids'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)]
-                # print(self.processor.tokenizer.decode(inputs["input_ids"][0,0]))
-                # print(self.processor.tokenizer.decode(inputs["input_ids"][0,-1]))
+                turn_inputs['attention_mask'] = turn_inputs['attention_mask'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)]
+                turn_inputs["input_ids"] = turn_inputs['input_ids'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)]
             else:
-                # print(self.processor.tokenizer.decode(inputs["input_ids"][0,logit_indices[0]]))
-                inputs['attention_mask'] = inputs['attention_mask'][:,:(postfix_starts[-1]-1)]
-                inputs["input_ids"] = inputs['input_ids'][:,:(postfix_starts[-1]-1)]
-                # print(self.processor.tokenizer.decode(inputs["input_ids"][0,0]))
-                # print(self.processor.tokenizer.decode(inputs["input_ids"][0,-1]))
-            # print(self.processor.batch_decode([inputs['input_ids'][0][inputs['input_ids'][0]!=self.processor.image_token_id]]))
-            # self.input_history+=list(inputs['input_ids'][0])
-                # print(inputs["input_ids"][0,-1])
-
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        input_ids = inputs['input_ids']
-        image_grid_thw = inputs['image_grid_thw']
-        attention_mask = inputs['attention_mask']
-        # 1. Ask Qwen to calculate the 3D layout for this chunk
-        # This returns positions starting at T=0, H=0, W=0 relative to this chunk
-        position_ids, deltas = self.model.model.get_rope_index(
-            input_ids=input_ids,
-            image_grid_thw=image_grid_thw, 
-            video_grid_thw=None,
-            attention_mask=attention_mask
-        )
-        inputs['position_ids'] = position_ids+self.offset
-        chunk_attention_mask = inputs['attention_mask']
-
-        if crop_inputs:
-            logit_indices = torch.tensor([inputs['input_ids'].shape[1]-1],device=self.model.device)
-        # Update the cumulative mask
-        if self.cumulative_attention_mask is None:
-            self.cumulative_attention_mask = chunk_attention_mask
+                turn_inputs['attention_mask'] = turn_inputs['attention_mask'][:,:(postfix_starts[-1]-1)]
+                turn_inputs["input_ids"] = turn_inputs['input_ids'][:,:(postfix_starts[-1]-1)]
+        self._accumulate_inputs(turn_inputs)
+        turn_inputs = {k: v.to(self.device) for k, v in turn_inputs.items()}
+        self.cumulative_inputs['position_ids'] = self._calculate_pos_id(pos_id_kwargs) # calculate the pos_ids for the whole sequence. hopefully not too expensive...
+        current_len = turn_inputs['input_ids'].shape[1]
+        turn_inputs['position_ids'] = self.cumulative_inputs['position_ids'][..., -current_len:].to(self.device)
+        if self.use_sparse:
+            turn_inputs['past_image_embeds'] = self.past_image_embeds
+            turn_inputs['save_image_db'] = True # new argument in sparse qwen to signal keeping the db as internal state
+            # sparsify the input attention mask
+            turn_inputs['attention_mask'] = None#turn_inputs['attention_mask'] = torch.ones((turn_inputs['input_ids'].shape[0], (self.past_key_values.get_seq_length() if self.past_key_values is not None else 0) + turn_inputs['input_ids'].shape[1]), device=self.device, dtype=turn_inputs['attention_mask'].dtype)# torch.ones(1,seql,device=self.device)
         else:
-            # Concatenate past mask with current mask
-            self.cumulative_attention_mask = torch.cat(
-                [self.cumulative_attention_mask, chunk_attention_mask], 
-                dim=1
-            )
-        inputs['attention_mask'] = self.cumulative_attention_mask # torch.ones(1,seql,device=self.device)
+            turn_inputs['attention_mask'] = self.cumulative_inputs['attention_mask'].to(self.device)
 
         with torch.inference_mode():
-            t0 = time.time()
-            outputs = self.model(
-                **inputs,
+            # t0 = time.time()
+            outputs = self.model.forward(
+                **turn_inputs,
                 past_key_values=self.past_key_values,
                 use_cache=True,
-                logits_to_keep = logit_indices.to(self.model.device)
+                # logits_to_keep = logit_indices.to(self.model.device)
+                logits_to_keep=1
             )
             # print(f"latency: {time.time()-t0}")
             self.past_key_values = outputs['past_key_values']
@@ -199,12 +249,17 @@ class VLMWorker:
                 # Compute logprobs directly (1-to-1 mapping)
             relevant_logits = outputs.logits[0].float()
             all_logprobs = torch.log_softmax(relevant_logits/temperature, dim=-1)
-
-        self.offset += len(inputs['input_ids'][0])
-        self.previous_history_len+= len(inputs['input_ids'][0])
-
-        self.offset+=deltas.item() # this is ok because assistant generations don't contain images so no effect on deltas
-
+            if self.use_sparse:
+                current_keep_mask = self.model.model.language_model.seq_keep_mask
+                if self.seq_keep_mask is None:
+                    self.seq_keep_mask = current_keep_mask.cpu()
+                else:
+                    self.seq_keep_mask = torch.cat((self.seq_keep_mask,current_keep_mask.cpu()))
+                if self.past_image_embeds is None:
+                    self.past_image_embeds = self.model.model.language_model.kept_visual_embeds
+                else:
+                    for idx, image_embeds in enumerate(self.model.model.language_model.kept_visual_embeds):
+                        self.past_image_embeds[idx] = torch.cat((self.past_image_embeds[idx],image_embeds)) #handle the batching...
         if check_probs:
             try:
                 assert(torch.argmax(all_logprobs,dim=-1).item() in self.vocab_ids)
@@ -216,15 +271,14 @@ class VLMWorker:
         else:
             return all_logprobs[:,self.vocab_ids].cpu().float().numpy()
 
-    def infer_probs(self,messages,images,temperature=1.2,check_probs=True):
-        logprobs = self.infer_step(messages,images,temperature=temperature, check_probs=check_probs)
+    def infer_probs(self,messages,images,**kwargs):
+        logprobs = self.infer_step(messages,images,**kwargs)
         assert(len(logprobs)==1) #ensure there is a unique token position for decision making
         logprobs = logprobs[0]
         probs = np.exp(logprobs)
         probs /= np.sum(probs)
         return probs
-
-
+    
 if __name__ == "__main__":
     from vlm_worker import VLMWorker
     import torch
@@ -276,21 +330,14 @@ if __name__ == "__main__":
             ]
             return messages, [image]
 
-    worker = VLMWorker(model_id=MODEL_ID,attn_implementation='flash_attention_2', dtype='bfloat16',offload_cache=False)
+    worker = VLMWorker(model_id=MODEL_ID,attn_implementation='flash_attention_2', dtype='bfloat16',offload_cache=False,use_sparse=True)
     generator = DataGenerator(IMAGE_WIDTH, IMAGE_HEIGHT, worker.processor)
     worker.reset()
     from tqdm import tqdm
     # torch.cuda.memory._record_memory_history(
     #    max_entries=3
     # )
-    for i in tqdm(range(40)):
+    for i in tqdm(range(160)):
         messages,images = generator._prepare_turn_inputs(i)
         action = worker.infer_probs(messages,images)
-    # print(worker.processor.batch_decode([worker.input_history]))
-    # try:
-    #    torch.cuda.memory._dump_snapshot(f"profile.pickle")
-    # except Exception as e:
-    #     print(f"Failed to capture memory snapshot {e}")
-
-    # Stop recording memory snapshot history.
-    # torch.cuda.memory._record_memory_history(enabled=None)
+        # action = worker.infer_step(messages,images)

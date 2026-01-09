@@ -121,7 +121,8 @@ default_logging_schema = {
     # 1. Observation: Keep only RGB and Goal Name (for text overlay)
     "obs": {
         "rgb": True,
-        "goal_name": True 
+        "goal_name": True,
+        "patch_coords": True
     },
     
     # 2. Info: Keep metrics for text overlay and Map for visual overlay
@@ -131,6 +132,7 @@ default_logging_schema = {
         "spl": True,
         "soft_spl":True,
         "episode_label": True,
+        "episode_id": True,
         "scene_id": True,
         # Critical for drawing the map overlay in vut.observations_to_image
         "top_down_map": {
@@ -205,12 +207,13 @@ def habitat_logging_helper(episode_data):
     #TODO: check safety. does habitat change the internal episode the moment step(stop) is called? if so, we are in trouble
     # safety overrides for now, using first step guarantees correctness
     episode_logs['episode_label'] = episode_data['info'][0]['episode_label']
+    episode_logs['episode_id'] = episode_data['info'][0]['episode_id']
     episode_logs['scene_id'] = episode_data['info'][0]['scene_id']
-    episode_logs['goal_name'] = episode_data['obs'][0]['goal_name'] #need this for obvious reasons
+    episode_logs['goal'] = episode_data['obs'][0]['goal_name'] #need this for obvious reasons
 
-    episode_logs['steps'] = len(episode_data['action'])
+    episode_logs['n_steps'] = len(episode_data['action'])
     episode_logs['duration'] = episode_data['timestamp'][-1]-episode_data['timestamp'][0]
-    episode_logs['throughput'] = episode_logs['steps']/max(episode_logs['duration'],1e-5)
+    episode_logs['throughput'] = episode_logs['n_steps']/max(episode_logs['duration'],1e-5)
 
     episode_logs['fpg_trigger_count'] = np.sum(np.array(episode_data['fp_stop'])) #works thanks to defaultdict shenanigans
     episode_logs['fng_trigger_count'] = np.sum(np.array(episode_data['fn_stop'])) #works thanks to defaultdict shenanigans
@@ -218,13 +221,13 @@ def habitat_logging_helper(episode_data):
     # sequence level logs
     raw_collisions = episode_data.get('stuck',[]) #this is already aligned to actions, no need to slice. 
     # auxiliary performance metrics
-    episode_logs['collision_rate'] = np.sum(np.array(raw_collisions))/episode_logs['steps']
+    episode_logs['collision_rate'] = np.sum(np.array(raw_collisions))/episode_logs['n_steps']
     episode_logs['mean_distance_reward'] = np.mean(np.array(episode_data['reward'][1:-1])) # slice to exclude the terminal reward
     # save the video.
     supplementary_logging_helper(episode_data,episode_logs)
 
     sequence_logs = {}
-    sequence_logs['actions'] = episode_data['action']
+    sequence_logs['action_history'] = episode_data['action']
     sequence_logs['positions'] = [info['pos_rots'][:3] for info in episode_data['info'][:-1]] #final position is redundant due to stop action
     sequence_logs['quaterions'] = [info['pos_rots'][3:] for info in episode_data['info'][:-1]] #doubt this is meaningful in wandb but it can't cost that much storage right?
     sequence_logs['collision_events'] = raw_collisions
@@ -251,7 +254,7 @@ def get_scene_id(scene_path):
     return scene_id
 
 class HabitatWorker:
-    def __init__(self, assigned_episode_labels=None,workspace='/Projects/SG_VLN_HumanData/SG-VLN', config_path="configs/objectnav_hm3d_rgbd_semantic.yaml", enable_caching=True,dataset_path = None, scenes_dir=None,split="val",postprocess= True,output_schema=None,logging_schema=None,fn_guard=False,fp_guard=False):
+    def __init__(self, assigned_episode_labels=None,workspace='/Projects/SG_VLN_HumanData/SG-VLN', config_path="configs/objectnav_hm3d_rgbd_semantic.yaml", enable_caching=True,dataset_path = None, scenes_dir=None,split="val",postprocess= True,output_schema=None,logging_schema=None,fn_guard=False,fp_guard=False,voxel_kwargs=None):
         from habitat.config.default import get_config
         from habitat.config import read_write
         from habitat.config.default_structured_configs import (
@@ -283,6 +286,8 @@ class HabitatWorker:
 
         self.fn_guard = fn_guard
         self.fp_guard = fp_guard
+
+        self.voxel_kwargs = voxel_kwargs
         # --- Initialize Config & Env ---
         self.config_env = get_config(config_path)
         with read_write(self.config_env):
@@ -528,11 +533,15 @@ class HabitatWorker:
             pos = state.position  # Vector3
             rot = state.rotation  # Quaternion
 
-            info['pos_rots'] = (
+            info['pos_rots'] = [
                 float(pos[0]), float(pos[1]), float(pos[2]),      # x, y, z
                 float(rot.x), float(rot.y), float(rot.z), # qx, qy, qz
                 float(rot.w)                                 # w
-            )
+            ]
+            if self.voxel_kwargs is not None:
+                from utils.bev_utils import get_patch_coords
+                H,W = step_dict['obs']['depth'].shape[:2] 
+                obs['patch_coords'] = get_patch_coords(np.array([info['pos_rots']]),step_dict['obs']['depth'].reshape((1,H,W)),**self.voxel_kwargs)[0] # 1 by H by W by 3 patch coords
         info['scene_id']=get_scene_id(self.env.current_episode().scene_id)
         info['episode_id']=self.env.current_episode().episode_id
         info['episode_label']=f"{info['scene_id']}_{info['episode_id']}"

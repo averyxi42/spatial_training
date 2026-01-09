@@ -12,7 +12,10 @@ from utils.logging_workers import WandbLoggerActor
 '''
 Eval Usage Example
 python3 inference_main.py --model-id Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800 --ray-address local --shard-size 6 --subset-label sample400_a --num-vlms 2 --num-sims 3 --attn-impl='flash_attention_2' --dtype='float16' --max-steps 300 --wandb-project 'single_action_eval' --run-name float16fa2
-python3 inference_main.py --model-id Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800 --ray-address local --shard-size 6 --subset-label sample400_a --num-vlms 1 --num-sims 2 --attn-impl='flash_attention_2' --dtype='bfloat16' --max-steps 300 --wandb-project 'single_action_eval' --run-name bfloat16fa2
+python3 inference_main.py --model-id Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800 --ray-address local --shard-size 6 --subset-label sample400_a --num-vlms 1 --num-sims 2 --attn-impl='flash_attention_2' --dtype='bfloat16' --max-steps 300 --wandb-project 'single_action_eval' --run-name bfloat16fa2_sparse
+
+python3 inference_main.py --model-id Phyllis1/qwen3_sft_bev_test_20260102_060608_ckpt8700 --ray-address local --shard-size 6 --subset-label sample400_a --num-vlms 1 --num-sims 2 --attn-impl='flash_attention_2' --dtype='bfloat16' --max-steps 300 --wandb-project 'single_action_eval' --run-name bfloat16fa2_sparse_bev_8700
+python3 inference_main.py --model-id Phyllis1/qwen3_sft_bev_rerun_26770828_ckpt6700 --ray-address local --shard-size 6 --subset-label sample400_a --num-vlms 1 --num-sims 2 --attn-impl='flash_attention_2' --dtype='bfloat16' --max-steps 300 --wandb-project 'single_action_eval' --run-name bfloat16fa2_sparse_bev_6700
 
 '''
 '''
@@ -30,7 +33,8 @@ HABITAT_CONDA_ENV = "vln"
 OUTPUT_SCHEMA = {
     "obs":{
         "rgb":True,
-        "goal_name":True
+        "goal_name":True,
+        "patch_coords":True
     },
     "info":{
         "episode_label":True,
@@ -195,8 +199,6 @@ def main():
             "temperature": 1.2, # Sweet spot
             "convo_start_template": CONVO_START_TEMPLATE, #template for the initial conversation chunk
             "convo_turn_template": CONVO_TURN_TEMPLATE, #template for the recurrent conversation chunks
-            "fp_guard": True, # use oracle to prevent incorrect stop actions
-            "fn_guard": False, # use oracle to automatically perform stop action
             "action_space":action_space_list,
             "action_space_str":"[stop, forward, left, right, up, down]"
         },
@@ -205,8 +207,20 @@ def main():
             "prefix":'<|im_start|>assistant\n**',
             "postfix":'**<|im_end|>\n',
             "vocab":action_space_list, # restrict vocab to remove dangerous up/down actions
-            "offload_cache":False #offload the kv cache layers to save VRAM
+            "offload_cache":False, #offload the kv cache layers to save VRAM
+            "use_sparse": True
         },
+        "sim_config":{
+            "fp_guard": True, # use oracle to prevent incorrect stop actions
+            "fn_guard": False, # use oracle to automatically perform stop action
+
+            # specifying this enables bev/patch voxel grid!
+            "voxel_kwargs" : {
+                "patch_size":32,
+                "resolution":0.15,
+                "fov_degrees":79
+            }
+        }
         
     }
 
@@ -266,12 +280,12 @@ def main():
                 # "CUDA_VISIBLE_DEVICES":"2"
             }
         })
-
+    experiment_config['vlm_config']['model_id'] = args.model_id
+    experiment_config['vlm_config']['attn_implementation'] = args.attn_impl
+    experiment_config['vlm_config']['dtype'] = args.dtype
+                
     vlm_handles = [
         RemoteVLMWorker.remote(
-            model_id=args.model_id, 
-            attn_implementation=args.attn_impl,
-            dtype=args.dtype,
             rollout_config=experiment_config['rollout_config'],
             **experiment_config['vlm_config']
         ) for _ in range(args.num_vlms)
@@ -284,10 +298,9 @@ def main():
             scenes_dir=args.scenes_dir,
             split=args.split,
             output_schema = OUTPUT_SCHEMA,
-            fp_guard = experiment_config['rollout_config']['fp_guard'],
-            fn_guard = experiment_config['rollout_config']['fn_guard'],
             logging_output_dir = str(os.path.join(args.output_dir, args.run_name, f'worker_{i}/')),
-            logger_actor = wandb_logger
+            logger_actor = wandb_logger,
+            **experiment_config['sim_config']
             # enable_caching = False
         ) for i in range(args.num_sims)
     ]
