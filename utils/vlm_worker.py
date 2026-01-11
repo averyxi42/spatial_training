@@ -4,10 +4,13 @@ import torch
 import time
 import gc
 import copy
+import os
+from typing import Optional, Any
+from collections import defaultdict
 # from transformers.models.qwen3_vl.modeling_qwen3_vl import rotate_half
 
 class VLMWorker:
-    def __init__(self, model_id="Qwen/Qwen3-VL-2B-Instruct",attn_implementation='sdpa',dtype='float16', prefix = '<|im_start|>assistant\n**',postfix = '**<|im_end|>',vocab=["stop","forward","left","right","up","down"],cache_outputs=False,load_model=True,offload_cache=False,use_sparse=False,bev_canvas_size=2000):
+    def __init__(self, model_id="Qwen/Qwen3-VL-2B-Instruct",attn_impl='sdpa',dtype='float16', prefix = '<|im_start|>assistant\n**',postfix = '**<|im_end|>',vocab=["stop","forward","left","right","up","down"],save_outputs=False,load_model=True,offload_cache=False,use_sparse=False,bev_canvas_size=2000):
         import transformers.modeling_flash_attention_utils as fa_utils
         def patched(position_ids, batch_size):
             return False
@@ -17,9 +20,9 @@ class VLMWorker:
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.vocab = vocab
         self.vocab_ids = self._vocab_to_ids(vocab)
-        self.cache_outputs = cache_outputs
+        self.save_outputs = save_outputs
         self.model_id = model_id
-        self.attn_implementation = attn_implementation
+        self.attn_implementation = attn_impl
         self.dtype = dtype
         self.model=None
         self.prefix_ids = self.processor.tokenizer.encode(prefix)
@@ -38,9 +41,10 @@ class VLMWorker:
         import torch
         # self.past_key_values=StaticCache(config=self.model.config, offloading=self.offload_cache,max_cache_len=70000)
         self.past_key_values=None#DynamicCache(config=self.model.config, offloading=self.offload_cache)
-        self.output_list = []
+        self.outputs = defaultdict(list)
         self.cumulative_inputs = None
         self.seq_keep_mask = None
+        self.vis_keep_masks = []
         self.past_image_embeds = None #per batch list of image embed tensors of the form N_patch by N_hidden
         torch.cuda.empty_cache()
 
@@ -69,8 +73,8 @@ class VLMWorker:
                 low_cpu_mem_usage=True,
                 attn_implementation = self.attn_implementation).eval()
             self.device = self.model.device
-
-    
+        self.vl_model = self.model.model
+        self.language_model = self.vl_model.language_model
 
     def tokenize_inputs(self,messages,images):
                 # Process ONLY this turn's data
@@ -185,7 +189,7 @@ class VLMWorker:
             attention_mask = self.cumulative_inputs['attention_mask']
             # 1. Ask Qwen to calculate the 3D layout for this chunk
             # This returns positions starting at T=0, H=0, W=0 relative to this chunk
-            position_ids, deltas = self.model.model.get_rope_index(
+            position_ids, deltas = self.vl_model.get_rope_index(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw, 
                 video_grid_thw=None,
@@ -205,7 +209,27 @@ class VLMWorker:
             patch_coords = self.bev_canvas_size//2*torch.ones(1,3,1)
             position_ids = get_pos_id(self.cumulative_inputs['input_ids'],patch_coords.to(self.cumulative_inputs['input_ids'].dtype),self.processor,self.bev_canvas_size)
         return position_ids
-
+    def _store_outputs(self, outputs):
+        """
+        Extracts cached tensors from ModelOutput and appends them to the rollout buffer.
+        """
+        # 1. Standard Tensors (Append to list, concatenate later)
+        # These are already on CPU thanks to your TextModel code
+        self.outputs['input_embeds'].append(outputs.input_embeds)
+        self.outputs['position_ids'].append(outputs.position_ids)
+        self.outputs['visual_pos_masks'].append(outputs.visual_pos_masks)
+        
+        # 2. Deepstack Inputs (List of Tensors handling)
+        # outputs.deepstack_inputs is a list [Layer1_Tensor, Layer2_Tensor, ...]
+        # We need to store them so we can eventually concat Layer 1 across all time steps.
+        if outputs.deepstack_inputs is not None:
+            if 'deepstack_inputs' not in self.outputs:
+                # Initialize list of lists: [[], [], [], ...]
+                self.outputs['deepstack_inputs'] = [[] for _ in outputs.deepstack_inputs]
+            
+            # Append Layer K's tensor to the Kth list
+            for layer_idx, layer_tensor in enumerate(outputs.deepstack_inputs):
+                self.outputs['deepstack_inputs'][layer_idx].append(layer_tensor)
     def infer_step(self,messages,images,full_logprobs=False,temperature=1.2,check_probs=True,crop_inputs=True,pos_id_kwargs=None):
         if self.model is None:
             self.load_model()
@@ -232,7 +256,8 @@ class VLMWorker:
             turn_inputs['attention_mask'] = None#turn_inputs['attention_mask'] = torch.ones((turn_inputs['input_ids'].shape[0], (self.past_key_values.get_seq_length() if self.past_key_values is not None else 0) + turn_inputs['input_ids'].shape[1]), device=self.device, dtype=turn_inputs['attention_mask'].dtype)# torch.ones(1,seql,device=self.device)
         else:
             turn_inputs['attention_mask'] = self.cumulative_inputs['attention_mask'].to(self.device)
-
+        if self.save_outputs:
+            turn_inputs['save_embeds'] = True
         with torch.inference_mode():
             # t0 = time.time()
             outputs = self.model.forward(
@@ -244,21 +269,22 @@ class VLMWorker:
             )
             # print(f"latency: {time.time()-t0}")
             self.past_key_values = outputs['past_key_values']
-            if self.cache_outputs:
-                self.output_list.append(outputs)
-                # Compute logprobs directly (1-to-1 mapping)
+            if self.save_outputs:
+                self._store_outputs(outputs)
+             # Compute logprobs directly (1-to-1 mapping)
             relevant_logits = outputs.logits[0].float()
             all_logprobs = torch.log_softmax(relevant_logits/temperature, dim=-1)
             if self.use_sparse:
-                current_keep_mask = self.model.model.language_model.seq_keep_mask
+                current_keep_mask = self.language_model.seq_keep_mask
+                self.vis_keep_masks.append(self.language_model.vis_keep_mask.cpu())
                 if self.seq_keep_mask is None:
                     self.seq_keep_mask = current_keep_mask.cpu()
                 else:
                     self.seq_keep_mask = torch.cat((self.seq_keep_mask,current_keep_mask.cpu()))
                 if self.past_image_embeds is None:
-                    self.past_image_embeds = self.model.model.language_model.kept_visual_embeds
+                    self.past_image_embeds = self.language_model.kept_visual_embeds
                 else:
-                    for idx, image_embeds in enumerate(self.model.model.language_model.kept_visual_embeds):
+                    for idx, image_embeds in enumerate(self.language_model.kept_visual_embeds):
                         self.past_image_embeds[idx] = torch.cat((self.past_image_embeds[idx],image_embeds)) #handle the batching...
         if check_probs:
             try:
@@ -278,7 +304,155 @@ class VLMWorker:
         probs = np.exp(logprobs)
         probs /= np.sum(probs)
         return probs
+
+from dataclasses import dataclass
+
+@dataclass
+class VLMTrainingConfig:
+    # Optimization
+    learning_rate: float = 1e-4
+    grad_accum_steps: int = 1
+    mixed_precision: str = "fp16"
+    gradient_checkpointing: bool = True
+    # PEFT: Pass the actual configuration object here (e.g., LoraConfig)
+    # Typed as Any to avoid crashing if peft isn't installed on the driver
+    peft_config: Optional[Any] = None
     
+import os
+import torch
+from accelerate import Accelerator
+from torch.optim import AdamW
+
+# Handle optional PEFT imports gracefully
+try:
+    from peft import get_peft_model, prepare_model_for_kbit_training
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+
+class VLMTrainingMixin:
+    def setup_training(self, config: VLMTrainingConfig,rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,):
+        """
+        Sets up distributed training using the provided TrainConfig.
+        """
+        # 1. Manual Environment Injection for Ray
+        os.environ["MASTER_ADDR"] = master_addr
+        os.environ["MASTER_PORT"] = str(master_port)
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["LOCAL_RANK"] = "0"
+        
+        # 2. Initialize Accelerator
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=config.grad_accum_steps,
+            mixed_precision=config.mixed_precision
+        )
+
+        # 3. Gradient Checkpointing (Must run before PEFT wrapping)
+        if config.gradient_checkpointing:
+            self.model.gradient_checkpointing_enable({"use_reentrant": False})
+            # This logic handles the edge case where input embeddings are frozen
+            # causing backward() to fail with checkpointing enabled.
+            if hasattr(self.model, "enable_input_require_grads"):
+                self.model.enable_input_require_grads() # use_reentrant=False to prevent hangs
+            else:
+                raise NotImplementedError("Model does not support 'enable_input_require_grads' method.")
+        # 4. Apply PEFT (if config provided)
+        if config.peft_config is not None:
+            if not PEFT_AVAILABLE:
+                raise ImportError("TrainConfig has peft_config, but 'peft' library is not installed.")
+            # Direct application of the config object
+            self.model = get_peft_model(self.model, config.peft_config)
+            # Print trainable parameters to verify LoRA is active
+            if self.accelerator.is_local_main_process:
+                self.model.print_trainable_parameters()
+        # 5. Create Optimizer
+        # Only optimize parameters that require gradients (i.e., the Adapters)
+        optimizer = AdamW(
+            filter(lambda p: p.requires_grad, self.model.parameters()), 
+            lr=config.learning_rate
+        )
+
+        # 6. Prepare with Accelerator
+        # self.ddp_model becomes the sync-wrapper
+        # self.model remains the direct reference (now with LoRA layers attached)
+        self.ddp_model, self.optimizer = self.accelerator.prepare(
+            self.model, optimizer
+        )
+        
+    def train_step(self, batch):
+        """
+        Standard training step.
+        """
+        self.ddp_model.train()
+        
+        # Accumulate gradients (handle micro-batches)
+        with self.accelerator.accumulate(self.ddp_model):
+            # Forward via DDP wrapper (triggers sync)
+            outputs = self.ddp_model(**batch)
+            loss = outputs.loss
+            
+            # Backward (handles mixed precision scaling)
+            self.accelerator.backward(loss)
+            
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+        return loss.item()
+
+    def save_adapter(self, path):
+        """
+        Saves ONLY the LoRA adapters. 
+        Safe to call from Ray actor (handles rank check internally).
+        """
+        # Wait for all workers to finish their current step
+        self.accelerator.wait_for_everyone()
+        
+        if self.accelerator.is_main_process:
+            # We unwrap to get the PeftModel, then call save_pretrained
+            # which knows to only save the 'adapter_model.bin'
+            unwrapped = self.accelerator.unwrap_model(self.ddp_model)
+            unwrapped.save_pretrained(path)
+            print(f"Adapters saved to {path}")
+class DataGenerator:
+    """Generates synthetic turn data."""
+    def __init__(self, width=640, height=480, processor=None):
+        self.width = width
+        self.height = height
+        self.processor = processor
+
+    def create_synthetic_image(self):
+        from PIL import Image
+        arr = np.random.randint(0, 255, (self.height, self.width, 3), dtype=np.uint8)
+        return Image.fromarray(arr)
+
+    def _prepare_turn_inputs(self, step_idx):
+        """
+        Creates inputs for a SINGLE turn (Image + Text).
+        We do not build the full conversation history in the prompt.
+        We rely on the KV cache for history.
+        """
+        image = self.create_synthetic_image()
+        
+        # Construct a standalone prompt for this step
+        # We simulate the user asking for a move
+        messages = [
+
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": f"Step {step_idx}: Next move?"}
+                ]
+            },
+            # We add the Assistant start token to force the model to predict the response immediately
+            {"role": "assistant", "content": "**forward**"} 
+        ]
+        return messages, [image]
+ 
 if __name__ == "__main__":
     from vlm_worker import VLMWorker
     import torch
@@ -295,42 +469,8 @@ if __name__ == "__main__":
     IMAGE_WIDTH = 640
     IMAGE_HEIGHT = 480
 
-    class DataGenerator:
-        """Generates synthetic turn data."""
-        def __init__(self, width, height, processor):
-            self.width = width
-            self.height = height
-            self.processor = processor
-
-        def create_synthetic_image(self):
-            arr = np.random.randint(0, 255, (self.height, self.width, 3), dtype=np.uint8)
-            return Image.fromarray(arr)
-
-        def _prepare_turn_inputs(self, step_idx):
-            """
-            Creates inputs for a SINGLE turn (Image + Text).
-            We do not build the full conversation history in the prompt.
-            We rely on the KV cache for history.
-            """
-            image = self.create_synthetic_image()
-            
-            # Construct a standalone prompt for this step
-            # We simulate the user asking for a move
-            messages = [
-
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": f"Step {step_idx}: Next move?"}
-                    ]
-                },
-                # We add the Assistant start token to force the model to predict the response immediately
-                {"role": "assistant", "content": "**forward**"} 
-            ]
-            return messages, [image]
-
-    worker = VLMWorker(model_id=MODEL_ID,attn_implementation='flash_attention_2', dtype='bfloat16',offload_cache=False,use_sparse=True)
+    
+    worker = VLMWorker(model_id=MODEL_ID,attn_impl='flash_attention_2', dtype='bfloat16',offload_cache=False,use_sparse=True)
     generator = DataGenerator(IMAGE_WIDTH, IMAGE_HEIGHT, worker.processor)
     worker.reset()
     from tqdm import tqdm

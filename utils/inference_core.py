@@ -4,10 +4,26 @@ from typing import List, Dict, Any, Iterator,Tuple
 from string import Template
 from PIL import Image
 from utils.habitat_worker import LoggingHabitatWorker
-from utils.vlm_worker import VLMWorker
+from utils.vlm_worker import VLMWorker,VLMTrainingMixin
 import numpy as np
 from tqdm import tqdm
+def create_shard_iterator(
+    all_episodes: List[str], 
+    shard_size: int
+) -> Iterator[List[str]]:
+    """
+    Yields chunks of episodes.
+    """
+    # Simple list slicing generator
+    for i in range(0, len(all_episodes), shard_size):
+        yield all_episodes[i : i + shard_size]
 
+def trivial_shard_iterator():
+    '''
+    yields the trivial shard (None) once.
+    '''
+    yield None
+    
 def substitute_convo_template(conversation_template: List[Dict], substitutions: Dict[str, Any]) -> List[Dict]:
     """
     Traverses the conversation template and substitutes any string.Template 
@@ -70,10 +86,13 @@ class EpisodeRolloutMixin:
             }
             if len(initial_state_ref)==2:
                 rgb,state_dict = initial_state_ref
+                print("using normal mode")
             elif len(initial_state_ref)==3:
+                print("using bev mode")
                 rgb,patch_coords,state_dict = initial_state_ref
                 pos_id_kwargs['patch_coords'] = patch_coords
                 pos_id_kwargs['mode'] = "bev"
+
             step_count = 0
             done = False
             messages = substitute_convo_template(self.rollout_config['convo_start_template'],state_dict['obs'] | self.rollout_config)
@@ -82,7 +101,6 @@ class EpisodeRolloutMixin:
             goal_name = state_dict['obs']['goal_name']
             while not done and step_count < self.rollout_config['max_steps']:
                 # A. Prepare VLM Input
-                # (Assuming your formatting logic is here)
                 rgb_numpy = rgb
                 rgb_pil = Image.fromarray(rgb_numpy)
                 # B. Call VLM (Blocking)
@@ -115,20 +133,24 @@ class EpisodeRolloutMixin:
                 # print(f"sim step{step_count}")
                 done = state_dict['done']
                 step_count += 1
-
-            return ray.get_runtime_context().current_actor,habitat_handle,state_dict['is_exhausted'], state_dict['info'] | {"steps":step_count, "goal_name":goal_name}
+            return habitat_handle,state_dict['is_exhausted'], state_dict['info'] | {"steps":step_count, "goal_name":goal_name}
+        
         except Exception as e:
             print(f"Episode failed: {e}")
             import traceback
             traceback.print_exc()
             # Return handles anyway so we don't leak resources (or handle crash logic)
-            return ray.get_runtime_context().current_actor,habitat_handle,False, None
+            return habitat_handle,False, None
         finally:
             self.reset()
 
+class EpisodeRolloutMixinRay(EpisodeRolloutMixin):
+    def run_episode(self,habitat_handle, initial_state_ref):
+        habitat_handle,is_exhausted,state_dict = super().run_episode(habitat_handle, initial_state_ref)
+        return ray.get_runtime_context().current_actor,habitat_handle,is_exhausted,state_dict
+    
 # from utils.logging_worker import LoggingHabitatWorker
 
-@ray.remote
 class HabitatRayWorker(LoggingHabitatWorker):
     """
     Ray Actor wrapper for the LoggingHabitatWorker.
@@ -187,8 +209,7 @@ class HabitatRayWorker(LoggingHabitatWorker):
             patch_coords = result['obs'].pop('patch_coords')
             return rgb,patch_coords,result
 
-@ray.remote
-class VLMRayWorker(VLMWorker, EpisodeRolloutMixin):
+class InferenceRayWorker(VLMWorker, EpisodeRolloutMixinRay):
     def __init__(self, rollout_config: Dict[str, Any], **vlm_kwargs):
         """
         Explicitly handles argument separation to avoid MRO issues.
@@ -205,6 +226,27 @@ class VLMRayWorker(VLMWorker, EpisodeRolloutMixin):
         # Since the Mixin's __init__ was just setting this variable, we can do it here directly
         # effectively bypassing the need for cooperative inheritance in the parents.
         self.rollout_config = rollout_config
+        
+class InferenceWorker(VLMWorker, EpisodeRolloutMixin):
+    def __init__(self, rollout_config: Dict[str, Any], **vlm_kwargs):
+        """
+        Explicitly handles argument separation to avoid MRO issues.
+        
+        Args:
+            rollout_config: Arguments intended for the EpisodeRolloutMixin.
+            **vlm_kwargs: All other arguments (model_id, dtype, etc.) passed to VLMWorker.
+        """
+        # 1. Initialize the VLM Worker (The Heavy Lifter)
+        # We pass only the relevant VLM args to avoid 'unexpected keyword argument' errors.
+        VLMWorker.__init__(self, **vlm_kwargs)
+        
+        # 2. Initialize the Mixin State
+        # Since the Mixin's __init__ was just setting this variable, we can do it here directly
+        # effectively bypassing the need for cooperative inheritance in the parents.
+        self.rollout_config = rollout_config
+        
+class RLWorker(InferenceWorker,VLMTrainingMixin):
+    pass
 
 def run_inference_driver(
     sim_handles: List[Any],
@@ -299,7 +341,6 @@ def run_inference_driver(
             # --- CASE 2: An Episode Finished ---
             elif ref in active_episodes:
                 del active_episodes[ref]
-                
                 # Retrieve the recycled actors and signals
                 # needs_reshard: bool indicating if the worker finished its assigned shard
                 vlm, hab, needs_reshard, stats = ray.get(ref)

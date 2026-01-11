@@ -51,8 +51,9 @@ def apply_schema(data, schema):
             if isinstance(sub_schema, dict) and isinstance(data[key], dict):
                 result[key] = apply_schema(data[key], sub_schema)
             else:
-                # Leaf node: Return the data found at this key
-                result[key] = data[key]
+                if sub_schema:
+                    # Leaf node: Return the data found at this key
+                    result[key] = data[key]
     return result
 
 
@@ -647,13 +648,14 @@ class LoggingHabitatWorker(HabitatWorker):
         self.logger_actor = logger_actor
         os.makedirs(self.log_dir, exist_ok=True)
 
-    def _flush_logs_to_disk(self):
+    def _flush_logs_to_disk(self,clear_steps = True):
         """
         Orchestrates saving heavy artifacts to disk and sending lightweight references to Ray.
         """
         if len(self.steps['action'])==0:
             print("log flush called, but step cache is empty! skipping...")
             return
+        
         # 1. Resolve Naming & Directory
         # Use first step info for stable IDs (scene, episode)
         first_info = self.steps['info'][0] if self.steps['info'] else {}
@@ -713,6 +715,8 @@ class LoggingHabitatWorker(HabitatWorker):
             "node": os.uname().nodename,
             "timestamp": time.time()
         }
+        if clear_steps:
+            self.steps = defaultdict(list)  # Clear video cache for new episode
 
         # 6. Send to Global Logger
         if self.logger_actor:

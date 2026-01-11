@@ -194,6 +194,9 @@ class Qwen3VLSparseTextModel(Qwen3VLTextModel):
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
         past_image_embeds = None,
         save_image_db = False,
+        save_embeds = False,
+        seq_keep_mask = None,
+        vis_keep_mask = None,
         **kwarg,
     ):
         # print(input_ids.shape)
@@ -205,6 +208,11 @@ class Qwen3VLSparseTextModel(Qwen3VLTextModel):
         """
         self.seq_keep_mask = None
         self.vis_keep_mask = None
+        # Save original inputs to LM
+        self.input_embeds = None
+        self.deepstack_inputs = None
+        self.visual_pos_masks = None
+        self.position_ids = None
         # 1. Determine Sequence Length
         if inputs_embeds is not None:
             B, S, H = inputs_embeds.shape
@@ -217,80 +225,83 @@ class Qwen3VLSparseTextModel(Qwen3VLTextModel):
 
         # 2. Compute Sparse Mask
         # Default: Keep everything (True)
-        final_keep_mask = torch.ones((S,), device=device, dtype=torch.bool,requires_grad=False)
-
-        if inputs_embeds is not None and visual_pos_masks is not None:
+        if seq_keep_mask is None and vis_keep_mask is None:
+            seq_keep_mask = torch.ones((S,), device=device, dtype=torch.bool,requires_grad=False)
+            vis_keep_mask = torch.zeros(deepstack_visual_embeds[0].shape[0],dtype=torch.bool)
+            if inputs_embeds is not None and visual_pos_masks is not None:
+                with torch.no_grad():
+                    # A. Initialize a batch-level mask
+                    # Shape: (B, S). Init to True. 
+                    batch_keep_mask = torch.ones((B, S), device=device, dtype=torch.bool)
+                    # B. Mark ALL visual positions as False initially (we will only add back the keepers)
+                    batch_keep_mask[visual_pos_masks] = False
+                    
+                    # C. Extract and Filter
+                    image_embeds_list = extract_contiguous_segments(inputs_embeds, visual_pos_masks)
+                    # TODO: Implement 'ds_cursor' offset logic here to support Batch Size > 1. 
+                    # Currently, 'embeds_to_keep_rel_idx' resets to 0 for every batch item, 
+                    # which causes index collisions in 'ds_keep_mask' if B > 1.
+                    self.kept_visual_embeds = []
+                    for b, image_embeds in enumerate(image_embeds_list):
+                        if not image_embeds: # Handle cases with no images
+                            # TODO: Append empty placeholder to self.kept_visual_embeds to maintain alignment for B > 1
+                            continue
+                        # Get indices of embeddings to KEEP (relative to the visual segments)
+                        embeds_to_keep_rel_idx,filtered_embeds = filter_embeds(image_embeds,past_image_embeds[b] if past_image_embeds is not None else None,max_global_keep=27000,threshold=0.95) #TODO: eliminate magic numbers, previously 0.95
+                        if save_image_db:
+                            self.kept_visual_embeds.append(filtered_embeds.cpu().clone())
+                        # MAP RELATIVE INDICES -> GLOBAL INDICES
+                        # Get global indices where this batch has visual tokens
+                        global_visual_indices = torch.nonzero(visual_pos_masks[b]).squeeze()
+                        
+                        # Select the global indices corresponding to the kept relative indices
+                        global_indices_to_keep = global_visual_indices[embeds_to_keep_rel_idx]
+                        
+                        # Set these specific visual tokens back to True
+                        batch_keep_mask[b, global_indices_to_keep] = True
+                        vis_keep_mask[embeds_to_keep_rel_idx] = True
+                    # D. Union over batch (Keep token if ANY sequence in the batch needs it)
+                    # This maintains a rectangular tensor shape required by standard attention
+                    seq_keep_mask = batch_keep_mask.any(dim=0) 
+                    
+        if isinstance(seq_keep_mask, torch.Tensor) and isinstance(vis_keep_mask, torch.Tensor): # Do not sparsify if user passes non tensor to indicate "keep all". 
+            #Sparsify Deepstack args if present
             with torch.no_grad():
-                # A. Initialize a batch-level mask
-                # Shape: (B, S). Init to True. 
-                batch_keep_mask = torch.ones((B, S), device=device, dtype=torch.bool)
-                ds_keep_mask = torch.zeros(deepstack_visual_embeds[0].shape[0],dtype=torch.bool)
-                # B. Mark ALL visual positions as False initially (we will only add back the keepers)
-                batch_keep_mask[visual_pos_masks] = False
-                
-                # C. Extract and Filter
-                image_embeds_list = extract_contiguous_segments(inputs_embeds, visual_pos_masks)
-                # TODO: Implement 'ds_cursor' offset logic here to support Batch Size > 1. 
-                # Currently, 'embeds_to_keep_rel_idx' resets to 0 for every batch item, 
-                # which causes index collisions in 'ds_keep_mask' if B > 1.
-                self.kept_visual_embeds = []
-                for b, image_embeds in enumerate(image_embeds_list):
-                    if not image_embeds: # Handle cases with no images
-                        # TODO: Append empty placeholder to self.kept_visual_embeds to maintain alignment for B > 1
-                        continue
-                    # Get indices of embeddings to KEEP (relative to the visual segments)
-                    embeds_to_keep_rel_idx,filtered_embeds = filter_embeds(image_embeds,past_image_embeds[b] if past_image_embeds is not None else None,max_global_keep=27000,threshold=0.95) #TODO: eliminate magic numbers, previously 0.95
-                    if save_image_db:
-                        self.kept_visual_embeds.append(filtered_embeds.cpu().clone())
-                    # MAP RELATIVE INDICES -> GLOBAL INDICES
-                    # Get global indices where this batch has visual tokens
-                    global_visual_indices = torch.nonzero(visual_pos_masks[b]).squeeze()
-                    
-                    # Select the global indices corresponding to the kept relative indices
-                    global_indices_to_keep = global_visual_indices[embeds_to_keep_rel_idx]
-                    
-                    # Set these specific visual tokens back to True
-                    batch_keep_mask[b, global_indices_to_keep] = True
-                    ds_keep_mask[embeds_to_keep_rel_idx] = True
-                # D. Union over batch (Keep token if ANY sequence in the batch needs it)
-                # This maintains a rectangular tensor shape required by standard attention
-                final_keep_mask = batch_keep_mask.any(dim=0) 
-
-                # E. Sparsify Deepstack args if present
                 if deepstack_visual_embeds is not None:
-                    deepstack_visual_embeds = [
-                        v[ds_keep_mask, :] for v in deepstack_visual_embeds
-                    ]
-                print(f"keeping {torch.sum(ds_keep_mask)}/{len(ds_keep_mask)}")
-        # 3. Apply Mask to Inputs
-        # Helper to slice only if tensor is not None
-        def apply_mask(t):
-            if t is None: return None
-            # Handle tensors that might be (B, S, ...) or (B, 1, S, S)
-            if t.shape[1] == S:
-                return t[:, final_keep_mask]
-            return t # Fallback for shapes that don't match S
+                        deepstack_visual_embeds = [
+                            v[vis_keep_mask, :] for v in deepstack_visual_embeds
+                        ]
+                print(f"keeping {torch.sum(vis_keep_mask)}/{len(vis_keep_mask)}")
+            # 3. Apply Mask to Inputs
+            # Helper to slice only if tensor is not None
+            def apply_mask(t):
+                if t is None: return None
+                # Handle tensors that might be (B, S, ...) or (B, 1, S, S)
+                if t.shape[1] == S:
+                    return t[:, seq_keep_mask]
+                return t # Fallback for shapes that don't match S
 
-        input_ids = apply_mask(input_ids)
-        if attention_mask is not None:
-            if attention_mask.shape[1] > S:
-                # 1. Split history (already sparse) from current chunk (dense)
-                past_mask = attention_mask[:, :-S]
-                curr_mask = attention_mask[:, -S:]
-                
-                # 2. Apply sparsity mask ONLY to the current chunk
-                curr_mask = curr_mask[:, final_keep_mask]
-                
-                # 3. Recombine
-                attention_mask = torch.cat([past_mask, curr_mask], dim=1)
-            else:
-                # Fallback: If mask length equals chunk length (e.g. first step), filter normally
-                attention_mask = attention_mask[:, final_keep_mask]
-        position_ids = position_ids[:,:,final_keep_mask]#.detach()
-        input_embeds = apply_mask(inputs_embeds)#.detach()
-        # input_embeds.requires_grad_()
-        visual_pos_masks = apply_mask(visual_pos_masks)#.detach()
-
+            input_ids = apply_mask(input_ids)
+            if attention_mask is not None:
+                if attention_mask.shape[1] > S:
+                    # 1. Split history (already sparse) from current chunk (dense)
+                    past_mask = attention_mask[:, :-S]
+                    curr_mask = attention_mask[:, -S:]
+                    
+                    # 2. Apply sparsity mask ONLY to the current chunk
+                    curr_mask = curr_mask[:, seq_keep_mask]
+                    
+                    # 3. Recombine
+                    attention_mask = torch.cat([past_mask, curr_mask], dim=1)
+                else:
+                    # Fallback: If mask length equals chunk length (e.g. first step), filter normally
+                    attention_mask = attention_mask[:, seq_keep_mask]
+            position_ids = position_ids[:,:,seq_keep_mask]#.detach()
+            input_embeds = apply_mask(inputs_embeds)#.detach()
+            # input_embeds.requires_grad_()
+            visual_pos_masks = apply_mask(visual_pos_masks)#.detach()
+            self.seq_keep_mask = seq_keep_mask.cpu()
+            self.vis_keep_mask = vis_keep_mask.cpu()
         outputs = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -303,8 +314,12 @@ class Qwen3VLSparseTextModel(Qwen3VLTextModel):
             deepstack_visual_embeds=deepstack_visual_embeds,
             **kwarg,
         )
-        self.seq_keep_mask = final_keep_mask.cpu()
-        self.vis_keep_mask = ds_keep_mask.cpu()
+        
+        if save_embeds:
+            self.position_ids = position_ids.cpu() if position_ids is not None else None
+            self.input_embeds = input_embeds.cpu() if input_embeds is not None else None
+            self.deepstack_inputs = [v.cpu() for v in deepstack_visual_embeds] if deepstack_visual_embeds is not None else None
+            self.visual_pos_masks = visual_pos_masks.cpu() if visual_pos_masks is not None else None
         return outputs
 
 # --- 2. The Middle Man (The Composite Model) ---
@@ -395,7 +410,7 @@ class Qwen3VLSparseForConditionalGeneration(Qwen3VLForConditionalGeneration):
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
-        if labels is not None:
+        if labels is not None and self.model.language_model.seq_keep_mask is not None:
             labels = labels[:,self.model.language_model.seq_keep_mask]
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
     
@@ -404,6 +419,13 @@ class Qwen3VLSparseForConditionalGeneration(Qwen3VLForConditionalGeneration):
             "logits": logits,
             "past_key_values": outputs.past_key_values,
             "rope_deltas": outputs.rope_deltas,
-            "seq_keep_mask": self.model.language_model.seq_keep_mask
+            "seq_keep_mask": self.model.language_model.seq_keep_mask,
+            "vis_keep_mask": self.model.language_model.vis_keep_mask,
+            "last_hidden_state": hidden_states, # need this for Value Head
+            # cache for RL.
+            "input_embeds": self.model.language_model.input_embeds,
+            "deepstack_inputs": self.model.language_model.deepstack_inputs,
+            "visual_pos_masks": self.model.language_model.visual_pos_masks,
+            "position_ids": self.model.language_model.position_ids,
         })
 
