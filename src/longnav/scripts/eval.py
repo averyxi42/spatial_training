@@ -18,8 +18,6 @@ eval "$(python rl_eval.py -sc install=bash)"
 NOTE: tab completion only works if your command uses python not python3. somehow.
 '''
 
-from pathlib import Path
-import sys
 import math
 # _ROOT = Path(__file__).resolve().parents[1]
 # if str(_ROOT) not in sys.path:
@@ -35,7 +33,7 @@ DEBUG_FLAG = False
 
 # 1. Register our command variants
 register_configs()
-@hydra.main(version_base=None, config_name="rl_config",config_path='./conf')
+@hydra.main(version_base=None, config_name="rl_config",config_path='../conf')
 def main(cfg: RLConfig):
     # keep heavy imports here so hydra tab complete is snappier?
     import ray

@@ -151,10 +151,10 @@ class VLMTrainingConfig:
 class HabitatConfig:
     config_path: str = "configs/objectnav_hm3d_rgbd_semantic.yaml"
     dataset_path: Optional[str] = None
-    workspace: Optional[str] = "/Projects/SG_VLN_HumanData/SG-VLN"
+    workspace: Optional[str] = "."
     scenes_dir: Optional[str] = None
     split: str = "val"
-    fp_guard: bool = True
+    fp_guard: bool = False
     fn_guard: bool = False
     voxel_kwargs: Optional[Dict[str, Any]] = field(default_factory=lambda: None)
     output_schema: Optional[Dict[str, Any]] = field(default_factory=lambda: {
@@ -165,7 +165,7 @@ class HabitatConfig:
         "stuck": True,
         "fp_stop": True
     })
-    auto_flush: bool = True # automatically flush logs upon reset
+    auto_flush: bool = False # automatically flush logs upon reset
     ep_seed: Optional[bool] = None # if set, episode iterators are deterministic with same set seed all habitat workers
     explr_bonus: Optional[float] = 0.13
     collision_penalty: Optional[float] = 0.05
