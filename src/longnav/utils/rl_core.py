@@ -45,13 +45,17 @@ def collate_trajectories(trajectory_list: list[dict], device='cpu'):
         # Convert to Tensor (Automatically handles float/int inference)
         # Note: We force float32 for typical float types to avoid double precision overhead
         tensors = []
-        for arr in arrays:
-            t = torch.tensor(arr, device=device)
-            if key in ['rewards', 'values', 'old_logprobs', 'logprobs', 'ref_logprobs']:
-                t = t.float() # Ensure float32
-            elif key in ['actions']:
-                t = t.long()  # Ensure int32 for pointer
-            tensors.append(t)
+        try:
+            for arr in arrays:
+                t = torch.tensor(arr, device=device)
+                if key in ['rewards', 'values', 'old_logprobs', 'logprobs', 'ref_logprobs']:
+                    t = t.float() # Ensure float32
+                elif key in ['actions']:
+                    t = t.long()  # Ensure int32 for pointer
+                tensors.append(t)
+        except:
+            print(f"cannot collate key {key}")
+            continue
             
         # Pad Sequence
         # batch_first=True -> (Batch, Seq, ...)
