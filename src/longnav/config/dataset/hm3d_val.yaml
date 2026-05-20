@@ -1,0 +1,6 @@
+# @package _global_
+sim:
+  config_path: habitat_configs/objectnav_hm3d_rgbd_semantic.yaml
+  split: val
+task:
+  subset_label: "everything"

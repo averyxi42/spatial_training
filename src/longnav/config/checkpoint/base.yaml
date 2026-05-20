@@ -1,0 +1,5 @@
+# @package _global_
+vlm:
+  model_id: "Qwen/Qwen3-VL-2B-Instruct"
+training:
+  checkpoint: null

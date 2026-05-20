@@ -1,0 +1,13 @@
+# @package _global_
+task:
+  run_name: "name me"
+  wandb_project: "longnav_eval"
+  output_dir: ./dump/longnav_eval
+  jobtype: eval
+rollout:
+  max_steps: 500
+sim:
+  fp_guard: false
+  fn_guard: false
+  ep_seed: 17 # determinism
+  add_top_down_map: true # add visualization

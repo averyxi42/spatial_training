@@ -1,0 +1,6 @@
+# @package _global_
+resources:
+  ray_address: local
+  osm_gb: 256
+  num_vlms: 8
+  num_sims: 9

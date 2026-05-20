@@ -149,7 +149,7 @@ class VLMTrainingConfig:
 # --- habitat sim configs ---
 @dataclass
 class HabitatConfig:
-    config_path: str = "configs/objectnav_hm3d_rgbd_semantic.yaml"
+    config_path: str = "habitat_configs/objectnav_hm3d_rgbd_semantic.yaml"
     dataset_path: Optional[str] = None
     workspace: Optional[str] = "."
     scenes_dir: Optional[str] = None
@@ -170,10 +170,11 @@ class HabitatConfig:
     explr_bonus: Optional[float] = 0.13
     collision_penalty: Optional[float] = 0.05
     fpstop_penalty: Optional[float] = 0.3
+    add_top_down_map:bool = False
 # --- Rollouts (both for Eval and RL) ---
 @dataclass
 class RolloutConfig:
-    max_steps: int = 300
+    max_steps: int = 350
     temperature: float = 1.0
     action_space_str: str = "[stop, forward, left, right, up, down]"
     system_prompt: str = "${read_text:src/longnav/conf/prompts/objectnav_prompt.txt}"

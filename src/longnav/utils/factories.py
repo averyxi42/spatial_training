@@ -230,10 +230,10 @@ class WandbFactory:
         id = None
         try:
             runs = api.runs(run_cfg.wandb_project,filters={"displayName":run_cfg.run_name})
+            print(f"Found {len(runs)} existing runs with name '{run_cfg.run_name}' in project '{run_cfg.wandb_project}'.")
         except:
             print(f"Could not fetch runs for project '{run_cfg.wandb_project}'. Check your WandB connection and project name.")
             runs = []
-        print(f"Found {len(runs)} existing runs with name '{run_cfg.run_name}' in project '{run_cfg.wandb_project}'.")
         episodes_to_skip = set()
         if len(runs) > 0:
             # Sort runs by creation time descending      

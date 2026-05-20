@@ -41,7 +41,7 @@ FREEZE_DATA = False # for debugging only
 env_actor_cls = ColorBanditEnvActor
 # 1. Register our command variants
 register_configs()
-@hydra.main(version_base=None, config_name="rl_config",config_path='../conf')
+@hydra.main(version_base=None, config_name="rl_config",config_path='../config')
 def main(cfg: RLConfig):
     # keep heavy imports here so hydra tab complete is snappier?
     import ray

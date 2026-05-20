@@ -49,17 +49,19 @@ Run our framework with a dummy environment (doesn't require habitat dependencies
 ```
 python3 -m longnav.scripts.train_dummy.py
 ```
-## ObjectNav Training 🚀
+
+## Training 🚀
 
 ```
-python3 -m longnav.scripts.train_rl.py +experiment=<experiment_name>
+python3 -m longnav.scripts.train_rl +checkpoint=sft +dataset=hm3d_train +experiment=train +resources=octo +training=hapo task.run_name=my_awesome_training_run
 ```
-- experiment_name must be a config that exists in src/conf/experiment.
 
 ## Eval ⏱️
+Example:
 ```
-python3 -m longnav.eval.py +experiment=<experiment_name>
+python -m longnav.scripts.eval +checkpoint=longnav +dataset=hm3d_val +experiment=eval +resources=octo task.run_name=my_awesome_eval_run
 ```
+
 ## Sim to Real Serving 🤖
 Serve the FAST API:
 ```
@@ -70,9 +72,14 @@ See the [client example](tools/client.py) for API usage.
 ## Project Structure:
 ### Configuration Management
 Config schemas are defined via data class in [config_schema.py](src/longnav/config_schema.py). 
+
+Config overrides are defined within the [config directory](src/longnav/config) which provides presets that can be composed. 
 #### Key Configs:
 - sim.workspace: directory containing "data", see [habitat lab datasets](https://github.com/facebookresearch/habitat-lab/blob/main/DATASETS.md)
-- 
+- resources.num_vlms and resources.num_sims: number of workers for policy and simualator respectively. the former must be less than your number of GPUs. the latter is recommended to be 1+num_vlms. when training, num_vlms must divide the number of rollouts (default 16) or the code will hang.
+- task.run_name: run name used for wandb, default behavior is to resume. 
+- resources.osm_gb: size of ray objectstore, tune according to available shared memory and spilling situation
+
 ### RL Env Interface
 See [dummy env structure](src/longnav/env/env_base.py) for reference. Any compatible Env may be used by the [rollout collection orchestration](src/longnav/utils/rollout_core.py) to produce rollouts for training steps.
 

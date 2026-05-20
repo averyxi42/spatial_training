@@ -1,0 +1,5 @@
+# @package _global_
+vlm:
+  model_id: "Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800"
+training:
+  checkpoint: null

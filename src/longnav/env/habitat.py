@@ -420,7 +420,7 @@ class HabitatWorker:
     def __init__(self, assigned_episode_labels=None,workspace='/Projects/SG_VLN_HumanData/SG-VLN', config_path="configs/objectnav_hm3d_rgbd_semantic.yaml", enable_caching=True,dataset_path = None, scenes_dir=None,split="val",postprocess= True,output_schema=None,logging_schema=None,fn_guard=False,fp_guard=False,voxel_kwargs=None,ep_seed=None,log_oracle=False,
                  explr_bonus = None,
                  collision_penalty = None,
-                 fpstop_penalty = None
+                 fpstop_penalty = None,add_top_down_map = False
                  ):
         from habitat.config.default import get_config
         from habitat.config import read_write
@@ -482,17 +482,18 @@ class HabitatWorker:
                 # Example: "/mnt/data/habitat/scene_datasets/"
                 self.config_env.habitat.dataset.scenes_dir = scenes_dir
             # Add TopDownMap for visualization
-            self.config_env.habitat.task.measurements.top_down_map = (
-                TopDownMapMeasurementConfig(
-                    map_padding=3,
-                    map_resolution=512,
-                    draw_goal_positions=True,
-                    draw_shortest_path=True,
-                    draw_view_points=True,
-                    draw_border=True,
-                    fog_of_war=FogOfWarConfig(draw=True, visibility_dist=20, fov=79),
+            if add_top_down_map:
+                self.config_env.habitat.task.measurements.top_down_map = (
+                    TopDownMapMeasurementConfig(
+                        map_padding=3,
+                        map_resolution=512,
+                        draw_goal_positions=True,
+                        draw_shortest_path=True,
+                        draw_view_points=True,
+                        draw_border=True,
+                        fog_of_war=FogOfWarConfig(draw=True, visibility_dist=20, fov=79),
+                    )
                 )
-            )
 
         # Create Dataset
         self.full_dataset = make_dataset(
@@ -697,12 +698,13 @@ class HabitatWorker:
             if extras['+stuck'] and self.collision_penalty is not None:
                 print("applying collision penalty")
                 step_dict['reward']-=self.collision_penalty #0.05
-            curr_explored_area = step_dict['info']['top_down_map']['fog_of_war_mask'].sum()
-            last_explored_area = self.last_step['info']['top_down_map']['fog_of_war_mask'].sum()
-            step_dict['+exploration_delta']=curr_explored_area-last_explored_area
-            print("applying exploration bonus")
-            if step_dict['+exploration_delta']>0 and self.explr_bonus is not None:
-                step_dict['reward']+=self.explr_bonus
+            if 'top_down_map' in step_dict['info'].keys():
+                curr_explored_area = step_dict['info']['top_down_map']['fog_of_war_mask'].sum()
+                last_explored_area = self.last_step['info']['top_down_map']['fog_of_war_mask'].sum()
+                step_dict['+exploration_delta']=curr_explored_area-last_explored_area
+                print("applying exploration bonus")
+                if step_dict['+exploration_delta']>0 and self.explr_bonus is not None:
+                    step_dict['reward']+=self.explr_bonus
             if action==0 and info['distance_to_goal']>self.config_env.habitat.task.measurements.success.success_distance:
                 if self.fpstop_penalty is not None:
                     print("FALSE POSITIVE STOP! penalizing.")

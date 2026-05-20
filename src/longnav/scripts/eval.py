@@ -1,21 +1,4 @@
 '''
-🚀 [run experiment]:
-python3 rl_eval.py +experiment=eval_goldeen +training.checkpoint=<checkpoint_name_or_path>
-NOTE: experiment_name must be a config that exists in conf/experiment.
-
-⚙️ [add experiment config]:
-add new yaml to conf/experiment. see config_schema.py for requirements or reference existing yaml.
-NOTE: need to have "# @package _global_" at the start of your config.
-
-👾 [see hydra help]:
-python3 training_scripts/train_rl.py --help
-https://hydra.cc/docs/intro/
-
-🔧 [install tab completion]:
-eval "$(python training_scripts/train_rl.py -sc install=bash)"
-eval "$(python rl_eval.py -sc install=bash)"
-
-NOTE: tab completion only works if your command uses python not python3. somehow.
 '''
 
 import math
@@ -33,7 +16,7 @@ DEBUG_FLAG = False
 
 # 1. Register our command variants
 register_configs()
-@hydra.main(version_base=None, config_name="rl_config",config_path='../conf')
+@hydra.main(version_base=None, config_name="rl_config",config_path='../config')
 def main(cfg: RLConfig):
     # keep heavy imports here so hydra tab complete is snappier?
     import ray

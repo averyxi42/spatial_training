@@ -1,0 +1,10 @@
+# @package _global_
+task:
+  run_name: "name me"
+  wandb_project: "longnav_training"
+  output_dir: ./dump/longnav_training
+  jobtype: train
+  shard_size: 0
+
+rollout:
+  max_steps: 350

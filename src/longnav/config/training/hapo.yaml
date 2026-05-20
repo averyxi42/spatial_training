@@ -1,0 +1,54 @@
+# @package _global_
+training:
+  load_optim: false
+  load_sched: false
+  learning_rate: 2e-06
+  grad_accum_steps: 1
+  mixed_precision: 'no'
+  gradient_checkpointing: true
+  total_optimization_steps: 20000
+  warmup_steps: 32
+  save_step: 8
+  peft_config:
+    r: 128
+    lora_alpha: 256
+    lora_dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    modules_to_save: null
+    use_rslora: false
+  rl_config:
+    use_value: false
+    value_grad_scale: 0.1
+    advantage_estimator: reinforce_plus_plus_time_kernel
+    policy_loss_name: clip_cov
+    n_rollout: 16
+    n_adv: 256
+    n_epoch: 2
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 3.0
+    policy_loss:
+      clip_cov_ratio: 0.0002
+      clip_cov_ub: 5.0
+      clip_cov_lb: 1.0
+    gamma: 0.95
+    lam: 0.95
+    cliprange_value: 0.2
+    entropy_bonus: 0.002
+    use_ref: true
+    kl_coeff: 0.001
+    kl_target: 0.1
+    global_batch_info: {}
+    time_kernel_sigma: 40.0
+    time_loto: false
+  sft_config: null
