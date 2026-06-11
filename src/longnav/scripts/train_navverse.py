@@ -60,7 +60,9 @@ def main(cfg: RLConfig):
     cfg.resources.num_sims = 1
     cfg.resources.num_vlms = 1
     cfg.resources.osm_gb = 28
-    
+    cfg.rollout.max_steps=10
+    cfg.training.rl_config.n_rollout=1
+    cfg.vlm.save_outputs = True
 
     advantage_estimator_fn = get_adv_estimator_fn(cfg.training.rl_config.advantage_estimator)
     print(f"Model ID: {cfg.vlm.model_id}")
@@ -99,6 +101,9 @@ def main(cfg: RLConfig):
     shard_iter = iter(
         [["test_generator_0"]*1000]*10
     )
+    # shard_iter = iter(
+    #     [["vc_amsterdam_store_1"]*1000]*10
+    # )
     trajectory_list = []
 
     def cleanup():

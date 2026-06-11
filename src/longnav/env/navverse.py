@@ -1,6 +1,6 @@
 
 
-
+import numbers
 class NavverseEnv():
     def __init__(self): 
 
@@ -91,9 +91,9 @@ class NavverseEnv():
         return self.episode_ptr<len(self.episodes)
     
     def reset(self):
-        state_tuple = self.vln_sim.reset_sync(self.episodes[self.episode_ptr])
+        obs,info = self.vln_sim.reset_sync(self.episodes[self.episode_ptr])
         self.episode_ptr+=1
-        return self._convert(state_tuple)
+        return self._convert((obs,0,False,info))
     
     def _step(self,action):
         if action == 0:
@@ -110,11 +110,12 @@ class NavverseEnv():
             "obs":{
                 "instr_or_goal":self.vln_sim.current_episode['objnav'] #instruction
             },
-            "reward":reward.squeeze().item(),
-            "done":done.item(),
-            "info":info['measurements']
+            "reward":reward.squeeze().item() if not isinstance(reward, numbers.Number) else reward,
+            "done":done.item() if not isinstance(done,bool) else done,
+            "info":info['measurements'],
+            "is_exhausted":self.is_exhausted()
         }
         return rgb,state
     
-    def step(self,action):
+    def step(self,action, supplementary_logs):
         return self._convert(self._step(action))
