@@ -99,7 +99,7 @@ def main(cfg: RLConfig):
     #     excluded_episodes=excluded_episodes
     # )
     shard_iter = iter(
-        [["test_generator_0"]*1000]*10
+        [["test_generator_0"]*1000]*1000
     )
     # shard_iter = iter(
     #     [["vc_amsterdam_store_1"]*1000]*10
