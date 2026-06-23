@@ -7,9 +7,9 @@ fastapi[standard]
 pillow
 opencv-python
 torchvision
-torch
 peft
 wandb
 tensordict
 huggingface-hub
 codetiming
+numpy==1.26.0

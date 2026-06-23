@@ -57,12 +57,15 @@ def main(cfg: RLConfig):
     
     cfg.resources.vlm_conda_env = "longnavverse"
     cfg.resources.habitat_conda_env = "navverse"
-    cfg.resources.num_sims = 1
-    cfg.resources.num_vlms = 1
-    cfg.resources.osm_gb = 28
-    cfg.rollout.max_steps=10
-    cfg.training.rl_config.n_rollout=1
+    cfg.resources.num_sims = 2
+    cfg.resources.num_vlms = 2
+    cfg.resources.osm_gb = 24
+    cfg.rollout.max_steps=30
+    cfg.resources.sim_gpu_fraction=0.3
+    cfg.resources.vlm_gpu_fraction=0.6
+    cfg.training.rl_config.n_rollout=2
     cfg.vlm.save_outputs = True
+    cfg.vlm.attn_impl = "flash_attention_2"
 
     advantage_estimator_fn = get_adv_estimator_fn(cfg.training.rl_config.advantage_estimator)
     print(f"Model ID: {cfg.vlm.model_id}")
@@ -98,12 +101,12 @@ def main(cfg: RLConfig):
     #     logger=logger,
     #     excluded_episodes=excluded_episodes
     # )
-    shard_iter = iter(
-        [["test_generator_0"]*1000]*1000
-    )
     # shard_iter = iter(
-    #     [["vc_amsterdam_store_1"]*1000]*10
+    #     [["test_generator_0"]*1000]*1000
     # )
+    shard_iter = iter(
+        [["vc_amsterdam_store_1"]*1000]*10
+    )
     trajectory_list = []
 
     def cleanup():
@@ -136,14 +139,6 @@ def main(cfg: RLConfig):
     try:
         num_rollouts = bootstrapper.typed_cfg.training.total_optimization_steps*bootstrapper.typed_cfg.training.grad_accum_steps//bootstrapper.typed_cfg.training.rl_config.n_rollout
         for global_cycle in range(num_rollouts):
-            if FREEZE_DATA:
-                # reset the dataset
-                shard_iter = get_shard_iterator(
-                    subset_label= cfg.task.subset_label,
-                    episode_json= cfg.task.episode_json,
-                    shard_size=cfg.task.shard_size,
-                    logger=logger
-                )
             # ------------------------------------------- rollouts ------------------------------------------
             logger.info("Starting rollout collection!")
 

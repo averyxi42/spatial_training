@@ -1,8 +1,16 @@
 
 
 import numbers
+import torch
 class NavverseEnv():
     def __init__(self): 
+        import os
+
+        def is_linux_headless():
+            # Returns True if no display environment variable is set
+            has_x11 = "DISPLAY" in os.environ
+            has_wayland = "WAYLAND_DISPLAY" in os.environ
+            return not (has_x11 or has_wayland)
 
         import argparse
         import json
@@ -33,8 +41,9 @@ class NavverseEnv():
         # 3. Restore the original arguments when done
         sys.argv = original_argv
         args.disable_socket_server=True
-        args.episode_folder = "/home/avery/codes/NavVerse-Benchmark/episodes"
-        args.scene_folder = "/home/avery/navverse_data/"
+        args.episode_folder = "/home/huyu/Documents/code/NavVerse-Benchmark/episodes"
+        args.scene_folder = "/home/huyu/navverse_data/"
+        args.headless = is_linux_headless()
         # Launch Isaac Lab app
         sim_start_time = time.time()
         app_launcher = AppLauncher(args)
@@ -67,8 +76,10 @@ class NavverseEnv():
             [[0,0,np.deg2rad(30)]],
             [[0,0,-np.deg2rad(30)]]
         ]
-        self.assign_shard(['test_generator_0'
-        ])
+        self.episode_ptr=0
+        self.episodes = []
+        # self.assign_shard(['test_generator_0'
+        # ])
    
     def assign_shard(self, episodes: list[str]|None = None):
         '''
@@ -88,7 +99,7 @@ class NavverseEnv():
         '''
         returns True if the actor has exhausted its assigned episodes.
         '''
-        return self.episode_ptr<len(self.episodes)
+        return self.episode_ptr>=len(self.episodes)
     
     def reset(self):
         obs,info = self.vln_sim.reset_sync(self.episodes[self.episode_ptr])
@@ -97,8 +108,9 @@ class NavverseEnv():
     
     def _step(self,action):
         if action == 0:
-            self.vln_sim.env.set_stop_called(0,True)
-            step_data = self.vln_sim.env.step([0,0,0])
+            with torch.inference_mode():
+                self.vln_sim.env.set_stop_called(0,True)
+                step_data = self.vln_sim.env.step([0,0,0])
         else:
             step_data = self.vln_sim.step_relative_waypoints_sync(self.action_map[action])
         return step_data

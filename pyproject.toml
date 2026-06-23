@@ -25,12 +25,12 @@ dependencies = [
     "pillow",
     "opencv-python",
     "torchvision",
-    "torch",
     "peft",
     "wandb",
     "tensordict",
     "huggingface-hub",
-    "codetiming"
+    "codetiming",
+    "numpy==1.26.0"
 ]
 [project.urls]
 #Homepage = ""

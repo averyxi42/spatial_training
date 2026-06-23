@@ -16,12 +16,12 @@ Requires-Dist: fastapi[standard]
 Requires-Dist: pillow
 Requires-Dist: opencv-python
 Requires-Dist: torchvision
-Requires-Dist: torch
 Requires-Dist: peft
 Requires-Dist: wandb
 Requires-Dist: tensordict
 Requires-Dist: huggingface-hub
 Requires-Dist: codetiming
+Requires-Dist: numpy==1.26.0
 
 # LongNav
 This repository provides the implementation of LongNav. 

@@ -26,8 +26,8 @@ def compute_full_kl_penalty(log_probs: torch.Tensor, ref_log_probs: torch.Tensor
         kl_penalty: [Batch, Seq] (Scalar KL value per token)
     """
     # 1. Convert log_probs to probs for the weighting term
-    probs = log_probs.exp()
-    
+    # probs = log_probs.exp()
+    probs = F.softmax(log_probs,dim=-1)
     # 2. Compute KL: P * (log_P - log_Q)
     #    We sum over the last dimension (Vocab/Action Space)
     kl = (probs * (log_probs - ref_log_probs)).sum(dim=-1)

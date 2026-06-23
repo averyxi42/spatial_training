@@ -15,7 +15,7 @@ cfg.resources.vlm_gpu_fraction=0.3
 cfg.resources.num_sims=2
 cfg.resources.vlm_conda_env=None
 
-cfg.vlm.attn_impl = "sdpa"
+cfg.vlm.attn_impl = "flash_attention_2"
 cfg.vlm.save_outputs=True
 cfg.rollout.convo_start_template=[
         {"role": "user", "content": [{"type": "text", "text": "example substitution: $instr_or_goal"}]},
