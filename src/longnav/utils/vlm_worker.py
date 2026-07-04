@@ -35,7 +35,7 @@ def compute_full_kl_penalty(log_probs: torch.Tensor, ref_log_probs: torch.Tensor
     return kl
 
 class VLMWorker:
-    def __init__(self, model_id="Qwen/Qwen3-VL-2B-Instruct",attn_impl='sdpa',dtype='float16', prefix = '<|im_start|>assistant\n**',postfix = '**<|im_end|>',vocab=["stop","forward","left","right","up","down"],save_outputs=False,load_model=True,offload_cache=False,use_sparse=False,bev_canvas_size=2000,save_pixels=False):
+    def __init__(self, model_id="Qwen/Qwen3-VL-2B-Instruct",attn_impl='sdpa',dtype='float16', prefix = '<|im_start|>assistant\n**',postfix = '**<|im_end|>',vocab=["stop","forward","left","right","up","down"],save_outputs=False,load_model=True,offload_cache=False,use_sparse=False,bev_canvas_size=2000,save_pixels=False,action_space_type="discrete",action_space_dim=2,gaussian_init_log_std=-0.5,gaussian_min_log_std=-5.0,gaussian_max_log_std=2.0,continuous_action_clip_low=-1.0,continuous_action_clip_high=1.0):
         import transformers.modeling_flash_attention_utils as fa_utils
         def patched(position_ids, batch_size):
             return False
@@ -56,6 +56,15 @@ class VLMWorker:
         self.offload_cache = offload_cache
         self.use_sparse = use_sparse
         self.bev_canvas_size = bev_canvas_size
+        self.action_space_type = action_space_type
+        self.action_space_dim = action_space_dim
+        self.gaussian_init_log_std = gaussian_init_log_std
+        self.gaussian_min_log_std = gaussian_min_log_std
+        self.gaussian_max_log_std = gaussian_max_log_std
+        self.continuous_action_clip_low = continuous_action_clip_low
+        self.continuous_action_clip_high = continuous_action_clip_high
+        if self.action_space_type not in ["discrete", "continuous"]:
+            raise ValueError(f"Unsupported action_space_type: {self.action_space_type}")
         
         self._is_merged = None
         self._is_lora = None
@@ -108,6 +117,21 @@ class VLMWorker:
         self.model.to('cuda')
         self.vl_model = self.model.model
         self.language_model = self.vl_model.language_model
+        if self.action_space_type == "continuous":
+            self._ensure_continuous_action_head()
+
+    def _ensure_continuous_action_head(self):
+        if hasattr(self.model, "action_head"):
+            return
+        hidden_size = self.language_model.config.hidden_size
+        self.model.action_head = ContinuousActionHead(
+            input_dim=hidden_size,
+            action_dim=self.action_space_dim,
+            init_log_std=self.gaussian_init_log_std,
+            min_log_std=self.gaussian_min_log_std,
+            max_log_std=self.gaussian_max_log_std,
+            dtype=getattr(torch, self.dtype) if isinstance(self.dtype, str) else self.dtype,
+        ).to(self.model.device)
 
     def tokenize_inputs(self,messages,images):
                 # Process ONLY this turn's data
@@ -444,7 +468,12 @@ class VLMWorker:
         #         print("WARNING: prediction not in provided vocab")
         # # print("inference done!")
         # print(f" total time: {time.time()-t0}")
-        return logprobs.cpu().float().numpy(),outputs
+            if self.action_space_type == "continuous":
+                hidden_last = outputs.last_hidden_state[:, -1:, :]
+                policy = self.model.action_head(hidden_last)
+                policy = {k: v.squeeze(0).float().cpu().numpy() for k, v in policy.items()}
+                return policy, outputs
+            return logprobs.cpu().float().numpy(),outputs
 
         
     def _calculate_action_logprobs(self,logits):
@@ -453,9 +482,28 @@ class VLMWorker:
             logits = torch.tensor(logits)
         action_logprobs = torch.log_softmax(logits[...,self.vocab_ids],dim=-1)
         return action_logprobs
+
+    def _continuous_log_prob(self, actions: torch.Tensor, mu: torch.Tensor, log_std: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(log_std)
+        dist = torch.distributions.Normal(mu, std)
+        return dist.log_prob(actions).sum(dim=-1)
+
+    def _continuous_entropy(self, log_std: torch.Tensor) -> torch.Tensor:
+        entropy_per_dim = 0.5 + 0.5 * np.log(2.0 * np.pi) + log_std
+        return entropy_per_dim.sum(dim=-1)
     
     def infer_probs(self,messages,images,**kwargs):
-        logprobs,outputs = self.infer_step(messages,images,**kwargs)
+        policy_output,outputs = self.infer_step(messages,images,**kwargs)
+        if self.action_space_type == "continuous":
+            mu = policy_output["mu"]
+            log_std = policy_output["log_std"]
+            std = np.exp(log_std)
+            action = np.random.normal(mu, std)
+            action = np.clip(action, self.continuous_action_clip_low, self.continuous_action_clip_high)
+            log_prob = -0.5 * (((action - mu) / std) ** 2 + 2.0 * log_std + np.log(2.0 * np.pi))
+            return action.astype(np.float32), np.sum(log_prob, axis=-1).astype(np.float32), outputs
+
+        logprobs = policy_output
         assert(len(logprobs)==1) #ensure there is a unique token position for decision making
         logprobs = logprobs[0]
         probs = np.exp(logprobs)
@@ -514,17 +562,35 @@ class ValueHead(nn.Module):
 
     def forward(self, x):
         return self.mlp(x)
+
+
+class ContinuousActionHead(nn.Module):
+    """Predicts diagonal Gaussian policy parameters from token hidden states."""
+
+    def __init__(self, input_dim: int, action_dim: int, init_log_std: float = -0.5, min_log_std: float = -5.0, max_log_std: float = 2.0, dtype: Any = torch.float32):
+        super().__init__()
+        self.mean = nn.Linear(input_dim, action_dim, dtype=dtype)
+        self.log_std = nn.Parameter(torch.full((action_dim,), init_log_std, dtype=dtype))
+        self.min_log_std = min_log_std
+        self.max_log_std = max_log_std
+
+    def forward(self, hidden_states: torch.Tensor):
+        mu = self.mean(hidden_states)
+        log_std = torch.clamp(self.log_std, self.min_log_std, self.max_log_std)
+        log_std = log_std.view(1, 1, -1).expand_as(mu)
+        return {"mu": mu, "log_std": log_std}
     
 class VLMWrapper(nn.Module):
     """
     Thin wrapper that enables forward pass of the language model to play nicely with DDP
     """
-    def __init__(self, vlm):
+    def __init__(self, vlm, action_space_type="discrete"):
         super().__init__()
         self.vlm = vlm # Can be PeftModel
         self._freeze_vision_tower()
+        self.action_space_type = action_space_type
 
-    def _forward_embeds(self,embeds_inputs,compute_values=False,value_grad_scale=0.1):
+    def _forward_hidden(self,embeds_inputs):
         embeds_inputs = {k:v.to('cuda') for k,v in embeds_inputs.items()}
         embeds_inputs['inputs_embeds'] = embeds_inputs['inputs_embeds'].to(self.vlm.dtype)
         if self.vlm.training:
@@ -534,7 +600,18 @@ class VLMWrapper(nn.Module):
         embeds_inputs.pop('input_ids_reference')
         embeds_inputs['seq_keep_mask']='everything' # force keeping everything since seq is already sparse
         hidden = self.vlm.model.model.language_model(**embeds_inputs).last_hidden_state #TODO: fix this mess
+        return hidden,logits_to_keep
+    
+    '''
+    Forward pass that computes stats for the policy distribution and optionally value function.
+    In the continuous case, this will return the mean and log_std of the Gaussian policy.
+    In the discrete case, this will return the logits for the action tokens.
+    '''
+    
+    def _forward_embeds(self,embeds_inputs,compute_values=False,value_grad_scale=0.1):
+        hidden,logits_to_keep = self._forward_hidden(embeds_inputs)
         values = None
+        policy_stats = {}
         if compute_values:
             value_hidden = hidden[:,logits_to_keep].to(self.vlm.value_head.dtype)
             if value_grad_scale<=0:
@@ -545,10 +622,12 @@ class VLMWrapper(nn.Module):
                 # Forward: Identity. Backward: Gradient * scale.
                 value_hidden = (value_hidden * value_grad_scale) + (value_hidden.detach() * (1 - value_grad_scale))
 
-
             values = self.vlm.value_head(value_hidden).squeeze(-1)
-        logits = self.vlm.lm_head(hidden[:,logits_to_keep])
-        return logits,values
+        if self.action_space_type == "continuous":
+            policy_stats = self.vlm.action_head(hidden[:, logits_to_keep])
+        else:
+            policy_stats['logits'] = self.vlm.lm_head(hidden[:,logits_to_keep])
+        return policy_stats,values
 
     def forward(self, mode = "embeds_inputs",**inputs):
         if mode == "embeds_inputs":
@@ -655,6 +734,8 @@ class VLMTrainingMixin:
         hidden_size = self.language_model.config.hidden_size
         
         if config.rl_config is not None:
+            if self.action_space_type == "continuous":
+                self._ensure_continuous_action_head()
             if config.rl_config.use_value:
                 self.model.value_head = ValueHead(
                     input_dim=hidden_size,
@@ -675,8 +756,8 @@ class VLMTrainingMixin:
         # 5. Create Optimizer
         # Only optimize parameters that require gradients (i.e., the Adapters)
         print(f"accelerator device: {self.accelerator.device}")
-        wrapper = VLMWrapper(self.model)
-        rest_params = [p for n, p in wrapper.named_parameters() if "value_head" not in n and p.requires_grad]
+        wrapper = VLMWrapper(self.model,action_space_type = self.action_space_type)
+        rest_params = [p for n, p in wrapper.named_parameters() if "value_head" not in n and "action_head" not in n and p.requires_grad]
 
         optimizer_grouped_parameters = [
             {
@@ -694,6 +775,15 @@ class VLMTrainingMixin:
                     "lr": config.value_head_learning_rate,
                     "name": "value_head"
                 }]
+        if self.action_space_type == "continuous":
+            action_head_params = [p for n, p in wrapper.named_parameters() if "action_head" in n and p.requires_grad]
+            optimizer_grouped_parameters += [
+                {
+                    "params": action_head_params,
+                    "lr": config.learning_rate,
+                    "name": "action_head"
+                }
+            ]
         optimizer = AdamW(optimizer_grouped_parameters)
         scheduler = get_scheduler(
             name="linear",
@@ -725,6 +815,8 @@ class VLMTrainingMixin:
                 config.peft_config.modules_to_save = []
             if "value_head" not in config.peft_config.modules_to_save:
                 config.peft_config.modules_to_save.append("value_head")
+            if self.action_space_type == "continuous" and "action_head" not in config.peft_config.modules_to_save:
+                config.peft_config.modules_to_save.append("action_head")
             try:
                 peft_kwargs = asdict(config.peft_config)
             except:
@@ -772,16 +864,24 @@ class VLMTrainingMixin:
         embeds_inputs['seq_keep_mask']='everything' # force keeping everything since seq is already sparse
         hidden = self.language_model(**embeds_inputs,).last_hidden_state
         values = None
+        policy_stats = {}
         if compute_values:
             values = model.value_head(hidden[:,logits_to_keep].to(model.value_head.dtype)).squeeze(-1)
-        logits = model.lm_head(hidden[:,logits_to_keep])
-        return logits,values
+        if self.action_space_type == "continuous":
+            policy_stats = model.action_head(hidden[:, logits_to_keep])
+        else:
+            policy_stats['logits'] = model.lm_head(hidden[:,logits_to_keep])
+        return policy_stats,values
     
-    def _forward_seq(self,rl_seq_inputs):
+    def _forward_seq(self,rl_seq_inputs,compute_values=False):
         # seq_inputs = {k:torch.tensor(v,device='cuda') for k,v in self.rl_seq_inputs.items()}
         seq_inputs = {k:v.to('cuda') for k,v in rl_seq_inputs.items()}
+        if self.action_space_type == "continuous":
+            raise NotImplementedError("Continuous training path requires embeds inputs; seq-input forward is not supported.")
         output = self.model(**seq_inputs)
-        return output.logits
+        policy_stats = {'logits': output.logits}
+        values = None
+        return policy_stats, values
     
     def _setup_training(self):
         self.ddp_model.train()
@@ -794,20 +894,28 @@ class VLMTrainingMixin:
         
     def _training_forward(self,embeds_inputs):
         # Forward via DDP wrapper (triggers sync)
-        logits,vpreds = self.ddp_model(embeds_inputs = embeds_inputs,compute_values = self.rl_algo_config.use_value,value_grad_scale=self.rl_algo_config.value_grad_scale)
-        return logits,vpreds 
+        policy_stats,vpreds, = self.ddp_model(embeds_inputs = embeds_inputs,compute_values = self.rl_algo_config.use_value,value_grad_scale=self.rl_algo_config.value_grad_scale)
+        return policy_stats,vpreds
     
-    def rl_loss(self, log_probs, actions, advantages, response_mask, old_log_prob, returns, old_values, vpreds, logits, rollout_log_probs=None, ref_log_probs=None):        
+    def rl_loss(self, log_probs, actions, advantages, response_mask, old_log_prob, returns, old_values, vpreds, rollout_log_probs=None, ref_log_probs=None, policy_stats=None, actions_continuous=None):        
         from verl.trainer.ppo.core_algos import compute_value_loss,compute_entropy_loss
-        #TODO: rollout correction, rejection sampling to exclude bad tokens
-        log_prob = torch.gather(log_probs, -1, actions.unsqueeze(-1).to(log_probs.device)).squeeze(-1)
+        if self.action_space_type == "continuous":
+            if policy_stats is None or actions_continuous is None:
+                raise ValueError("Continuous RL loss requires policy_stats and actions_continuous.")
+            mu = policy_stats['mu']
+            log_std = policy_stats['log_std']
+            actions_continuous = actions_continuous.to(mu.device)
+            log_prob = self._continuous_log_prob(actions_continuous, mu, log_std)
+        else:
+            #TODO: rollout correction, rejection sampling to exclude bad tokens
+            log_prob = torch.gather(log_probs, -1, actions.unsqueeze(-1).to(log_probs.device)).squeeze(-1)
         response_mask = response_mask.to(log_prob.device).bool()
         # --- CRITICAL FIX: Handle Pure DAgger Episodes ---
         if response_mask.sum() == 0:
             print("warning: empty RL mask, skipping RL loss.")
             # If PPO has no data (all tokens went to DAgger), return 0 loss safely.
             # We strictly require grad=True for DDP compatibility.
-            zero_loss = torch.tensor(0.0, device=log_probs.device, requires_grad=True)
+            zero_loss = torch.tensor(0.0, device=log_prob.device, requires_grad=True)
             return zero_loss, {'loss/pg_loss': 0.0, 'return': 0.0, 'train/vf_loss': 0.0}
         pg_loss,metrics = self.policy_loss_fn(old_log_prob=old_log_prob.to(log_prob.device),log_prob=log_prob,advantages=advantages.to(log_prob.device),response_mask=response_mask,config = self.rl_algo_config)
         metrics['loss/pg_loss'] = pg_loss.detach().item()
@@ -826,17 +934,20 @@ class VLMTrainingMixin:
             loss = pg_loss
 
         if self.rl_algo_config.entropy_bonus is not None:
-            entropy = compute_entropy_loss(logits,response_mask)
+            if self.action_space_type == "continuous" and policy_stats is not None:
+                entropy = self._continuous_entropy(policy_stats['log_std']).mean()
+            else:
+                entropy = compute_entropy_loss(policy_stats['logits'],response_mask)
             entropy_loss = -entropy*self.rl_algo_config.entropy_bonus
             metrics['train/entropy'] = entropy.detach().item()
             loss = loss+entropy_loss
 
-        if ref_log_probs is not None and self.rl_algo_config.kl_coeff is not None:
+        if self.action_space_type != "continuous" and ref_log_probs is not None and self.rl_algo_config.kl_coeff is not None:
             kld = compute_full_kl_penalty(log_probs,ref_log_probs.to(log_probs.device))
             metrics['train/ref_kl_divergence'] = kld.mean().item()
             loss = loss + (kld * self.rl_algo_config.kl_coeff).mean()
 
-        if rollout_log_probs is not None:
+        if self.action_space_type != "continuous" and rollout_log_probs is not None:
             kld = compute_full_kl_penalty(log_probs.cpu(),rollout_log_probs.cpu())
             metrics['train/rollout_kl_divergence'] = kld.mean().item()        
         return loss,metrics
@@ -845,6 +956,8 @@ class VLMTrainingMixin:
         """
         Behavior Cloning / DAgger Loss.
         """
+        if self.action_space_type == "continuous":
+            raise NotImplementedError("DAgger/BC is not supported for continuous action mode.")
         import torch.nn.functional as F
         
         # Flatten for CrossEntropyLoss
@@ -902,13 +1015,16 @@ class VLMTrainingMixin:
         with self.accelerator.accumulate(self.ddp_model):
             loss = torch.tensor(0.0).to(self.device)
             metrics = {}
-            logits,vpreds = self._training_forward(embeds_inputs)
-            log_probs = self._calculate_action_logprobs(logits) # B by S by N_action space
+            policy_stats,vpreds = self._training_forward(embeds_inputs)
+            if self.action_space_type == "discrete":
+                log_probs = self._calculate_action_logprobs(policy_stats['logits']) # B by S by N_action space
+            else:
+                log_probs = None # cannot calculate individual logprobs for continuous actions, must use policy_stats for distribution
             if loss_weights is None:
                 loss_weights = [1.0]*len(loss_fn_names)
             for loss_fn_name,weight in zip(loss_fn_names,loss_weights):
                 loss_fn = getattr(self, f"{loss_fn_name}_loss")
-                loss_part,metric = loss_fn(log_probs=log_probs,vpreds=vpreds,logits=logits,**loss_kwargs_list[loss_fn_name])
+                loss_part,metric = loss_fn(log_probs=log_probs,vpreds=vpreds,policy_stats=policy_stats,**loss_kwargs_list[loss_fn_name])
                 loss = loss + loss_part*weight
                 metrics |= metric
                 
@@ -928,7 +1044,7 @@ class VLMTrainingMixin:
             self.optimizer.zero_grad()
         return metrics
             
-    def train_rl_step(self,embeds_inputs,actions,old_log_prob,advantages,returns=None,old_values=None,rollout_log_probs=None,ref_log_probs=None):
+    def train_rl_step(self,embeds_inputs,actions=None,old_log_prob=None,advantages=None,returns=None,old_values=None,rollout_log_probs=None,ref_log_probs=None,actions_continuous=None):
         '''
         Docstring for train_rl_step
         
@@ -939,83 +1055,26 @@ class VLMTrainingMixin:
         :param rollout_log_prob: Optional for rollout correction (not yet implemented)
         :param ref_logprobs: B by S by Action Space
         '''
-        from verl.trainer.ppo.core_algos import compute_value_loss,compute_entropy_loss
-
-        self.ddp_model.train()
-        if self.is_merged():
-            self.unmerge_adapter()
-        if self.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable({"use_reentrant": False})
-        self.reset() #clear internal state, training is (mostly) stateless
-        self.accelerator.wait_for_everyone() # ensure all workers have unmerged before training
-        # Accumulate gradients (handle micro-batches)
-        with self.accelerator.accumulate(self.ddp_model):
-            # Forward via DDP wrapper (triggers sync)
-            logits,vpreds = self.ddp_model(embeds_inputs = embeds_inputs,compute_values = self.rl_algo_config.use_value,value_grad_scale=self.rl_algo_config.value_grad_scale)
-            log_probs = self._calculate_action_logprobs(logits) # B by S by N_action space
-            log_prob = torch.gather(log_probs, -1, actions.unsqueeze(-1).to(log_probs.device)).squeeze(-1)
-            
-            '''
-            old_log_prob (torch.Tensor):
-            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
-            log_prob (torch.Tensor):
-                Log-probabilities of actions under the current policy, shape (batch_size, response_length).
-            advantages (torch.Tensor):
-                Advantage estimates for each action, shape (batch_size, response_length).
-            response_mask (torch.Tensor):
-                Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
-            loss_agg_mode (str, optional):
-                Aggregation mode for `agg_loss`. Defaults to "token-mean".
-            config: `(verl.trainer.config.ActorConfig)`: config for the actor.
-            '''
-            
-            response_mask = torch.ones_like(log_prob).bool() #TODO: rollout correction, rejection sampling to exclude bad tokens
-            pg_loss,metrics = self.policy_loss_fn(old_log_prob=old_log_prob.to(log_prob.device),log_prob=log_prob,advantages=advantages.to(log_prob.device),response_mask=response_mask,config = self.rl_algo_config)
-            metrics['loss/pg_loss'] = pg_loss.detach().item()
-            metrics['return'] = torch.amax(returns).detach().item()
-            if self.rl_algo_config.use_value:
-                value_loss,vf_clipfrac = compute_value_loss(vpreds,returns.to(log_prob.device),old_values.to(log_prob.device),response_mask,self.rl_algo_config.cliprange_value)
-                loss = pg_loss + value_loss
-                metrics['critic/vf_clipfrac'] = vf_clipfrac.detach().item()
-                metrics['train/vf_loss'] = value_loss.detach().item()
-                valid_values = torch.masked_select(vpreds, response_mask).cpu()
-                valid_returns = torch.masked_select(returns,response_mask.cpu())
-                return_diff_var = torch.var(valid_returns - valid_values)
-                return_var = torch.var(valid_returns)
-                metrics['critic/explained_variance']=(1.0 - return_diff_var / (return_var + 1e-5)).detach().item()
-            else:
-                loss = pg_loss
-
-            if self.rl_algo_config.entropy_bonus is not None:
-                entropy = compute_entropy_loss(logits,response_mask)
-                entropy_loss = -entropy*self.rl_algo_config.entropy_bonus
-                metrics['train/entropy'] = entropy.detach().item()
-                loss = loss+entropy_loss
-
-            if ref_log_probs is not None and self.rl_algo_config.kl_coeff is not None:
-                kld = compute_full_kl_penalty(log_probs,ref_log_probs.to(log_probs.device))
-                metrics['train/ref_kl_divergence'] = kld.mean().item()
-                loss = loss + (kld * self.rl_algo_config.kl_coeff).mean()
-
-            if rollout_log_probs is not None:
-                kld = compute_full_kl_penalty(log_probs.cpu(),rollout_log_probs.cpu())
-                metrics['train/rollout_kl_divergence'] = kld.mean().item()
-            # Backward (handles mixed precision scaling)
-            self.accelerator.backward(loss)
-            # Clip gradients and return the total norm (Global L2)
-            # max_grad_norm is usually 0.5 or 1.0 in PPO papers
-            grad_norm = self.accelerator.clip_grad_norm_(
-                self.ddp_model.parameters(), 
-                max_norm=1.0 
-            )
-            # Log the norm (Detect explosions if this spikes > 10.0)
-            metrics['train/grad_norm'] = grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
-            
-            self.optimizer.step()
-            self.scheduler.step()
-            metrics['train/lr'] = self.scheduler.get_last_lr()[0]
-            self.optimizer.zero_grad()
-        return metrics    
+        if old_log_prob is None or advantages is None or returns is None:
+            raise ValueError("old_log_prob, advantages and returns are required for train_rl_step")
+        response_mask = torch.ones_like(old_log_prob, dtype=torch.bool)
+        return self.generic_train_step(
+            embeds_inputs=embeds_inputs,
+            loss_fn_names=['rl'],
+            loss_kwargs_list={
+                'rl': {
+                    'actions': actions,
+                    'actions_continuous': actions_continuous,
+                    'old_log_prob': old_log_prob,
+                    'advantages': advantages,
+                    'returns': returns,
+                    'old_values': old_values,
+                    'rollout_log_probs': rollout_log_probs,
+                    'ref_log_probs': ref_log_probs,
+                    'response_mask': response_mask,
+                }
+            }
+        )
     
     def save_adapter(self, path):
         """
@@ -1140,7 +1199,6 @@ class DataGenerator:
         return messages, [image]
  
 if __name__ == "__main__":
-    from vlm_worker import VLMWorker
     import torch
     import time
     import argparse

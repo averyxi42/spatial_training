@@ -120,7 +120,7 @@ class EpisodeRolloutMixin:
                 # print("inferring VLM with messages:")
                 # print(messages)
                 t0 = time.time()
-                action_probs,action_logprobs,outputs = self.infer_probs(images=[rgb_pil],messages=messages,temperature = self.rollout_config['temperature'],pos_id_kwargs=pos_id_kwargs)
+                policy_out,action_logprobs,outputs = self.infer_probs(images=[rgb_pil],messages=messages,temperature = self.rollout_config['temperature'],pos_id_kwargs=pos_id_kwargs)
                 
                 vlm_logs |= {'mean/vlm_latency':time.time()-t0,'min/vlm_latency':time.time()-t0,'max/vlm_latency':time.time()-t0,'sum/spguard_trigger_count':0}
                 try:
@@ -131,23 +131,31 @@ class EpisodeRolloutMixin:
                 # print(f"vlm step{step_count}")
                 # print("done")
                 #except for the first turn, all messages follow the exact same template.
-                action_id = np.random.choice(len(action_probs),p=action_probs) # sampling
-                if action_id ==0 and self.rollout_config['stop_prob_threshold'] is not None:
-                    if action_probs[0] >= self.rollout_config['stop_prob_threshold']:
-                        action_id = 0
-                    else:
-                        vlm_logs['sum/spguard_trigger_count']=1
-                        action_id = np.random.choice(len(action_probs)-1,p=action_probs[1:]/np.sum(action_probs[1:]))+1
-                    
-                entropy = -np.sum(action_probs * np.log(action_probs + 1e-9))
-                vlm_logs |= {'mean/entropy':entropy,'mean/action_prob':float(action_probs[action_id]),"action_probs":action_probs.tolist()} 
+                if self.action_space_type == "continuous":
+                    action_to_env = np.asarray(policy_out, dtype=np.float32).reshape(-1)
+                    action_id = action_to_env
+                    vlm_logs |= {
+                        'mean/action_l2': float(np.linalg.norm(action_to_env)),
+                        'mean/action_abs_mean': float(np.mean(np.abs(action_to_env))),
+                    }
+                else:
+                    action_probs = policy_out
+                    action_id = np.random.choice(len(action_probs),p=action_probs) # sampling
+                    if action_id ==0 and self.rollout_config['stop_prob_threshold'] is not None:
+                        if action_probs[0] >= self.rollout_config['stop_prob_threshold']:
+                            action_id = 0
+                        else:
+                            vlm_logs['sum/spguard_trigger_count']=1
+                            action_id = np.random.choice(len(action_probs)-1,p=action_probs[1:]/np.sum(action_probs[1:]))+1
+                    entropy = -np.sum(action_probs * np.log(action_probs + 1e-9))
+                    vlm_logs |= {'mean/entropy':entropy,'mean/action_prob':float(action_probs[action_id]),"action_probs":action_probs.tolist()} 
                 # D. Store Transition
                
 
                 # D. Step Simulator (Blocking) ---------------------------RAY----------------------------- 
                 t0 = time.time()
                 # del rgb,state_dict
-                state_ref = ray.get(env_handle.step.remote(action_id,supplementary_logs=vlm_logs))
+                state_ref = ray.get(env_handle.step.remote(action_to_env if self.action_space_type == "continuous" else action_id,supplementary_logs=vlm_logs))
                 if len(state_ref)==2:
                     rgb,state_dict = state_ref
                 elif len(state_ref)==3:
@@ -158,9 +166,7 @@ class EpisodeRolloutMixin:
                 if collect_trajectory:
                     # Append dict to list - fast and simple
                     trajectory_dict = {
-                        "actions": action_id,
                         "rollout_logprobs": action_logprobs,
-                        "rollout_probs": action_probs,
                         "rewards": state_dict.get("reward", 0.0),
                         "dones": state_dict['done'],
                         # "spl": state_dict['info']['spl'],
@@ -168,13 +174,22 @@ class EpisodeRolloutMixin:
                         # "distance_to_goal": state_dict['info']['distance_to_goal'],
                         **state_dict['info'],
                     }
+                    if self.action_space_type == "continuous":
+                        trajectory_dict["actions_continuous"] = np.asarray(action_id, dtype=np.float32)
+                    else:
+                        trajectory_dict["actions"] = action_id
+                        trajectory_dict["rollout_probs"] = action_probs
                     if compute_value:
                         import torch
                         # Compute value estimate for the current state
                         with torch.no_grad():
                             trajectory_dict["values"] = self._compute_value(outputs).cpu().numpy()
                     trajectory_buffer.append(trajectory_dict)
-                messages = substitute_convo_template(self.rollout_config['convo_turn_template'],{"action":self.rollout_config['action_space'][action_id]})
+                if self.action_space_type == "continuous":
+                    action_text = ",".join([f"{x:.3f}" for x in np.asarray(action_id).reshape(-1)])
+                else:
+                    action_text = self.rollout_config['action_space'][action_id]
+                messages = substitute_convo_template(self.rollout_config['convo_turn_template'],{"action":action_text})
                 # print(f"sim step{step_count}")
                 done = state_dict['done']
                 step_count += 1
@@ -263,28 +278,38 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
             import torch
             with torch.no_grad():
                 if self.rl_embeds_inputs is not None:
-                    logits,values = self._forward_embeds(self.rl_embeds_inputs,self.rl_algo_config.use_value)
+                    policy_stats,values = self._forward_embeds(self.rl_embeds_inputs,self.rl_algo_config.use_value)
                     model_inputs = self.rl_embeds_inputs
                 elif self.rl_seq_inputs is not None:
-                    logits,values = self._forward_seq(self.rl_seq_inputs,self.rl_algo_config.use_value)
+                    policy_stats,values = self._forward_seq(self.rl_seq_inputs,self.rl_algo_config.use_value)
                     model_inputs = self.rl_seq_inputs
                 else:
                     raise ValueError("No stored model inputs found for postprocessing.")
-                logprobs = self._calculate_action_logprobs(logits).squeeze().float().cpu()
-                if logprobs.dim() == 1:
-                    logprobs = logprobs.unsqueeze(0) # ensure batch dim
-                self.rl_trajectory['old_logprobs'] = logprobs.numpy()
+                if self.action_space_type == "continuous":
+                    actions_continuous = torch.as_tensor(self.rl_trajectory['actions_continuous'], dtype=policy_stats['mu'].dtype, device=policy_stats['mu'].device)
+                    if actions_continuous.dim() == 2:
+                        actions_continuous = actions_continuous.unsqueeze(0)
+                    old_log_prob = self._continuous_log_prob(actions_continuous, policy_stats['mu'], policy_stats['log_std']).squeeze(0).float().cpu()
+                    self.rl_trajectory['old_log_prob'] = old_log_prob.numpy()
+                else:
+                    logits = policy_stats['logits']
+                    logprobs = self._calculate_action_logprobs(logits).squeeze().float().cpu()
+                    if logprobs.dim() == 1:
+                        logprobs = logprobs.unsqueeze(0) # ensure batch dim
+                    self.rl_trajectory['old_logprobs'] = logprobs.numpy()
                 if values is not None:
                     self.rl_trajectory['values'] = values.squeeze().float().cpu().numpy()
 
-            if self.rl_algo_config.use_ref:
+            if self.rl_algo_config.use_ref and self.action_space_type != "continuous":
                 with torch.no_grad():
                     self.unmerge_adapter()
                     with self.model.disable_adapter():
                         if self.rl_embeds_inputs is not None:
-                            logits,values = self._forward_embeds(self.rl_embeds_inputs,False)
+                            policy_stats,values = self._forward_embeds(self.rl_embeds_inputs,False)
+                            logits = policy_stats['logits']
                         elif self.rl_seq_inputs is not None:
-                            logits,values = self._forward_seq(self.rl_seq_inputs)
+                            policy_stats,values = self._forward_seq(self.rl_seq_inputs)
+                            logits = policy_stats['logits']
                         ref_logprobs = self._calculate_action_logprobs(logits).squeeze().float().cpu()
                         if ref_logprobs.dim() == 1:
                             ref_logprobs = ref_logprobs.unsqueeze(0) # ensure batch dim
@@ -306,7 +331,8 @@ class RLActor(RLWorker):
 
     def train_rl_step(self, embeds_inputs_np, embeds_inputs_meta,traj_batch):
         embeds_inputs = TensorPacker.unpack(embeds_inputs_np,embeds_inputs_meta,device=self.accelerator.device)
-        actions = traj_batch['actions']
+        actions = traj_batch.get('actions', None)
+        actions_continuous = traj_batch.get('actions_continuous', None)
         old_log_prob = traj_batch['old_log_prob']
         advantages = traj_batch['advantages']
         returns = traj_batch['returns']
@@ -314,7 +340,7 @@ class RLActor(RLWorker):
         rollout_log_probs = traj_batch.get('rollout_logprobs',None)
         ref_logprobs = traj_batch.get('ref_logprobs',None)
     
-        return super().train_rl_step(embeds_inputs, actions, old_log_prob, advantages, returns, old_values, rollout_log_probs,ref_logprobs)
+        return super().train_rl_step(embeds_inputs, actions=actions, old_log_prob=old_log_prob, advantages=advantages, returns=returns, old_values=old_values, rollout_log_probs=rollout_log_probs, ref_log_probs=ref_logprobs, actions_continuous=actions_continuous)
     
     def train_dagger_step(self, embeds_inputs_np, embeds_inputs_meta, traj_batch):
         """
@@ -503,7 +529,11 @@ def collect_rollouts(
                     ray.get(wandb_logger.alert.remote(title="Rollout Collection Frozen",text=f"Active Episodes: {len(active_episodes)}, Pending PostProc: {len(pending_postproc)}",level="ERROR"))
                 # Check 1: Are we waiting on a specific ref forever?
                 # Dump the first few active refs to inspect
-                import ipdb; ipdb.set_trace()
+                try:
+                    import importlib
+                    importlib.import_module("ipdb").set_trace()
+                except Exception:
+                    print("ipdb is not installed; skipping interactive deadlock breakpoint.")
 
             continue # Jump back to start of loop (and potentially dispatch more if resources freed up)
 

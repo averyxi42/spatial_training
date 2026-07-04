@@ -28,7 +28,14 @@ class VLMConfig:
     dtype: str = "bfloat16"
     prefix: str = '<|im_start|>assistant\n**'
     postfix: str = '**<|im_end|>\n'
-    vocab: List[str] = field(default_factory=lambda: ["stop", "forward", "left", "right"])
+    vocab: List[str] = field(default_factory=lambda: ["stop", "forward", "left", "right"]) # discrete actions based on lmhead
+    action_space_type : str = "discrete" # discrete or continuous
+    action_space_dim: int = 2 # for continuous action space
+    gaussian_init_log_std: float = -0.5
+    gaussian_min_log_std: float = -5.0
+    gaussian_max_log_std: float = 2.0
+    continuous_action_clip_low: float = -1.0
+    continuous_action_clip_high: float = 1.0
     offload_cache: bool = False
     use_sparse: bool = True
     save_outputs: bool = False # only need this for RL
@@ -204,6 +211,7 @@ class RunConfig:
     episode_json: str = ""
     output_dir: str = "./dump/results"
     jobtype: str = "eval"
+    env_backend: str = "habitat"  # habitat | continuous_dummy
 
 # --- ROOT CONFIGs ---
 @dataclass

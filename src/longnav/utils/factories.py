@@ -118,7 +118,7 @@ class InferenceWorkerFactory:
                 **vlm_dict
             ) for _ in range(res_cfg.num_vlms)
         ]
-    
+
 class RLWorkerFactory:
     @staticmethod
     def create(vlm_dict: dict, rollout_dict: dict, res_cfg: ResourceConfig):
