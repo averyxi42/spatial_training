@@ -27,7 +27,6 @@ training:
     use_rslora: false
   rl_config:
     advantage_estimator: reinforce_plus_plus_time_kernel
-    policy_loss_name: clip_cov
     n_rollout: 16
     n_adv: 256
     n_epoch: 2
@@ -36,6 +35,7 @@ training:
     clip_ratio_high: 0.28
     clip_ratio_c: 3.0
     policy_loss:
+      name: clip_cov
       clip_cov_ratio: 0.0002
       clip_cov_ub: 5.0
       clip_cov_lb: 1.0

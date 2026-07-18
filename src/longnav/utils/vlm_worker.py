@@ -737,7 +737,7 @@ class VLMTrainingMixin:
                     dtype=getattr(torch,config.rl_config.value_head.dtype)
                 ).to(self.model.device)
             from verl.trainer.ppo.core_algos import get_policy_loss_fn
-            self.policy_loss_fn = get_policy_loss_fn(config.rl_config.policy_loss_name)
+            self.policy_loss_fn = get_policy_loss_fn(config.rl_config.policy_loss.name)
         # 4. Apply PEFT (if config provided)
         self._setup_peft(config)
             # Print trainable parameters to verify LoRA is active

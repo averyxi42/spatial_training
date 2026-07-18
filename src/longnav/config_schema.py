@@ -36,16 +36,16 @@ class VLMConfig:
 
 @dataclass 
 class PolicyLossConfig:
-    clip_cov_ratio: Optional[float] = 0.0002
-    clip_cov_ub: Optional[float] = 5.0
-    clip_cov_lb: Optional[float] = 1.0
-    
-@dataclass 
+    name: str = "vanilla"
+    clip_cov_ratio: Optional[float] = None
+    clip_cov_ub: Optional[float] = None
+    clip_cov_lb: Optional[float] = None
+
+@dataclass
 class RLAlgoConfig:
     # generic on policy params
     value_head: Optional[Any] = None
     advantage_estimator: str = "reinforce_plus_plus"
-    policy_loss_name: str = "vanilla"
     n_rollout: int = 12 # note: must be divisible by num vlms times gradient accumulation
     n_adv: int = 256 # number of trajectories for advantage estimation, must > n_rollout
     n_epoch: int = 2 # number of policy gradient epochs
