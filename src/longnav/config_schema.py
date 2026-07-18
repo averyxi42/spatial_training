@@ -167,7 +167,7 @@ class RolloutConfig:
 @dataclass
 class RunConfig:
     run_name: str = "debug_run"
-    wandb_project: Optional[str] = None
+    logger: Optional[Any] = None
     shard_size: int = 6
     subset_label: str = "sample400_a"
     episode_json: str = ""

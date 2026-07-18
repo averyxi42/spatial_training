@@ -1,5 +1,7 @@
 from longnav.config_schema import *
 from longnav.conf.env_configs import DummyDiscreteEnvConfig
+from longnav.conf.vlm_configs import LMHeadConfig
+from longnav.conf.logging_configs import WandbLoggerConfig
 from longnav.utils.factories import ExpBootstrapper,get_shard_iterator
 from longnav.utils.rollout_core import collect_rollouts
 from longnav.utils.rl_core import collate_trajectories
@@ -16,6 +18,7 @@ cfg.resources.num_sims=2
 cfg.resources.vlm_conda_env=None
 cfg.resources.habitat_conda_env=None
 cfg.sim = DummyDiscreteEnvConfig()
+cfg.vlm.policy_head = LMHeadConfig()
 
 cfg.vlm.attn_impl = "sdpa"
 cfg.vlm.save_outputs=True
@@ -29,7 +32,7 @@ cfg.training.rl_config.n_rollout=4
 advantage_estimator_fn = get_adv_estimator_fn("reinforce_plus_plus")
 
 cfg.task.run_name = "rl_step"
-cfg.task.wandb_project = "longnav_smoke_test"
+cfg.task.logger = WandbLoggerConfig(project="longnav_smoke_test")
 bootstrapper = ExpBootstrapper(cfg)
 
 bootstrapper.setup_cluster()

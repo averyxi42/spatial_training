@@ -1,7 +1,9 @@
 # @package _global_
 task:
   run_name: "name me"
-  wandb_project: "longnav_training"
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "longnav_training"
   output_dir: ./dump/longnav_training
   jobtype: train
   shard_size: 0
