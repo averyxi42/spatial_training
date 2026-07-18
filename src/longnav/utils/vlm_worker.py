@@ -780,7 +780,7 @@ class VLMTrainingMixin:
             optimizer_grouped_parameters += [
                 {
                     "params": action_head_params,
-                    "lr": config.learning_rate,
+                    "lr": config.action_head_learning_rate,
                     "name": "action_head"
                 }
             ]

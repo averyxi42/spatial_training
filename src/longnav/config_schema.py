@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
+from omegaconf import MISSING
 
 # --- 1. Resource & Environment Config ---
 @dataclass
@@ -24,7 +25,7 @@ class ResourceConfig:
 @dataclass
 class VLMConfig:
     model_id: Optional[str] = "Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800"
-    attn_impl: str = "sdpa"
+    attn_impl: str = "flash_attention_2"
     dtype: str = "bfloat16"
     prefix: str = '<|im_start|>assistant\n**'
     postfix: str = '**<|im_end|>\n'
@@ -138,7 +139,8 @@ class VLMTrainingConfig:
     total_optimization_steps: int = 100000 # used for linear LR schedule
     warmup_steps: int = 64
     save_step: Optional[int] = 10
-
+    
+    action_head_learning_rate: float = 5e-4
     # Value Head Configuration
     value_head_learning_rate: float = 5e-4  # Often higher than Adapter LR
     value_head_dropout: float = 0.0
@@ -153,37 +155,12 @@ class VLMTrainingConfig:
     rl_config:Optional[RLAlgoConfig] = field(default_factory=RLAlgoConfig) # RL Algorithm 
     sft_config:Optional[SFTConfig] = None
 
-# --- habitat sim configs ---
-@dataclass
-class HabitatConfig:
-    config_path: str = "habitat_configs/objectnav_hm3d_rgbd_semantic.yaml"
-    dataset_path: Optional[str] = None
-    workspace: Optional[str] = "."
-    scenes_dir: Optional[str] = None
-    split: str = "val"
-    fp_guard: bool = False
-    fn_guard: bool = False
-    voxel_kwargs: Optional[Dict[str, Any]] = field(default_factory=lambda: None)
-    output_schema: Optional[Dict[str, Any]] = field(default_factory=lambda: {
-        "obs": {"rgb": True, "instr_or_goal": True, "patch_coords": False},
-        "info": {"episode_label": True, "spl": True, "soft_spl":True, "success": True,"distance_to_goal":True},
-        "done": True,
-        "reward": True,
-        "stuck": True,
-        "fp_stop": True
-    })
-    auto_flush: bool = False # automatically flush logs upon reset
-    ep_seed: Optional[bool] = None # if set, episode iterators are deterministic with same set seed all habitat workers
-    explr_bonus: Optional[float] = 0.13
-    collision_penalty: Optional[float] = 0.05
-    fpstop_penalty: Optional[float] = 0.3
-    add_top_down_map:bool = False
 # --- Rollouts (both for Eval and RL) ---
 @dataclass
 class RolloutConfig:
     max_steps: int = 350
     temperature: float = 1.0
-    action_space_str: str = "[stop, forward, left, right, up, down]"
+    action_space_str: str = "[stop, forward, left, right]"
     system_prompt: str = "${read_text:src/longnav/conf/prompts/objectnav_prompt.txt}"
     action_space: List[str] = field(default_factory=lambda: ["stop", "forward", "left", "right"])
     # Templates are lists of dicts (JSON-like)
@@ -211,7 +188,6 @@ class RunConfig:
     episode_json: str = ""
     output_dir: str = "./dump/results"
     jobtype: str = "eval"
-    env_backend: str = "habitat"  # habitat | continuous_dummy
 
 # --- ROOT CONFIGs ---
 @dataclass
@@ -219,10 +195,10 @@ class InferenceConfig:
     resources: ResourceConfig = field(default_factory=ResourceConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     vlm: VLMConfig = field(default_factory=VLMConfig)
-    sim: HabitatConfig = field(default_factory=HabitatConfig)
+    sim: Any = MISSING
     task: RunConfig = field(default_factory=RunConfig)
+    defaults: List[Any] = field(default_factory=lambda: ["_self_", {"sim": "habitat"}])
 
 @dataclass
 class RLConfig(InferenceConfig):
     training: VLMTrainingConfig = field(default_factory=VLMTrainingConfig)
-    hab_config_list: Optional[List] = None

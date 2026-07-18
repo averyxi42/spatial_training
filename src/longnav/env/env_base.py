@@ -19,6 +19,10 @@ class DummyEnvActor:
     Dummy Environment that demonstrates the interface but uses dummy RGB data.
     Reward is a trivial bandit problem: reward of 1 for stop, small negative reward otherwise. Episode ends when stop is taken or randomly with small probability.
     '''
+    def __init__(self, logging_output_dir=None, logger_actor=None, **kwargs):
+        self.logging_output_dir = logging_output_dir
+        self.logger_actor = logger_actor
+
     def step(self, action: int, supplementary_logs: Dict[str, Any] = None):
         # generate random RGB data and state dict
         print(f"step {self.sc} of dummy env")
@@ -62,6 +66,10 @@ class DummyContinuousEnvActor:
     Continuous-action dummy environment for smoke tests.
     Accepts vector actions and returns the same reset/step interface as DummyEnvActor.
     '''
+
+    def __init__(self, logging_output_dir=None, logger_actor=None, **kwargs):
+        self.logging_output_dir = logging_output_dir
+        self.logger_actor = logger_actor
 
     def step(self, action, supplementary_logs: Dict[str, Any] = None):
         print(f"step {self.sc} of continuous dummy env")

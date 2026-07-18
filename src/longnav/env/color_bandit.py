@@ -3,8 +3,8 @@ import numpy as np
 import random
 from typing import Dict, Any
 class ColorBanditEnvActor(DummyEnvActor):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, logging_output_dir=None, logger_actor=None, **kwargs):
+        super().__init__(logging_output_dir=logging_output_dir, logger_actor=logger_actor, **kwargs)
         # mapping from int to color in RGB space
         self.colors = [
             [255,0,0], # red

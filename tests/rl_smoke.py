@@ -1,6 +1,6 @@
 from longnav.config_schema import *
+from longnav.conf.env_configs import DummyDiscreteEnvConfig
 from longnav.utils.factories import ExpBootstrapper,get_shard_iterator
-from longnav.env.env_base import DummyEnvActor
 from longnav.utils.rollout_core import collect_rollouts
 from longnav.utils.rl_core import collate_trajectories
 from verl.trainer.ppo.core_algos import get_adv_estimator_fn
@@ -14,6 +14,8 @@ cfg.resources.num_vlms=1
 cfg.resources.vlm_gpu_fraction=0.3
 cfg.resources.num_sims=2
 cfg.resources.vlm_conda_env=None
+cfg.resources.habitat_conda_env=None
+cfg.sim = DummyDiscreteEnvConfig()
 
 cfg.vlm.attn_impl = "sdpa"
 cfg.vlm.save_outputs=True
@@ -32,8 +34,8 @@ bootstrapper = ExpBootstrapper(cfg)
 
 bootstrapper.setup_cluster()
 
-trainers = bootstrapper.bootstrap_vlms_rl(training=True) 
-sims = [ray.remote(DummyEnvActor).remote() for _ in range(2)]
+trainers = bootstrapper.bootstrap_vlms_rl(training=True)
+sims = bootstrapper.bootstrap_sims()
 try:
     wandb_actor,_ = bootstrapper.bootstrap_logger()
 except Exception as e:

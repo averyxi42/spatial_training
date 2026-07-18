@@ -1,7 +1,17 @@
 import ray
 import os
 from omegaconf import OmegaConf
+from hydra.utils import get_class
 from longnav.config_schema import *
+
+# Metadata keys that exist purely for the factory/registry layer (dispatch, discrimination)
+# and have no corresponding constructor parameter on the actor being instantiated. Strip
+# these centrally wherever a resolved config dict gets spread into a `.remote()` call.
+RESERVED_CONFIG_KEYS = {"_target_", "type", "name"}
+
+
+def strip_reserved_keys(config_dict: dict) -> dict:
+    return {k: v for k, v in config_dict.items() if k not in RESERVED_CONFIG_KEYS}
 
 # Use these imports for type hinting
 from typing import List, Dict, Any, Iterator, Optional,Union
@@ -176,12 +186,16 @@ class RLWorkerFactory:
 
 class SimWorkerFactory:
     @staticmethod
-    def create(sim_dict: dict, res_cfg: ResourceConfig, task_cfg: RunConfig, logger_actor=None,config_overrides=None):
-        from longnav.env.habitat import HabitatEnvActor
+    def create(sim_dict: dict, res_cfg: ResourceConfig, task_cfg: RunConfig, logger_actor=None):
+        sim_dict = dict(sim_dict)
+        target = sim_dict.pop("_target_")
+        config_overrides = sim_dict.pop("per_worker_config_overrides", None)
+        env_actor_cls = get_class(target)
+
         env_dict = {}
         if res_cfg.habitat_conda_env is not None:
             env_dict = {"conda": res_cfg.habitat_conda_env}
-        RemoteSim = ray.remote(HabitatEnvActor).options(
+        RemoteSim = ray.remote(env_actor_cls).options(
             resources={res_cfg.sim_resource_tag: 1},
             num_cpus=res_cfg.sim_cpus,
             num_gpus=res_cfg.sim_gpu_fraction,
@@ -190,17 +204,18 @@ class SimWorkerFactory:
             max_task_retries=-1,
         )
 
+        ctor_kwargs = strip_reserved_keys(sim_dict)
         handles = []
         for i in range(res_cfg.num_sims):
             if config_overrides is not None:
                 print(f"overriding sim {i} config with: {config_overrides[i]}")
-                sim_dict['config_path'] = config_overrides[i]
+                ctor_kwargs['config_path'] = config_overrides[i]
             # Calculate dynamic per-worker arguments
             log_dir = os.path.join(task_cfg.output_dir, task_cfg.run_name,"rollout")# f'worker_{i}')
-            
-            # We merge the static sim_dict with our dynamic arguments
+
+            # We merge the static ctor_kwargs with our dynamic arguments
             h = RemoteSim.remote(
-                **sim_dict,
+                **ctor_kwargs,
                 logging_output_dir=log_dir,
                 logger_actor=logger_actor,
                 # Ensure these match your HabitatRayWorker __init__
@@ -316,6 +331,8 @@ class ExpBootstrapper:
                 self.typed_cfg.vlm.model_id = base_model_path
             # self.resolved_dict['training']['checkpoint'] = checkpoint_path
             self.typed_cfg.training.checkpoint = checkpoint_path
+        # vlm_dict['save_outputs'] = True # force save outputs for RL
+        self.resolved_dict['vlm']['save_outputs'] = True
         workers = RLWorkerFactory.create(
             vlm_dict=self.resolved_dict['vlm'], 
             rollout_dict=self.resolved_dict['rollout'], 
@@ -335,11 +352,10 @@ class ExpBootstrapper:
     
     def bootstrap_sims(self,logger=None):
         return SimWorkerFactory.create(
-            sim_dict=self.resolved_dict['sim'], 
-            res_cfg=self.typed_cfg.resources, 
-            task_cfg=self.typed_cfg.task, 
+            sim_dict=self.resolved_dict['sim'],
+            res_cfg=self.typed_cfg.resources,
+            task_cfg=self.typed_cfg.task,
             logger_actor=logger,
-            config_overrides = self.typed_cfg.hab_config_list
         )
     
     def bootstrap_eval(self):
