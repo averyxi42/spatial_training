@@ -26,8 +26,6 @@ training:
     modules_to_save: null
     use_rslora: false
   rl_config:
-    use_value: false
-    value_grad_scale: 0.1
     advantage_estimator: reinforce_plus_plus_time_kernel
     policy_loss_name: clip_cov
     n_rollout: 16
@@ -43,7 +41,6 @@ training:
       clip_cov_lb: 1.0
     gamma: 0.95
     lam: 0.95
-    cliprange_value: 0.2
     entropy_bonus: 0.002
     use_ref: true
     kl_coeff: 0.001

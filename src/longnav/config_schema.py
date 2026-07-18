@@ -29,14 +29,7 @@ class VLMConfig:
     dtype: str = "bfloat16"
     prefix: str = '<|im_start|>assistant\n**'
     postfix: str = '**<|im_end|>\n'
-    vocab: List[str] = field(default_factory=lambda: ["stop", "forward", "left", "right"]) # discrete actions based on lmhead
-    action_space_type : str = "discrete" # discrete or continuous
-    action_space_dim: int = 2 # for continuous action space
-    gaussian_init_log_std: float = -0.5
-    gaussian_min_log_std: float = -5.0
-    gaussian_max_log_std: float = 2.0
-    continuous_action_clip_low: float = -1.0
-    continuous_action_clip_high: float = 1.0
+    policy_head: Any = MISSING
     offload_cache: bool = False
     use_sparse: bool = True
     save_outputs: bool = False # only need this for RL
@@ -50,8 +43,7 @@ class PolicyLossConfig:
 @dataclass 
 class RLAlgoConfig:
     # generic on policy params
-    use_value: bool = False
-    value_grad_scale: float = 0.1
+    value_head: Optional[Any] = None
     advantage_estimator: str = "reinforce_plus_plus"
     policy_loss_name: str = "vanilla"
     n_rollout: int = 12 # note: must be divisible by num vlms times gradient accumulation
@@ -81,7 +73,6 @@ class RLAlgoConfig:
     distance_pad_mode: Optional[str] = "replicate"
     distance_pad_val: Optional[float] = None
     # Value & Entropy
-    cliprange_value: float = 0.2
     entropy_bonus: float = 0.0
 
     # Ref KL Control
@@ -141,12 +132,6 @@ class VLMTrainingConfig:
     save_step: Optional[int] = 10
     
     action_head_learning_rate: float = 5e-4
-    # Value Head Configuration
-    value_head_learning_rate: float = 5e-4  # Often higher than Adapter LR
-    value_head_dropout: float = 0.0
-    value_head_dtype: str = "float32"  
-    # List of hidden layer sizes. Empty list [] implies a single linear layer (Linear Probe).
-    value_head_hidden_dims: List[int] = field(default_factory=lambda:[1024,512])
 
     # PEFT: Pass the actual configuration object here (e.g., LoraConfig)
     # Typed as Any to avoid crashing if peft isn't installed on the driver
@@ -197,7 +182,7 @@ class InferenceConfig:
     vlm: VLMConfig = field(default_factory=VLMConfig)
     sim: Any = MISSING
     task: RunConfig = field(default_factory=RunConfig)
-    defaults: List[Any] = field(default_factory=lambda: ["_self_", {"sim": "habitat"}])
+    defaults: List[Any] = field(default_factory=lambda: ["_self_", {"sim": "habitat"}, {"policy_head@vlm.policy_head": "lm_head"}])
 
 @dataclass
 class RLConfig(InferenceConfig):

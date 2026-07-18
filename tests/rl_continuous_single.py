@@ -1,5 +1,6 @@
 from longnav.config_schema import *
 from longnav.conf.env_configs import DummyContinuousEnvConfig
+from longnav.conf.vlm_configs import GaussianHeadConfig
 from longnav.utils.factories import ExpBootstrapper, get_shard_iterator
 from longnav.utils.rollout_core import collect_rollouts
 from longnav.utils.rl_core import collate_trajectories
@@ -20,8 +21,7 @@ cfg.sim = DummyContinuousEnvConfig()
 
 cfg.vlm.attn_impl = "sdpa"
 cfg.vlm.save_outputs = True
-cfg.vlm.action_space_type = "continuous"
-cfg.vlm.action_space_dim = 2
+cfg.vlm.policy_head = GaussianHeadConfig(action_space_dim=2)
 
 cfg.rollout.convo_start_template = [
     {"role": "user", "content": [{"type": "text", "text": "example substitution: $instr_or_goal"}]},

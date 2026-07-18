@@ -35,7 +35,7 @@ def compute_full_kl_penalty(log_probs: torch.Tensor, ref_log_probs: torch.Tensor
     return kl
 
 class VLMWorker:
-    def __init__(self, model_id="Qwen/Qwen3-VL-2B-Instruct",attn_impl='sdpa',dtype='float16', prefix = '<|im_start|>assistant\n**',postfix = '**<|im_end|>',vocab=["stop","forward","left","right","up","down"],save_outputs=False,load_model=True,offload_cache=False,use_sparse=False,bev_canvas_size=2000,save_pixels=False,action_space_type="discrete",action_space_dim=2,gaussian_init_log_std=-0.5,gaussian_min_log_std=-5.0,gaussian_max_log_std=2.0,continuous_action_clip_low=-1.0,continuous_action_clip_high=1.0):
+    def __init__(self, model_id="Qwen/Qwen3-VL-2B-Instruct",attn_impl='sdpa',dtype='float16', prefix = '<|im_start|>assistant\n**',postfix = '**<|im_end|>',save_outputs=False,load_model=True,offload_cache=False,use_sparse=False,bev_canvas_size=2000,save_pixels=False,policy_head=None):
         import transformers.modeling_flash_attention_utils as fa_utils
         def patched(position_ids, batch_size):
             return False
@@ -43,8 +43,8 @@ class VLMWorker:
         import torch
         from transformers import AutoProcessor
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.vocab = vocab
-        self.vocab_ids = self._vocab_to_ids(vocab)
+        self.policy_head_config = policy_head if policy_head is not None else {"type": "discrete", "vocab": ["stop","forward","left","right","up","down"]}
+        self.vocab_ids = self._vocab_to_ids(self.policy_head_config.get('vocab', []))
         self.save_outputs = save_outputs
         self.save_pixels = save_pixels
         self.model_id = model_id
@@ -56,15 +56,8 @@ class VLMWorker:
         self.offload_cache = offload_cache
         self.use_sparse = use_sparse
         self.bev_canvas_size = bev_canvas_size
-        self.action_space_type = action_space_type
-        self.action_space_dim = action_space_dim
-        self.gaussian_init_log_std = gaussian_init_log_std
-        self.gaussian_min_log_std = gaussian_min_log_std
-        self.gaussian_max_log_std = gaussian_max_log_std
-        self.continuous_action_clip_low = continuous_action_clip_low
-        self.continuous_action_clip_high = continuous_action_clip_high
-        if self.action_space_type not in ["discrete", "continuous"]:
-            raise ValueError(f"Unsupported action_space_type: {self.action_space_type}")
+        if self.policy_head_config['type'] not in ["discrete", "continuous"]:
+            raise ValueError(f"Unsupported action_space_type: {self.policy_head_config['type']}")
         
         self._is_merged = None
         self._is_lora = None
@@ -117,7 +110,7 @@ class VLMWorker:
         self.model.to('cuda')
         self.vl_model = self.model.model
         self.language_model = self.vl_model.language_model
-        if self.action_space_type == "continuous":
+        if self.policy_head_config['type'] == "continuous":
             self._ensure_continuous_action_head()
 
     def _ensure_continuous_action_head(self):
@@ -126,10 +119,10 @@ class VLMWorker:
         hidden_size = self.language_model.config.hidden_size
         self.model.action_head = ContinuousActionHead(
             input_dim=hidden_size,
-            action_dim=self.action_space_dim,
-            init_log_std=self.gaussian_init_log_std,
-            min_log_std=self.gaussian_min_log_std,
-            max_log_std=self.gaussian_max_log_std,
+            action_dim=self.policy_head_config['action_space_dim'],
+            init_log_std=self.policy_head_config['gaussian_init_log_std'],
+            min_log_std=self.policy_head_config['gaussian_min_log_std'],
+            max_log_std=self.policy_head_config['gaussian_max_log_std'],
             dtype=getattr(torch, self.dtype) if isinstance(self.dtype, str) else self.dtype,
         ).to(self.model.device)
 
@@ -468,7 +461,7 @@ class VLMWorker:
         #         print("WARNING: prediction not in provided vocab")
         # # print("inference done!")
         # print(f" total time: {time.time()-t0}")
-            if self.action_space_type == "continuous":
+            if self.policy_head_config['type'] == "continuous":
                 hidden_last = outputs.last_hidden_state[:, -1:, :]
                 policy = self.model.action_head(hidden_last)
                 policy = {k: v.squeeze(0).float().cpu().numpy() for k, v in policy.items()}
@@ -494,12 +487,12 @@ class VLMWorker:
     
     def infer_probs(self,messages,images,**kwargs):
         policy_output,outputs = self.infer_step(messages,images,**kwargs)
-        if self.action_space_type == "continuous":
+        if self.policy_head_config['type'] == "continuous":
             mu = policy_output["mu"]
             log_std = policy_output["log_std"]
             std = np.exp(log_std)
             action = np.random.normal(mu, std)
-            action = np.clip(action, self.continuous_action_clip_low, self.continuous_action_clip_high)
+            action = np.clip(action, self.policy_head_config['continuous_action_clip_low'], self.policy_head_config['continuous_action_clip_high'])
             log_prob = -0.5 * (((action - mu) / std) ** 2 + 2.0 * log_std + np.log(2.0 * np.pi))
             return action.astype(np.float32), np.sum(log_prob, axis=-1).astype(np.float32), outputs
 
@@ -734,14 +727,14 @@ class VLMTrainingMixin:
         hidden_size = self.language_model.config.hidden_size
         
         if config.rl_config is not None:
-            if self.action_space_type == "continuous":
+            if self.policy_head_config['type'] == "continuous":
                 self._ensure_continuous_action_head()
-            if config.rl_config.use_value:
+            if config.rl_config.value_head is not None:
                 self.model.value_head = ValueHead(
                     input_dim=hidden_size,
-                    hidden_dims=config.value_head_hidden_dims,
-                    dropout=config.value_head_dropout,
-                    dtype=getattr(torch,config.value_head_dtype)
+                    hidden_dims=config.rl_config.value_head.hidden_dims,
+                    dropout=config.rl_config.value_head.dropout,
+                    dtype=getattr(torch,config.rl_config.value_head.dtype)
                 ).to(self.model.device)
             from verl.trainer.ppo.core_algos import get_policy_loss_fn
             self.policy_loss_fn = get_policy_loss_fn(config.rl_config.policy_loss_name)
@@ -756,7 +749,7 @@ class VLMTrainingMixin:
         # 5. Create Optimizer
         # Only optimize parameters that require gradients (i.e., the Adapters)
         print(f"accelerator device: {self.accelerator.device}")
-        wrapper = VLMWrapper(self.model,action_space_type = self.action_space_type)
+        wrapper = VLMWrapper(self.model,action_space_type = self.policy_head_config['type'])
         rest_params = [p for n, p in wrapper.named_parameters() if "value_head" not in n and "action_head" not in n and p.requires_grad]
 
         optimizer_grouped_parameters = [
@@ -767,15 +760,15 @@ class VLMTrainingMixin:
             }
         ]
 
-        if config.rl_config.use_value:
+        if config.rl_config.value_head is not None:
             head_params = [p for n, p in wrapper.named_parameters() if "value_head" in n and p.requires_grad]
             optimizer_grouped_parameters+=[
                 {
                     "params": head_params,
-                    "lr": config.value_head_learning_rate,
+                    "lr": config.rl_config.value_head.learning_rate,
                     "name": "value_head"
                 }]
-        if self.action_space_type == "continuous":
+        if self.policy_head_config['type'] == "continuous":
             action_head_params = [p for n, p in wrapper.named_parameters() if "action_head" in n and p.requires_grad]
             optimizer_grouped_parameters += [
                 {
@@ -815,7 +808,7 @@ class VLMTrainingMixin:
                 config.peft_config.modules_to_save = []
             if "value_head" not in config.peft_config.modules_to_save:
                 config.peft_config.modules_to_save.append("value_head")
-            if self.action_space_type == "continuous" and "action_head" not in config.peft_config.modules_to_save:
+            if self.policy_head_config['type'] == "continuous" and "action_head" not in config.peft_config.modules_to_save:
                 config.peft_config.modules_to_save.append("action_head")
             try:
                 peft_kwargs = asdict(config.peft_config)
@@ -867,7 +860,7 @@ class VLMTrainingMixin:
         policy_stats = {}
         if compute_values:
             values = model.value_head(hidden[:,logits_to_keep].to(model.value_head.dtype)).squeeze(-1)
-        if self.action_space_type == "continuous":
+        if self.policy_head_config['type'] == "continuous":
             policy_stats = model.action_head(hidden[:, logits_to_keep])
         else:
             policy_stats['logits'] = model.lm_head(hidden[:,logits_to_keep])
@@ -876,7 +869,7 @@ class VLMTrainingMixin:
     def _forward_seq(self,rl_seq_inputs,compute_values=False):
         # seq_inputs = {k:torch.tensor(v,device='cuda') for k,v in self.rl_seq_inputs.items()}
         seq_inputs = {k:v.to('cuda') for k,v in rl_seq_inputs.items()}
-        if self.action_space_type == "continuous":
+        if self.policy_head_config['type'] == "continuous":
             raise NotImplementedError("Continuous training path requires embeds inputs; seq-input forward is not supported.")
         output = self.model(**seq_inputs)
         policy_stats = {'logits': output.logits}
@@ -894,12 +887,16 @@ class VLMTrainingMixin:
         
     def _training_forward(self,embeds_inputs):
         # Forward via DDP wrapper (triggers sync)
-        policy_stats,vpreds, = self.ddp_model(embeds_inputs = embeds_inputs,compute_values = self.rl_algo_config.use_value,value_grad_scale=self.rl_algo_config.value_grad_scale)
+        compute_values = self.rl_algo_config.value_head is not None
+        forward_kwargs = {"embeds_inputs": embeds_inputs, "compute_values": compute_values}
+        if compute_values:
+            forward_kwargs["value_grad_scale"] = self.rl_algo_config.value_head.value_grad_scale
+        policy_stats,vpreds, = self.ddp_model(**forward_kwargs)
         return policy_stats,vpreds
     
     def rl_loss(self, log_probs, actions, advantages, response_mask, old_log_prob, returns, old_values, vpreds, rollout_log_probs=None, ref_log_probs=None, policy_stats=None, actions_continuous=None):        
         from verl.trainer.ppo.core_algos import compute_value_loss,compute_entropy_loss
-        if self.action_space_type == "continuous":
+        if self.policy_head_config['type'] == "continuous":
             if policy_stats is None or actions_continuous is None:
                 raise ValueError("Continuous RL loss requires policy_stats and actions_continuous.")
             mu = policy_stats['mu']
@@ -920,8 +917,8 @@ class VLMTrainingMixin:
         pg_loss,metrics = self.policy_loss_fn(old_log_prob=old_log_prob.to(log_prob.device),log_prob=log_prob,advantages=advantages.to(log_prob.device),response_mask=response_mask,config = self.rl_algo_config)
         metrics['loss/pg_loss'] = pg_loss.detach().item()
         metrics['return'] = torch.amax(returns).detach().item()
-        if self.rl_algo_config.use_value:
-            value_loss,vf_clipfrac = compute_value_loss(vpreds,returns.to(log_prob.device),old_values.to(log_prob.device),response_mask,self.rl_algo_config.cliprange_value)
+        if self.rl_algo_config.value_head is not None:
+            value_loss,vf_clipfrac = compute_value_loss(vpreds,returns.to(log_prob.device),old_values.to(log_prob.device),response_mask,self.rl_algo_config.value_head.cliprange_value)
             loss = pg_loss + value_loss
             metrics['critic/vf_clipfrac'] = vf_clipfrac.detach().item()
             metrics['train/vf_loss'] = value_loss.detach().item()
@@ -934,7 +931,7 @@ class VLMTrainingMixin:
             loss = pg_loss
 
         if self.rl_algo_config.entropy_bonus is not None:
-            if self.action_space_type == "continuous" and policy_stats is not None:
+            if self.policy_head_config['type'] == "continuous" and policy_stats is not None:
                 entropy = self._continuous_entropy(policy_stats['log_std']).mean()
             else:
                 entropy = compute_entropy_loss(policy_stats['logits'],response_mask)
@@ -942,12 +939,12 @@ class VLMTrainingMixin:
             metrics['train/entropy'] = entropy.detach().item()
             loss = loss+entropy_loss
 
-        if self.action_space_type != "continuous" and ref_log_probs is not None and self.rl_algo_config.kl_coeff is not None:
+        if self.policy_head_config['type'] != "continuous" and ref_log_probs is not None and self.rl_algo_config.kl_coeff is not None:
             kld = compute_full_kl_penalty(log_probs,ref_log_probs.to(log_probs.device))
             metrics['train/ref_kl_divergence'] = kld.mean().item()
             loss = loss + (kld * self.rl_algo_config.kl_coeff).mean()
 
-        if self.action_space_type != "continuous" and rollout_log_probs is not None:
+        if self.policy_head_config['type'] != "continuous" and rollout_log_probs is not None:
             kld = compute_full_kl_penalty(log_probs.cpu(),rollout_log_probs.cpu())
             metrics['train/rollout_kl_divergence'] = kld.mean().item()        
         return loss,metrics
@@ -956,7 +953,7 @@ class VLMTrainingMixin:
         """
         Behavior Cloning / DAgger Loss.
         """
-        if self.action_space_type == "continuous":
+        if self.policy_head_config['type'] == "continuous":
             raise NotImplementedError("DAgger/BC is not supported for continuous action mode.")
         import torch.nn.functional as F
         
@@ -1016,7 +1013,7 @@ class VLMTrainingMixin:
             loss = torch.tensor(0.0).to(self.device)
             metrics = {}
             policy_stats,vpreds = self._training_forward(embeds_inputs)
-            if self.action_space_type == "discrete":
+            if self.policy_head_config['type'] == "discrete":
                 log_probs = self._calculate_action_logprobs(policy_stats['logits']) # B by S by N_action space
             else:
                 log_probs = None # cannot calculate individual logprobs for continuous actions, must use policy_stats for distribution

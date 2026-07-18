@@ -131,7 +131,7 @@ class EpisodeRolloutMixin:
                 # print(f"vlm step{step_count}")
                 # print("done")
                 #except for the first turn, all messages follow the exact same template.
-                if self.action_space_type == "continuous":
+                if self.policy_head_config['type'] == "continuous":
                     action_to_env = np.asarray(policy_out, dtype=np.float32).reshape(-1)
                     action_id = action_to_env
                     vlm_logs |= {
@@ -155,7 +155,7 @@ class EpisodeRolloutMixin:
                 # D. Step Simulator (Blocking) ---------------------------RAY----------------------------- 
                 t0 = time.time()
                 # del rgb,state_dict
-                state_ref = ray.get(env_handle.step.remote(action_to_env if self.action_space_type == "continuous" else action_id,supplementary_logs=vlm_logs))
+                state_ref = ray.get(env_handle.step.remote(action_to_env if self.policy_head_config['type'] == "continuous" else action_id,supplementary_logs=vlm_logs))
                 if len(state_ref)==2:
                     rgb,state_dict = state_ref
                 elif len(state_ref)==3:
@@ -174,7 +174,7 @@ class EpisodeRolloutMixin:
                         # "distance_to_goal": state_dict['info']['distance_to_goal'],
                         **state_dict['info'],
                     }
-                    if self.action_space_type == "continuous":
+                    if self.policy_head_config['type'] == "continuous":
                         trajectory_dict["actions_continuous"] = np.asarray(action_id, dtype=np.float32)
                     else:
                         trajectory_dict["actions"] = action_id
@@ -185,7 +185,7 @@ class EpisodeRolloutMixin:
                         with torch.no_grad():
                             trajectory_dict["values"] = self._compute_value(outputs).cpu().numpy()
                     trajectory_buffer.append(trajectory_dict)
-                if self.action_space_type == "continuous":
+                if self.policy_head_config['type'] == "continuous":
                     action_text = ",".join([f"{x:.3f}" for x in np.asarray(action_id).reshape(-1)])
                 else:
                     action_text = self.rollout_config['action_space'][action_id]
@@ -278,14 +278,14 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
             import torch
             with torch.no_grad():
                 if self.rl_embeds_inputs is not None:
-                    policy_stats,values = self._forward_embeds(self.rl_embeds_inputs,self.rl_algo_config.use_value)
+                    policy_stats,values = self._forward_embeds(self.rl_embeds_inputs,(self.rl_algo_config.value_head is not None))
                     model_inputs = self.rl_embeds_inputs
                 elif self.rl_seq_inputs is not None:
-                    policy_stats,values = self._forward_seq(self.rl_seq_inputs,self.rl_algo_config.use_value)
+                    policy_stats,values = self._forward_seq(self.rl_seq_inputs,(self.rl_algo_config.value_head is not None))
                     model_inputs = self.rl_seq_inputs
                 else:
                     raise ValueError("No stored model inputs found for postprocessing.")
-                if self.action_space_type == "continuous":
+                if self.policy_head_config['type'] == "continuous":
                     actions_continuous = torch.as_tensor(self.rl_trajectory['actions_continuous'], dtype=policy_stats['mu'].dtype, device=policy_stats['mu'].device)
                     if actions_continuous.dim() == 2:
                         actions_continuous = actions_continuous.unsqueeze(0)
@@ -300,7 +300,7 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
                 if values is not None:
                     self.rl_trajectory['values'] = values.squeeze().float().cpu().numpy()
 
-            if self.rl_algo_config.use_ref and self.action_space_type != "continuous":
+            if self.rl_algo_config.use_ref and self.policy_head_config['type'] != "continuous":
                 with torch.no_grad():
                     self.unmerge_adapter()
                     with self.model.disable_adapter():
