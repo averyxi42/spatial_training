@@ -175,6 +175,16 @@ class RunConfig:
     jobtype: str = "eval"
 
 # --- ROOT CONFIGs ---
+# `sim` and `vlm.policy_head` are Hydra ConfigStore groups (see conf/env_configs.py,
+# conf/vlm_configs.py), not plain fields. To pick a non-default member:
+#   - from the CLI: bare `sim=dummy_discrete` / `policy_head@vlm.policy_head=gaussian_head`
+#     (no `+`, since they're already in the defaults list below).
+#   - from a yaml (e.g. an experiment/*.yaml under `# @package _global_`): plain
+#     `sim: dummy_discrete` does NOT work -- that just assigns the literal string
+#     "dummy_discrete" to the field and fails validation once merged against the
+#     already-typed group default. Use Hydra's defaults-list override syntax instead:
+#       defaults:
+#         - override /sim: dummy_discrete
 @dataclass
 class InferenceConfig:
     resources: ResourceConfig = field(default_factory=ResourceConfig)

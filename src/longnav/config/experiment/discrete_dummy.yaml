@@ -1,0 +1,63 @@
+# @package _global_
+defaults:
+  - override /sim: dummy_discrete
+training:
+  load_optim: false
+  load_sched: false
+  learning_rate: 2e-06
+  grad_accum_steps: 1
+  mixed_precision: 'no'
+  gradient_checkpointing: true
+  total_optimization_steps: 20000
+  warmup_steps: 32
+  save_step: 32
+  peft_config:
+    r: 128
+    lora_alpha: 256
+    lora_dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    modules_to_save: null
+    use_rslora: false
+  rl_config:
+    advantage_estimator: reinforce_plus_plus
+    n_rollout: 4
+    n_adv: 256
+    n_epoch: 2
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 3.0
+    policy_loss:
+      name: clip_cov
+      clip_cov_ratio: 0.0002
+      clip_cov_ub: 5.0
+      clip_cov_lb: 1.0
+    gamma: 0.95
+    lam: 0.95
+    entropy_bonus: 0.0
+    use_ref: true
+    kl_coeff: 0.001
+    kl_target: 0.1
+    global_batch_info: {}
+  sft_config: null
+rollout:
+  system_prompt: "${read_text:src/longnav/conf/prompts/discrete_dummy_prompt.txt}"
+  max_steps: 16
+resources:
+  osm_gb: 16
+  vlm_conda_env: "longnav"
+  habitat_conda_env: "longnav"
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "discrete_dummy_step_limit_fix"
