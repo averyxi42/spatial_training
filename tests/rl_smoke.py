@@ -163,4 +163,5 @@ for i in range(3):
                 print(f"Error in training future: {e}")
                 completed_count += 1
                 print(f"[{completed_count}/{total_tasks}] Complete with error. Check logs for details.")
-ray.get(wandb_actor.close.remote())
+if wandb_actor is not None:
+    ray.get(wandb_actor.close.remote())
