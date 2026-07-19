@@ -11,8 +11,9 @@ built-in regression check at the bottom of this file.
 
 To add a demo case: drop a yaml under cases/ with `composables: [...]` (names
 of files under composables/, without extension) and/or `overrides: [...]`
-(raw Hydra override strings). Optional `assert_sim_target: <dotted.path>` and
-`expect_failure: true` keys add a pass/fail assertion.
+(raw Hydra override strings). Optional `assert_sim_target: <dotted.path>`,
+`assert_policy_head_type: <discrete|continuous>`, and `expect_failure: true`
+keys add a pass/fail assertion.
 
 Run with: python3 tests/compose_demos/compose_demo.py
 """
@@ -79,6 +80,15 @@ def run_case(name, case, composables):
         got = container.get("sim", {}).get("_target_")
         if got != assert_target:
             return False, f"assert_sim_target failed: expected {assert_target!r}, got {got!r}"
+
+    # LMHeadConfig (discrete) has no _target_ field at all (nothing extra to
+    # construct beyond the backbone), so we assert on `type` rather than
+    # `_target_` -- unlike sim backends, every policy_head variant sets `type`.
+    assert_policy_head_type = case.get("assert_policy_head_type")
+    if assert_policy_head_type is not None:
+        got = container.get("vlm", {}).get("policy_head", {}).get("type")
+        if got != assert_policy_head_type:
+            return False, f"assert_policy_head_type failed: expected {assert_policy_head_type!r}, got {got!r}"
 
     return True, "ok"
 

@@ -9,3 +9,4 @@ overrides:
   - +experiment=discrete_dummy
   - +training=rpp
 assert_sim_target: longnav.env.env_base.DummyEnvActor
+assert_policy_head_type: discrete

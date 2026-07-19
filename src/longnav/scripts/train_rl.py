@@ -77,6 +77,15 @@ def main(cfg: RLConfig):
     trainers = ctx.trainers
     sims = ctx.sims
     wandb_actor = ctx.wandb_actor
+    # NOTE (behavior change, deliberate): the pre-extraction code built a second,
+    # redundant get_shard_iterator() right after this one and used that one for
+    # the training loop -- it dropped the `excluded_episodes` the first (dead)
+    # call had wired in, so resumed runs silently retrained on already-completed
+    # episodes. bootstrap_all's shard_iter carries excluded_episodes through
+    # (matching what eval.py always did), so resumed runs now correctly skip
+    # them -- a bug fix, not a regression, but flagging it since it changes
+    # resumed-run behavior and isn't visible to the dummy-env smoke tests
+    # (excluded_episodes is None there).
     shard_iter = ctx.shard_iter
     logger = ctx.logger
     num_rollouts = ctx.num_rollouts

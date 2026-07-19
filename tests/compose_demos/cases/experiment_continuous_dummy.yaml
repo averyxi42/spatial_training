@@ -12,3 +12,4 @@ overrides:
   - +experiment=continuous_dummy
   - +training=rpp
 assert_sim_target: longnav.env.env_base.DummyContinuousEnvActor
+assert_policy_head_type: continuous
