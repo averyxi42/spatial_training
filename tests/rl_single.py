@@ -1,14 +1,16 @@
 from longnav.config_schema import *
 from longnav.conf.env_configs import DummyDiscreteEnvConfig
 from longnav.conf.vlm_configs import LMHeadConfig
-from longnav.utils.factories import ExpBootstrapper,get_shard_iterator
-from longnav.utils.rollout_core import collect_rollouts
-from longnav.utils.rl_core import collate_trajectories
+from longnav.utils.factories import ExpBootstrapper, get_shard_iterator, get_console_logger
+from longnav.utils.train_loop import (
+    run_rollout_cycle,
+    compute_advantages_and_returns,
+    run_training_epochs,
+    stream_results_and_log,
+)
 from verl.trainer.ppo.core_algos import get_adv_estimator_fn
 
 import ray
-import numpy as np
-import json
 cfg = RLConfig()
 cfg.resources.osm_gb=28
 cfg.resources.num_vlms=1
@@ -33,6 +35,7 @@ advantage_estimator_fn = get_adv_estimator_fn("reinforce_plus_plus")
 cfg.task.run_name = "rl_step"
 # cfg.task.logger = WandbLoggerConfig(project="longnav_smoke_test")
 bootstrapper = ExpBootstrapper(cfg)
+logger = get_console_logger()
 
 bootstrapper.setup_cluster()
 
@@ -47,169 +50,42 @@ except Exception as e:
 
 trajectory_list = []
 
-rollout_list,result_list,log_list = collect_rollouts(sims,trainers,get_shard_iterator(0),bootstrapper.typed_cfg.training.rl_config.n_rollout) #
-trajectory_list += [tup[0] for tup in rollout_list]
-trajectory_list = trajectory_list[-bootstrapper.typed_cfg.training.rl_config.n_adv:]
-traj_batch = collate_trajectories(trajectory_list)
-model_inputs = [(tup[1],tup[2]) for tup in rollout_list]
-
-values = traj_batch.get("values",None)
+traj_batch, model_inputs, values, distances, log_list = run_rollout_cycle(
+    sims,
+    trainers,
+    get_shard_iterator(0),
+    trajectory_list,
+    bootstrapper.typed_cfg.training.rl_config.n_rollout,
+    bootstrapper.typed_cfg.training.rl_config.n_adv,
+)
 
 print("Computing Advantages")
-# config = bootstrapper.resolved_dict['training']['rl_config']
-# Note: compute_gae expects (B, T) inputs and returns (B, T)
-adv_tuple = advantage_estimator_fn(
-    token_level_rewards=traj_batch['rewards'],
-    values=values,
-    response_mask=traj_batch['response_mask'],
-    config = cfg.training.rl_config,
-    # gamma=config.get('gamma', 0.99), # Fallback defaults if not in config
-    # lam=config.get('lam', 0.95)
-)
-advantages, returns = adv_tuple[0],adv_tuple[1]
-traj_batch['advantages'] = advantages
-traj_batch['returns'] = returns
+traj_batch, global_return_mean = compute_advantages_and_returns(traj_batch, advantage_estimator_fn, cfg)
 
 print(f"traj batch shape: {traj_batch.shape}")
 traj_batch = traj_batch[-bootstrapper.typed_cfg.training.rl_config.n_rollout:] # only train on most recent.
 
 print("training step:")
 
-future_metadata = {}
-training_futures = []
-perm_indices = np.random.permutation(bootstrapper.typed_cfg.training.rl_config.n_rollout) # shuffle
-for batch_start in range(0, bootstrapper.typed_cfg.training.rl_config.n_rollout, bootstrapper.typed_cfg.resources.num_vlms):
-    # Create futures for this specific "global step"
-    # We map workers 0..N to data indices batch_start..batch_start+N
-    step_futures = []
-    for worker_idx, trainer in enumerate(trainers):
-        global_idx = batch_start + worker_idx
-        global_idx = perm_indices[global_idx]
-        # Access the specific inputs and the sliced TensorDict for this index
-        # We use global_idx to ensure we pull the correct corresponding data
-        ref = trainer.train_rl_step.remote(
-                *model_inputs[global_idx], 
-                traj_batch[global_idx : global_idx + 1, traj_batch['response_mask'][global_idx].bool()]
-            )
-        step_futures.append(ref)
-        future_metadata[ref] = global_idx
-    training_futures.extend(step_futures)
+training_futures, future_metadata = run_training_epochs(
+    trainers,
+    model_inputs,
+    traj_batch,
+    1, # one logged epoch, matching the original single-epoch smoke test
+    bootstrapper.typed_cfg.training.rl_config.n_rollout,
+    bootstrapper.typed_cfg.resources.num_vlms,
+)
 
 print(f"Dispatched {len(training_futures)} training tasks for epoch")
-# ------------------------------------- monitor training live ---------------------------------
-pending_futures = training_futures
-total_tasks = len(pending_futures)
-completed_count = 0
-
-while pending_futures:
-    # 1. Block until at least one future is ready
-    ready_refs, pending_futures = ray.wait(pending_futures, num_returns=1)
-    
-    # 2. Process the ready future(s)
-    for ref in ready_refs:
-        # We catch exceptions here to prevent one failed batch from crashing the loop
-        try:
-            result = ray.get(ref)
-            rollout_idx = future_metadata[ref]
-
-            batch_row = traj_batch[rollout_idx] 
-            valid_mask = batch_row['response_mask'].bool()
-            traj_stats = batch_row[valid_mask] 
-
-
-            # 4. Log
-            rollout_stats = {
-                "rollout/ep_rew": traj_stats['rewards'].sum().item(),
-                "rollout/ep_len": valid_mask.sum().item(),
-                # "rollout/success": traj_stats['success'].max().item(), 
-                # "rollout/spl": traj_stats['spl'].max().item(),
-                "rollout/ep_rtn": traj_stats['returns'].mean().item(),
-                "rollout/rtn_var": traj_stats['returns'].var().item(),
-                # "rollout/global_cycle": global_cycle
-            }
-            try:
-                critic_mse = ((traj_stats['baseline']-traj_stats['returns'])**2).mean()
-                # naive_mse = ((traj_stats['returns'] - global_return_mean)**2).mean().item()
-                rollout_stats |= {
-                    "rollout/baseline_mse":critic_mse,
-                    # "rollout/naive_mse":naive_mse
-                }
-            except:
-                print("cannot compute baseline metric")
-            result |= rollout_stats
-            log_ref = log_list[rollout_idx]
-            try:
-                # 1. Try to get the path with a short timeout (e.g., 0.1s)
-                # If the Sim Worker is done, this is instant.
-                log_path = ray.get(log_ref, timeout=30.0)
-                
-                with open(log_path, 'r') as f:
-                    vlm_log_dict = json.load(f)
-                result |= vlm_log_dict
-                
-            except ray.exceptions.GetTimeoutError:
-                # 2. If Sim Worker is stuck, log a warning but DO NOT FREEZE training
-                print(f"Log file for rollout {rollout_idx} not ready (Sim Worker I/O Lag). Skipping detailed logs.")
-            except Exception as e:
-                print(f"Failed to read log file: {e}")
-            if wandb_actor is not None:
-                wandb_actor.log_row.remote(result)
-            completed_count += 1
-            
-            print(f"[{completed_count}/{total_tasks}] Complete. {result}")
-        except Exception as e:
-            print(f"Error in training future: {e}")
-            completed_count += 1
-            print(f"[{completed_count}/{total_tasks}] Complete with error. Check logs for details.")
+stream_results_and_log(
+    training_futures,
+    future_metadata,
+    traj_batch,
+    wandb_actor,
+    0,
+    global_return_mean,
+    logger,
+    log_list,
+)
 if wandb_actor is not None:
     ray.get(wandb_actor.close.remote())
-# from longnav.utils.tensor_utils import TensorPacker
-# trainer = trainers[0]
-# model_input = model_inputs[0]
-# embeds_input = TensorPacker.unpack(*model_input,'cuda')
-# # result_1 = ray.get(trainer._forward_embeds.remote(embeds_input))
-# # packed_input = TensorPacker.pack(embeds_input)
-# # embeds_input_2 = TensorPacker.unpack(*packed_input,'cuda')
-# result_1 = ray.get(trainer._forward_embeds.remote(embeds_input))
-# new_log_prob = ray.get(trainer._calculate_action_logprobs.remote(result_1[0]))
-# print(new_log_prob)
-# ray.kill(trainer)
-
-
-# from typing import Optional
-# from dataclasses import asdict
-# from longnav.utils.rollout_core import RLWorker
-# from longnav.config_schema import RolloutConfig,VLMConfig,VLMTrainingConfig
-# from longnav.utils.factories import resolve_checkpoint_path,get_base_model
-# from longnav.utils.rollout_core import substitute_convo_template
-# import os
-# from pathlib import Path
-# import numpy as np
-# rollout_cfg = RolloutConfig()
-# vlm_cfg = VLMConfig()
-# vlm_cfg.attn_impl = "sdpa"
-# training_cfg = VLMTrainingConfig()
-
-# # checkpoint_path = "Aasdfip/hm3d_rpp_ke_standard-checkpoint_231"
-
-# # checkpoint_path = resolve_checkpoint_path(checkpoint_path)
-# # base_model_path = get_base_model(checkpoint_path)
-# # vlm_cfg.model_id = base_model_path
-
-
-# worker = RLWorker(asdict(rollout_cfg),**asdict(vlm_cfg))
-# # worker._setup_peft(training_cfg)
-# import socket
-
-# def find_free_port():
-#     # Create a new socket
-#     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-#         # Bind to an empty address/port, letting the OS pick a free port (port 0)
-#         s.bind(('', 0))
-#         # Return the port number assigned by the OS
-#         return s.getsockname()[1]
-# master_port = find_free_port()
-# # worker.setup_training(config=cfg.training,rank=0,world_size=1,master_addr='localhost',master_port=master_port)
-# worker.setup_training(config=training_cfg,rank=0,world_size=1,master_addr='localhost',master_port=master_port)
-
-# initial_new_logprobs = worker._calculate_action_logprobs(worker._forward_embeds(embeds_input)[0])

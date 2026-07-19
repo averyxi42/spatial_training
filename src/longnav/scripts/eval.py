@@ -8,10 +8,9 @@ import math
 import hydra
 from longnav.conf.register_configs import register_configs
 from longnav.config_schema import RLConfig
-import os 
+import os
 import itertools
 
-from longnav.utils.rollout_core import collect_rollouts
 DEBUG_FLAG = False
 
 # 1. Register our command variants
@@ -20,33 +19,20 @@ register_configs()
 def main(cfg: RLConfig):
     # keep heavy imports here so hydra tab complete is snappier?
     import ray
-    import numpy as np
+    import time
 
-    from longnav.conf.register_configs import register_configs
-    from longnav.utils.factories import ExpBootstrapper,get_shard_iterator,get_console_logger
-    from longnav.utils.tensor_utils import TensorPacker
-    from longnav.utils.rl_core import collate_trajectories
-    from verl.trainer.ppo.core_algos import get_adv_estimator_fn,AdvantageEstimator,POLICY_LOSS_REGISTRY
+    from longnav.utils.rollout_core import collect_rollouts
+    from longnav.utils.train_loop import bootstrap_all
 
-    advantage_estimator_fn = get_adv_estimator_fn(cfg.training.rl_config.advantage_estimator)
     print(f"Model ID: {cfg.vlm.model_id}")
-    bootstrapper = ExpBootstrapper(cfg)
-    logger = get_console_logger()
 
-    bootstrapper.setup_cluster()
-    trainers = bootstrapper.bootstrap_vlms_rl(training=False) #allocate vlms first to prevent out of room issues
-    wandb_actor,episodes_to_skip = bootstrapper.bootstrap_logger()
-    sim_logger = wandb_actor
-    sims = bootstrapper.bootstrap_sims(sim_logger)
-
-    # # 3. Prepare Data Shards (using simple helper)
-    shard_iter = get_shard_iterator(
-        subset_label= cfg.task.subset_label,
-        episode_json= cfg.task.episode_json,
-        shard_size=cfg.task.shard_size,
-        logger=logger,
-        excluded_episodes=episodes_to_skip
-    )
+    ctx = bootstrap_all(cfg, training=False)
+    bootstrapper = ctx.bootstrapper
+    trainers = ctx.trainers
+    sims = ctx.sims
+    wandb_actor = ctx.wandb_actor
+    shard_iter = ctx.shard_iter
+    logger = ctx.logger
 
     shard_iter,shard_iter_copy = itertools.tee(shard_iter)
     try:
@@ -76,12 +62,11 @@ def main(cfg: RLConfig):
         filepath = os.path.join(dirname,f"{filename}.pkl")
         with open(filepath,'wb') as f:
             pickle.dump(obj,f)
-    
+
     # ------------------------------------------- rollouts ------------------------------------------
     batch_size = 32 # fixed batch size decoupled from RL logic for eval
     for i in range(max(math.ceil(len(all_episodes)/batch_size),1)):
         logger.info("Starting rollout collection!")
-        # bootstrapper.typed_cfg.training.rl_config.n_rollout
         rollout_list,result_list,log_list = collect_rollouts(sims,trainers,shard_iter,batch_size,{"return_inputs":False,"eval":True}) #
         if len(rollout_list) == 0:
             print("rollout list empty, exiting")
@@ -91,8 +76,6 @@ def main(cfg: RLConfig):
         # pickle_obj(result_list, f"result_{i}")
         # pickle_obj(log_list,f"logpaths_{i}")
     ray.get(log_list)
-    import time
-    # time.sleep(360)
     cleanup()
 
 if __name__ == "__main__":
