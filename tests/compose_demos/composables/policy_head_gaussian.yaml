@@ -1,0 +1,4 @@
+description: "Continuous Gaussian action head."
+overrides:
+  - policy_head@vlm.policy_head=gaussian_head
+  - vlm.policy_head.action_space_dim=2

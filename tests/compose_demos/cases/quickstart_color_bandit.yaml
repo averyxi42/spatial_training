@@ -1,0 +1,5 @@
+description: "Trivial color-bandit RL-plumbing smoke test."
+composables:
+  - sim_color_bandit
+  - policy_head_lm
+overrides: []

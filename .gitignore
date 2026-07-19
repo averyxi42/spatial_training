@@ -5,3 +5,4 @@ outputs/
 __pycache__/
 ray_object_spilling
 .vscode
+tests/compose_demos/output/

@@ -1,0 +1,7 @@
+description: >
+  Dependency-free continuous quickstart, equivalent to
+  `sim=dummy_continuous policy_head@vlm.policy_head=gaussian_head`.
+composables:
+  - sim_dummy_continuous
+  - policy_head_gaussian
+overrides: []
