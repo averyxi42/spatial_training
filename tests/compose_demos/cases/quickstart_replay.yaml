@@ -1,0 +1,9 @@
+description: >
+  Confirms the `replay` sim group member registered in env_configs.py
+  resolves cleanly (script field left null -- real scripts are supplied at
+  hydra.utils.instantiate time by tests, not via static config).
+composables:
+  - sim_replay
+  - policy_head_lm
+overrides: []
+assert_sim_target: longnav.env.replay.ReplayEnvActor

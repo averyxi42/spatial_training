@@ -32,6 +32,10 @@ dependencies = [
     "huggingface-hub",
     "codetiming"
 ]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.urls]
 #Homepage = ""
 #Issues = ""
@@ -39,3 +43,9 @@ dependencies = [
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires a GPU and the real checkpoint",
+    "slow: forward-pass/checkpoint tier",
+]

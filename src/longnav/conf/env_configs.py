@@ -51,6 +51,17 @@ class ColorBanditEnvConfig:
     _target_: str = "longnav.env.color_bandit.ColorBanditEnvActor"
 
 
+@dataclass
+class ReplayEnvConfig:
+    _target_: str = "longnav.env.replay.ReplayEnvActor"
+    # A scripted sequence of {"rgb": ndarray, "obs": {...}, "reward": float,
+    # "done": bool, "info": {...}} entries. Left None here -- ndarrays aren't
+    # something a static Hydra config should carry -- tests pass a real
+    # script via hydra.utils.instantiate(cfg.sim, script=[...]), overriding
+    # this field at instantiation time.
+    script: Optional[List[Dict[str, Any]]] = None
+
+
 cs.store(name="habitat", group="sim", node=HabitatEnvConfig())
 cs.store(name="voxel", group="sim", node=HabitatEnvConfig(
     voxel_kwargs={
@@ -67,3 +78,4 @@ cs.store(name="voxel", group="sim", node=HabitatEnvConfig(
 cs.store(name="dummy_discrete", group="sim", node=DummyDiscreteEnvConfig())
 cs.store(name="dummy_continuous", group="sim", node=DummyContinuousEnvConfig())
 cs.store(name="color_bandit", group="sim", node=ColorBanditEnvConfig())
+cs.store(name="replay", group="sim", node=ReplayEnvConfig())
