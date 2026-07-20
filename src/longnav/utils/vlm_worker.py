@@ -117,6 +117,9 @@ class VLMWorker:
         if hasattr(self.model, "action_head"):
             return
         hidden_size = self.language_model.config.hidden_size
+        init_seed = self.policy_head_config.get('action_head_init_seed')
+        if init_seed is not None:
+            torch.manual_seed(init_seed)
         self.model.action_head = ContinuousActionHead(
             input_dim=hidden_size,
             action_dim=self.policy_head_config['action_space_dim'],
@@ -488,13 +491,12 @@ class VLMWorker:
     def infer_probs(self,messages,images,**kwargs):
         policy_output,outputs = self.infer_step(messages,images,**kwargs)
         if self.policy_head_config['type'] == "continuous":
-            mu = policy_output["mu"]
-            log_std = policy_output["log_std"]
-            std = np.exp(log_std)
-            action = np.random.normal(mu, std)
-            action = np.clip(action, self.policy_head_config['continuous_action_clip_low'], self.policy_head_config['continuous_action_clip_high'])
-            log_prob = -0.5 * (((action - mu) / std) ** 2 + 2.0 * log_std + np.log(2.0 * np.pi))
-            return action.astype(np.float32), np.sum(log_prob, axis=-1).astype(np.float32), outputs
+            # Sampling (and the oracle-action override) happens in
+            # EpisodeRolloutMixin.run_episode, same as the discrete branch
+            # below returns the full distribution rather than a pre-sampled
+            # action -- this lets run_episode compute a log-prob consistent
+            # with whichever action is actually taken (sampled or oracle).
+            return policy_output, None, outputs
 
         logprobs = policy_output
         assert(len(logprobs)==1) #ensure there is a unique token position for decision making

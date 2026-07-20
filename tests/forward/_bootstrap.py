@@ -16,29 +16,40 @@ import ray
 from longnav.utils.factories import ExpBootstrapper, get_console_logger, get_shard_iterator
 
 
-def make_replay_script(n_steps: int = 8, obs_text: str = "reach the goal"):
-    """`info.oracle_action` is a fixed, deterministic discrete action index
-    (cycling forward/left/right, ending in stop) -- consumed by
-    EpisodeRolloutMixin.run_episode when rollout_config['use_oracle_action']
-    is set, so the *actual* action taken (and therefore every subsequent
-    turn's prompt text) is deterministic across runs. Without this, the
+def make_replay_script(n_steps: int = 8, obs_text: str = "reach the goal", oracle_action_dim: int = None):
+    """`info.oracle_action` is consumed by EpisodeRolloutMixin.run_episode
+    when rollout_config['use_oracle_action'] is set, so the *actual* action
+    taken (and therefore every subsequent turn's prompt text / continuous
+    action fed to the env) is deterministic across runs. Without this, the
     model's own action sampling is genuinely random per-process
     (RolloutWorker.__init__ seeds from os.getpid()), and that sampled
-    action's text feeds back into later turns' prompts -- so turn>=2 model
-    outputs are not reproducible no matter how deterministic the env's
-    observations are."""
+    action's text/value feeds back into later turns' prompts -- so turn>=2
+    model outputs are not reproducible no matter how deterministic the env's
+    observations are.
+
+    `oracle_action_dim=None` (discrete scenarios): oracle_action is a fixed
+    cycling discrete action index (forward/left/forward/right, ending in
+    stop). `oracle_action_dim=<int>` (continuous scenarios): oracle_action
+    is a fixed, per-step deterministic float vector of that dimension
+    (seeded per-step so it's identical run to run, not tied to any process
+    RNG state)."""
     oracle_cycle = [1, 2, 1, 3]  # forward, left, forward, right -- valid indices into action_space
     script = []
     for i in range(n_steps):
         rgb = np.random.default_rng(i).integers(0, 255, (64, 64, 3), dtype=np.uint8)
         is_last = i == n_steps - 1
+        if oracle_action_dim is not None:
+            oracle_action = np.zeros(oracle_action_dim, dtype=np.float32) if is_last else \
+                np.random.default_rng(1000 + i).uniform(-1.0, 1.0, oracle_action_dim).astype(np.float32)
+        else:
+            oracle_action = 0 if is_last else oracle_cycle[i % len(oracle_cycle)]
         script.append(
             {
                 "rgb": rgb,
                 "obs": {"instr_or_goal": obs_text},
                 "reward": 0.1 if not is_last else 1.0,
                 "done": is_last,
-                "info": {"oracle_action": 0 if is_last else oracle_cycle[i % len(oracle_cycle)]},
+                "info": {"oracle_action": oracle_action},
             }
         )
     return script

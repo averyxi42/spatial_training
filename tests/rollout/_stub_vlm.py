@@ -39,7 +39,11 @@ class StubEpisodeWorker(EpisodeRolloutMixin):
         continuous_action_sequence: Optional[List[np.ndarray]] = None,
         rollout_config: Optional[Dict[str, Any]] = None,
     ):
-        self.policy_head_config = {"type": policy_head_type}
+        self.policy_head_config = {
+            "type": policy_head_type,
+            "continuous_action_clip_low": -1.0,
+            "continuous_action_clip_high": 1.0,
+        }
         self.rollout_config = rollout_config or dict(MINIMAL_ROLLOUT_CONFIG)
         self._action_probs_sequence = action_probs_sequence or []
         self._continuous_action_sequence = continuous_action_sequence or []
@@ -53,8 +57,19 @@ class StubEpisodeWorker(EpisodeRolloutMixin):
         idx = min(self._call_idx, max(len(self._action_probs_sequence), len(self._continuous_action_sequence)) - 1)
         self._call_idx += 1
         if self.policy_head_config["type"] == "continuous":
-            action = self._continuous_action_sequence[idx]
-            return action.astype(np.float32), np.float32(0.0), None
+            # Matches VLMWorker.infer_probs' real contract: returns the raw
+            # {"mu", "log_std"} distribution, not a pre-sampled action --
+            # run_episode does the sampling (or oracle override) itself.
+            # log_std=-30 makes std ~9e-14 -- negligible relative to the
+            # action values here, so run_episode's np.random.normal(mu, std)
+            # sampling returns ~exactly `mu` (within assert_allclose's
+            # default tolerance) -- letting this stub stay a deterministic,
+            # scripted sequence of *actions* without needing a real oracle.
+            # (std=0.0 exactly would make run_episode's log-prob computation
+            # divide by zero.)
+            mu = self._continuous_action_sequence[idx].astype(np.float32)
+            log_std = np.full_like(mu, -30.0, dtype=np.float32)
+            return {"mu": mu, "log_std": log_std}, None, None
         probs = self._action_probs_sequence[idx]
         logprobs = np.log(probs + 1e-9)
         return probs, logprobs, None

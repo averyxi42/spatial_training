@@ -132,7 +132,33 @@ class EpisodeRolloutMixin:
                 # print("done")
                 #except for the first turn, all messages follow the exact same template.
                 if self.policy_head_config['type'] == "continuous":
-                    action_to_env = np.asarray(policy_out, dtype=np.float32).reshape(-1)
+                    mu = policy_out["mu"]
+                    log_std = policy_out["log_std"]
+                    std = np.exp(log_std)
+                    if self.rollout_config.get('use_oracle_action'):
+                        # See the discrete branch below for the rationale.
+                        # The policy still runs a real forward pass (mu/log_std
+                        # above are the real distribution); only which action
+                        # is actually taken (and fed back into the next turn's
+                        # prompt) is overridden. The recorded log-prob is
+                        # still computed against the real distribution, just
+                        # evaluated at the oracle action instead of a sample.
+                        if 'oracle_action' not in state_dict['info']:
+                            raise RuntimeError(
+                                "rollout_config['use_oracle_action'] is True but this env's "
+                                "state_dict['info'] has no 'oracle_action' key."
+                            )
+                        action = np.asarray(state_dict['info']['oracle_action'], dtype=np.float32)
+                    else:
+                        action = np.random.normal(mu, std)
+                        action = np.clip(
+                            action,
+                            self.policy_head_config['continuous_action_clip_low'],
+                            self.policy_head_config['continuous_action_clip_high'],
+                        )
+                    log_prob = -0.5 * (((action - mu) / std) ** 2 + 2.0 * log_std + np.log(2.0 * np.pi))
+                    action_logprobs = np.sum(log_prob, axis=-1).astype(np.float32)
+                    action_to_env = action.astype(np.float32).reshape(-1)
                     action_id = action_to_env
                     vlm_logs |= {
                         'mean/action_l2': float(np.linalg.norm(action_to_env)),

@@ -48,7 +48,8 @@ fixtures), `_compare.py` (full, non-summarizing per-element comparison).
 None of the three test files hardcode a single config combination. Each is
 parametrized over every yaml file in `tests/forward/scenarios/`
 (`scenarios.py` auto-discovers them at import time). A scenario file
-declares the `compose_rl_config` overrides and the replay-episode length:
+declares the `compose_rl_config` overrides, the replay-episode length, and
+(for a continuous head) the oracle-action vector dimension:
 
 ```yaml
 # tests/forward/scenarios/discrete_dummy_rpp.yaml
@@ -65,13 +66,15 @@ n_steps: 8
 ```
 
 To add coverage for another run setup (a different experiment yaml,
-training preset, policy head, continuous vs. discrete head, etc.), drop
-another yaml file here -- fixture files are auto-named
-`{component}__{scenario_name}.{pt,json}`, and all three test files pick up
-the new scenario automatically with no code changes. (A continuous-head
-scenario needs its own oracle-action mechanism first --
-`make_replay_script`'s `oracle_cycle` is a discrete action-space index, not
-meaningful for a continuous head -- see `_bootstrap.py`.)
+training preset, policy head, etc.), drop another yaml file here. Fixtures
+for a scenario live under `fixtures/<scenario_name>/` (one subfolder per
+scenario, containing that scenario's whole A/B/C fixture chain), and all
+three test files pick up a new scenario automatically with no code changes.
+
+Two scenarios currently exist: `discrete_dummy_rpp` and
+`continuous_dummy_rpp`. The continuous scenario also sets
+`oracle_action_dim: 2` (matching `gaussian_head`'s `action_space_dim`) and
+overrides `vlm.policy_head.action_head_init_seed=0` -- see below for why.
 
 ## Why `rollout.use_oracle_action`
 
@@ -91,6 +94,33 @@ real logits/probs/logprobs are still what gets recorded. It raises a clear
 `RuntimeError` if enabled against an env whose `info` doesn't provide
 `oracle_action`, since that key is not (yet) a strict env contract.
 
+The continuous-action branch had the exact same problem (`np.random.normal`
+sampling an action inside `infer_probs`, invisible to `run_episode`) plus a
+missing override entirely -- fixed the same way: `infer_probs` now returns
+the raw `mu`/`log_std` distribution (mirroring the discrete branch
+returning the full `action_probs` distribution) instead of a pre-sampled
+action, and `run_episode`'s continuous branch does its own sampling **or**
+the oracle override, then computes the log-prob of whichever action was
+actually taken -- so `rollout_logprobs` always matches what was fed to the
+env, sampled or not.
+
+## Why `vlm.policy_head.action_head_init_seed`
+
+Even with actions made deterministic, `continuous_dummy_rpp` was still
+non-reproducible: `old_log_prob`/`rollout_logprobs` differed by ~7-8
+between runs (nowhere near GPU-jitter magnitude). Root cause:
+`continuous_dummy_rpp` uses `+checkpoint=sft` (no adapter/head checkpoint
+loaded), so `ContinuousActionHead`'s mean layer (`vlm_worker.py`) gets
+PyTorch's default, unseeded `nn.Linear` init -- a genuinely different
+random network every process launch, computing a different `mu` for the
+same input. (`log_std` is a config-driven constant, not random; LoRA's own
+random `lora_A` init doesn't matter since `lora_B` starts at zero.)
+`GaussianHeadConfig.action_head_init_seed` (opt-in, default `None` =
+existing unseeded behavior) calls `torch.manual_seed(seed)` immediately
+before constructing the head, giving a reproducible starting `mu` for
+scenarios -- like this one -- with no real trained head checkpoint to load
+instead.
+
 ## Tolerance calibration
 
 Each test's `TOLERANCE` is set from an actual measured spread across
@@ -104,13 +134,15 @@ several fresh-process runs, documented in that test file's own docstring
   of jitter. Tight tolerance (`atol=1e-6, rtol=1e-6`).
 - **Component C** (real forward+backward pass + real `optimizer.step()`):
   most metrics were bit-identical across 3 fresh-process runs, but
-  `train/grad_norm` was not (observed spread ~0.0044 at magnitude ~8.7),
-  consistent with non-reentrant gradient-checkpointing recomputation and
-  unpinned backward-kernel reduction order. Tolerance (`atol=1e-4,
-  rtol=1e-3`) is set from that measured spread. `train_rl_step` performs a
-  real, unconditional `optimizer.step()`/`scheduler.step()` and is **not**
-  idempotent -- each test run builds a fresh worker (a distinct
-  `build_rl_worker` cache key) rather than reusing one across calls.
+  `train/grad_norm` was not (observed spread ~0.0044 at magnitude ~8.7 for
+  `discrete_dummy_rpp`), consistent with non-reentrant
+  gradient-checkpointing recomputation and unpinned backward-kernel
+  reduction order. Tolerance (`atol=1e-4, rtol=1e-3`, a relative allowance
+  that scales with each scenario's own magnitude) is set from that measured
+  spread. `train_rl_step` performs a real, unconditional
+  `optimizer.step()`/`scheduler.step()` and is **not** idempotent -- each
+  test run builds a fresh worker (a distinct `build_rl_worker` cache key
+  per scenario) rather than reusing one across calls.
 
 If a future run trips a tolerance, that's a real signal (a behavior change
 somewhere in the chain) -- recalibrate deliberately with fresh measurements

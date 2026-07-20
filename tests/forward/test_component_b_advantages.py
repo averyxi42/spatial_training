@@ -11,8 +11,8 @@ Input: Component A's stored traj_batch fixture for the same scenario
 production yaml config values.
 Output: the same traj_batch with `advantages`/`returns` (and, for
 estimators that produce one, `baseline`) added, stored via torch.save
-(exact, not summarized) in tests/forward/fixtures/. This is Component C's
-traj_batch input.
+(exact, not summarized) in tests/forward/fixtures/<scenario_name>/. This is
+Component C's traj_batch input.
 
 No GPU/Ray/model involved -- this is pure CPU tensor math on a frozen
 input, so unlike Component A there is no jitter to calibrate against: two
@@ -26,8 +26,13 @@ from verl.trainer.ppo.core_algos import get_adv_estimator_fn
 
 from _compare import diff_traj_batches
 from _fixture_io import load_traj_batch, save_traj_batch
-from scenarios import SCENARIO_IDS, SCENARIOS, Scenario
-from test_component_a_rollout import traj_batch_fixture_name as component_a_traj_batch_fixture_name
+from scenarios import (
+    COMPONENT_A_TRAJ_BATCH_FILE,
+    COMPONENT_B_TRAJ_BATCH_FILE,
+    SCENARIO_IDS,
+    SCENARIOS,
+    Scenario,
+)
 from longnav.utils.train_loop import compute_advantages_and_returns
 
 # Pure CPU tensor math on a frozen input -- no real source of run-to-run
@@ -37,13 +42,9 @@ from longnav.utils.train_loop import compute_advantages_and_returns
 TOLERANCE = {"atol": 1e-6, "rtol": 1e-6}
 
 
-def traj_batch_fixture_name(scenario: Scenario) -> str:
-    return f"component_b_traj_batch__{scenario.name}"
-
-
 def _run_component_b(compose_rl_config, scenario: Scenario):
     cfg = compose_rl_config(scenario.overrides)
-    traj_batch = load_traj_batch(component_a_traj_batch_fixture_name(scenario))
+    traj_batch = load_traj_batch(scenario.name, COMPONENT_A_TRAJ_BATCH_FILE)
     advantage_estimator_fn = get_adv_estimator_fn(cfg.training.rl_config.advantage_estimator)
     traj_batch, global_return_mean = compute_advantages_and_returns(traj_batch, advantage_estimator_fn, cfg)
     return traj_batch, global_return_mean
@@ -59,9 +60,9 @@ def test_component_b_advantages(compose_rl_config, scenario: Scenario):
     print(f"global_return_mean: {global_return_mean:.6f}")
 
     if os.environ.get("LONGNAV_UPDATE_FIXTURES") == "1":
-        save_traj_batch(traj_batch_fixture_name(scenario), traj_batch)  # full batch: cheap (~14KB), no trimming
+        save_traj_batch(scenario.name, COMPONENT_B_TRAJ_BATCH_FILE, traj_batch)  # full batch: cheap (~14KB), no trimming
         pytest.skip("fixture (re)captured via LONGNAV_UPDATE_FIXTURES=1; rerun without it to verify")
 
-    expected = load_traj_batch(traj_batch_fixture_name(scenario))
+    expected = load_traj_batch(scenario.name, COMPONENT_B_TRAJ_BATCH_FILE)
     mismatches = diff_traj_batches(traj_batch, expected, **TOLERANCE)
     assert not mismatches, "\n".join(mismatches)

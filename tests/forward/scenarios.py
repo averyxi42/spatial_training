@@ -10,7 +10,7 @@ scenario's filename-derived `name`.
 import glob
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 import yaml
 
@@ -22,6 +22,10 @@ class Scenario:
     name: str
     overrides: List[str] = field(default_factory=list)
     n_steps: int = 8
+    # None -> discrete oracle action (cycling index into action_space).
+    # <int> -> continuous oracle action (fixed per-step float vector of
+    # this dimension). Must match the scenario's policy_head action_space_dim.
+    oracle_action_dim: Optional[int] = None
 
 
 def load_scenarios() -> List[Scenario]:
@@ -35,6 +39,7 @@ def load_scenarios() -> List[Scenario]:
                 name=name,
                 overrides=raw.get("overrides", []),
                 n_steps=raw.get("n_steps", 8),
+                oracle_action_dim=raw.get("oracle_action_dim", None),
             )
         )
     if not scenarios:
@@ -44,3 +49,12 @@ def load_scenarios() -> List[Scenario]:
 
 SCENARIOS = load_scenarios()
 SCENARIO_IDS = [s.name for s in SCENARIOS]
+
+# Shared fixture filenames within each scenario's fixtures/<scenario_name>/
+# subfolder -- kept here (not re-derived per test file) so all three
+# component tests agree on where to read/write without cross-importing
+# each other.
+COMPONENT_A_TRAJ_BATCH_FILE = "component_a_traj_batch.pt"
+COMPONENT_A_MODEL_INPUTS_FILE = "component_a_model_inputs.pt"
+COMPONENT_B_TRAJ_BATCH_FILE = "component_b_traj_batch.pt"
+COMPONENT_C_METRICS_FILE = "component_c_metrics.json"

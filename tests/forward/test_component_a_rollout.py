@@ -32,6 +32,16 @@ model still computes real logits/probs/logprobs. Verified empirically:
 zero measured variance (std=0.0) across 3 fresh-process runs for
 rollout_probs/old_logprobs/actions/old_log_prob after this fix, vs. the
 large variance before it.
+
+The continuous head (`continuous_dummy_rpp` scenario) had the same
+underlying problem plus a second one: its action sampling happened inside
+`infer_probs` itself (invisible to run_episode, so oracle override had
+nothing to hook), and its head has no trained checkpoint to load, so its
+mean layer's default nn.Linear init is unseeded and differs every process
+launch. See tests/forward/README.md's two "Why" sections for both fixes
+(`infer_probs` now returns the raw mu/log_std distribution instead of a
+pre-sampled action; `GaussianHeadConfig.action_head_init_seed` pins the
+head's initial weights).
 """
 import os
 
@@ -41,7 +51,13 @@ import torch
 from _bootstrap import bootstrap_with_replay_sim, make_replay_script, teardown
 from _compare import diff_traj_batches
 from _fixture_io import load_traj_batch, save_model_inputs, save_traj_batch
-from scenarios import SCENARIO_IDS, SCENARIOS, Scenario
+from scenarios import (
+    COMPONENT_A_MODEL_INPUTS_FILE,
+    COMPONENT_A_TRAJ_BATCH_FILE,
+    SCENARIO_IDS,
+    SCENARIOS,
+    Scenario,
+)
 from longnav.utils.train_loop import run_rollout_cycle
 
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]
@@ -57,17 +73,9 @@ def _require_gpu():
         pytest.skip("Component A requires a GPU; none available")
 
 
-def traj_batch_fixture_name(scenario: Scenario) -> str:
-    return f"component_a_traj_batch__{scenario.name}"
-
-
-def model_inputs_fixture_name(scenario: Scenario) -> str:
-    return f"component_a_model_inputs__{scenario.name}"
-
-
 def _run_component_a(compose_rl_config, scenario: Scenario):
     cfg = compose_rl_config(scenario.overrides)
-    script = make_replay_script(n_steps=scenario.n_steps)
+    script = make_replay_script(n_steps=scenario.n_steps, oracle_action_dim=scenario.oracle_action_dim)
     bootstrapper, trainers, sims, wandb_actor, shard_iter, logger = bootstrap_with_replay_sim(cfg, script)
     try:
         traj_batch, model_inputs, values, distances, log_list = run_rollout_cycle(
@@ -93,7 +101,7 @@ def test_component_a_rollout(compose_rl_config, scenario: Scenario):
         print(f"  {k}: shape={tuple(traj_batch[k].shape)} dtype={traj_batch[k].dtype}")
 
     if os.environ.get("LONGNAV_UPDATE_FIXTURES") == "1":
-        save_traj_batch(traj_batch_fixture_name(scenario), traj_batch)  # full batch: cheap (~14KB), no trimming
+        save_traj_batch(scenario.name, COMPONENT_A_TRAJ_BATCH_FILE, traj_batch)  # full batch: cheap (~14KB), no trimming
         # model_inputs is ~14MB PER trajectory (real per-patch visual
         # embeds at hidden_dim=2048) -- storing all n_rollout would be
         # impractical to commit to git. Component C only ever calls
@@ -104,9 +112,9 @@ def test_component_a_rollout(compose_rl_config, scenario: Scenario):
         # stored -- this is a storage-driven trim of *how many*
         # trajectories are kept, not a summarization of any trajectory's
         # own data.
-        save_model_inputs(model_inputs_fixture_name(scenario), model_inputs[:1])
+        save_model_inputs(scenario.name, COMPONENT_A_MODEL_INPUTS_FILE, model_inputs[:1])
         pytest.skip("fixture (re)captured via LONGNAV_UPDATE_FIXTURES=1; rerun without it to verify")
 
-    expected = load_traj_batch(traj_batch_fixture_name(scenario))
+    expected = load_traj_batch(scenario.name, COMPONENT_A_TRAJ_BATCH_FILE)
     mismatches = diff_traj_batches(traj_batch, expected, **TOLERANCE)
     assert not mismatches, "\n".join(mismatches)

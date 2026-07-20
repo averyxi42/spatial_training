@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from hydra.core.config_store import ConfigStore
 
@@ -25,6 +25,16 @@ class GaussianHeadConfig:
     gaussian_max_log_std: float = 2.0
     continuous_action_clip_low: float = -1.0
     continuous_action_clip_high: float = 1.0
+    # Optional: seed torch's global RNG immediately before constructing the
+    # head's mean layer (see VLMWorker._ensure_continuous_action_head).
+    # Without a loaded checkpoint, the mean layer's nn.Linear init draws
+    # from the unseeded global torch RNG, so its initial weights (and
+    # therefore mu/log-prob) differ across every process launch -- this is
+    # normal/desired for real training (independent random init per run),
+    # but makes deterministic fingerprint tests of an untrained continuous
+    # head impossible without pinning it. None (default) preserves the
+    # existing unseeded behavior.
+    action_head_init_seed: Optional[int] = None
 
 
 # --- value head config (optional, auxiliary; no ConfigStore group needed - see plan) ---

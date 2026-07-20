@@ -14,7 +14,7 @@ the way train_loop.run_training_epochs does at its call site:
     traj_batch[idx:idx+1, traj_batch["response_mask"][idx].bool()]
 Output: the metrics dict train_rl_step returns, stored as plain JSON (already
 scalar floats -- no tensor round-tripping needed, so no compression
-question arises).
+question arises) at fixtures/<scenario_name>/component_c_metrics.json.
 
 Unlike Components A/B, `train_rl_step` performs a real optimizer.step() --
 it mutates the worker's weights and is NOT idempotent (see vlm_worker.py's
@@ -46,9 +46,14 @@ import os
 import pytest
 
 from _fixture_io import FIXTURES_DIR, load_model_inputs, load_traj_batch
-from scenarios import SCENARIO_IDS, SCENARIOS, Scenario
-from test_component_a_rollout import model_inputs_fixture_name as component_a_model_inputs_fixture_name
-from test_component_b_advantages import traj_batch_fixture_name as component_b_traj_batch_fixture_name
+from scenarios import (
+    COMPONENT_A_MODEL_INPUTS_FILE,
+    COMPONENT_B_TRAJ_BATCH_FILE,
+    COMPONENT_C_METRICS_FILE,
+    SCENARIO_IDS,
+    SCENARIOS,
+    Scenario,
+)
 
 # Measured 0.0 std for the numeric metrics across 3 fresh-process
 # calibration runs (see module docstring). Safety margin, not a guess.
@@ -57,13 +62,13 @@ TOLERANCE = {"atol": 1e-4, "rtol": 1e-3}
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]
 
 
-def metrics_fixture_path(scenario: Scenario) -> str:
-    return os.path.join(FIXTURES_DIR, f"component_c_metrics__{scenario.name}.json")
+def _metrics_fixture_path(scenario: Scenario) -> str:
+    return os.path.join(FIXTURES_DIR, scenario.name, COMPONENT_C_METRICS_FILE)
 
 
 def _run_component_c(build_rl_worker, scenario: Scenario):
-    traj_batch = load_traj_batch(component_b_traj_batch_fixture_name(scenario))
-    model_inputs = load_model_inputs(component_a_model_inputs_fixture_name(scenario))
+    traj_batch = load_traj_batch(scenario.name, COMPONENT_B_TRAJ_BATCH_FILE)
+    model_inputs = load_model_inputs(scenario.name, COMPONENT_A_MODEL_INPUTS_FILE)
     embeds_inputs_np, embeds_inputs_meta = model_inputs[0]
 
     idx = 0
@@ -82,13 +87,14 @@ def test_component_c_train_step(build_rl_worker, scenario: Scenario):
     for k in sorted(metrics.keys()):
         print(f"  {k}: {metrics[k]}")
 
+    path = _metrics_fixture_path(scenario)
     if os.environ.get("LONGNAV_UPDATE_FIXTURES") == "1":
-        os.makedirs(FIXTURES_DIR, exist_ok=True)
-        with open(metrics_fixture_path(scenario), "w") as f:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
             json.dump(metrics, f, indent=2, sort_keys=True)
         pytest.skip("fixture (re)captured via LONGNAV_UPDATE_FIXTURES=1; rerun without it to verify")
 
-    with open(metrics_fixture_path(scenario), "r") as f:
+    with open(path, "r") as f:
         expected = json.load(f)
 
     mismatches = []

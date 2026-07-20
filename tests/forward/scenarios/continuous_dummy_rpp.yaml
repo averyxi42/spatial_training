@@ -1,0 +1,22 @@
+# action_space_dim for gaussian_head (see conf/vlm_configs.py::GaussianHeadConfig) is 2.
+# checkpoint=longnav is a discrete-head LoRA checkpoint (no action_head.log_std
+# weights) -- incompatible with the continuous Gaussian head, which needs a
+# checkpoint with no pre-existing (discrete) action-head adapter. checkpoint=sft
+# is the base SFT model with no adapter loaded, same starting point a real
+# continuous-head training run would use.
+# action_head_init_seed pins the continuous head's otherwise-unseeded
+# nn.Linear mean-layer init (see GaussianHeadConfig.action_head_init_seed)
+# -- needed because no checkpoint provides trained action_head weights here,
+# so without pinning, mu/log-prob would differ every process launch.
+overrides:
+  - "+checkpoint=sft"
+  - "+experiment=continuous_dummy"
+  - "+training=rpp"
+  - "sim=replay"
+  - "resources.vlm_conda_env=null"
+  - "resources.habitat_conda_env=null"
+  - "task.logger=null"
+  - "rollout.use_oracle_action=true"
+  - "vlm.policy_head.action_head_init_seed=0"
+n_steps: 8
+oracle_action_dim: 2

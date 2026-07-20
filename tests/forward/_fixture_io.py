@@ -14,27 +14,38 @@ from tensordict import TensorDict
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 
-def save_traj_batch(name: str, traj_batch: TensorDict):
-    os.makedirs(FIXTURES_DIR, exist_ok=True)
+def _fixture_path(scenario_name: str, filename: str) -> str:
+    """Fixtures live under one subfolder per scenario:
+    tests/forward/fixtures/<scenario_name>/<filename> -- so a scenario's
+    whole chain of stored fixtures (A's traj_batch/model_inputs, B's
+    traj_batch, C's metrics) is one directory, easy to add/remove/diff as a
+    unit when a scenario is added or dropped."""
+    return os.path.join(FIXTURES_DIR, scenario_name, filename)
+
+
+def save_traj_batch(scenario_name: str, filename: str, traj_batch: TensorDict):
+    path = _fixture_path(scenario_name, filename)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
         "batch_size": tuple(traj_batch.batch_size),
         "tensors": {k: v for k, v in traj_batch.items()},
     }
-    torch.save(payload, os.path.join(FIXTURES_DIR, f"{name}.pt"))
+    torch.save(payload, path)
 
 
-def load_traj_batch(name: str) -> TensorDict:
-    payload = torch.load(os.path.join(FIXTURES_DIR, f"{name}.pt"), weights_only=False)
+def load_traj_batch(scenario_name: str, filename: str) -> TensorDict:
+    payload = torch.load(_fixture_path(scenario_name, filename), weights_only=False)
     return TensorDict(payload["tensors"], batch_size=torch.Size(payload["batch_size"]))
 
 
-def save_model_inputs(name: str, model_inputs: list):
+def save_model_inputs(scenario_name: str, filename: str, model_inputs: list):
     """model_inputs is the list of (inputs_tensors_np, inputs_meta) tuples
     `run_rollout_cycle` returns -- exactly what train_rl_step's first two
     positional args come from, one tuple per rollout."""
-    os.makedirs(FIXTURES_DIR, exist_ok=True)
-    torch.save(model_inputs, os.path.join(FIXTURES_DIR, f"{name}.pt"))
+    path = _fixture_path(scenario_name, filename)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(model_inputs, path)
 
 
-def load_model_inputs(name: str) -> list:
-    return torch.load(os.path.join(FIXTURES_DIR, f"{name}.pt"), weights_only=False)
+def load_model_inputs(scenario_name: str, filename: str) -> list:
+    return torch.load(_fixture_path(scenario_name, filename), weights_only=False)
