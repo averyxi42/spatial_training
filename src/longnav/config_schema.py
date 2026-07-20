@@ -161,6 +161,12 @@ class RolloutConfig:
         {"role": "assistant", "content": [{"type": "text", "text": "**forward**"}]}
     ])
     stop_prob_threshold: Optional[float] = None
+    # Deterministic-rollout mode: act on the env-provided state_dict['info']['oracle_action']
+    # instead of sampling from the policy's own output distribution. The policy still runs a
+    # real forward pass; only which action is taken (and fed back into the next turn's prompt)
+    # is overridden. Used by the forward-pass test tier for reproducible rollouts -- see
+    # tests/forward/_bootstrap.py.
+    use_oracle_action: bool = False
 
 
 # --- Experiment housekeeping ---

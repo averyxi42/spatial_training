@@ -140,13 +140,29 @@ class EpisodeRolloutMixin:
                     }
                 else:
                     action_probs = policy_out
-                    action_id = np.random.choice(len(action_probs),p=action_probs) # sampling
-                    if action_id ==0 and self.rollout_config['stop_prob_threshold'] is not None:
-                        if action_probs[0] >= self.rollout_config['stop_prob_threshold']:
-                            action_id = 0
-                        else:
-                            vlm_logs['sum/spguard_trigger_count']=1
-                            action_id = np.random.choice(len(action_probs)-1,p=action_probs[1:]/np.sum(action_probs[1:]))+1
+                    if self.rollout_config.get('use_oracle_action'):
+                        # Deterministic-rollout mode: act on the env-provided oracle
+                        # action instead of sampling from the real policy output.
+                        # The policy still runs a real forward pass (action_probs
+                        # above is the real distribution) -- only which action is
+                        # actually taken (and fed back into the next turn's prompt)
+                        # is overridden. 'oracle_action' is not yet a strict env
+                        # contract, so a missing key is a hard error, not a
+                        # silent fallback to sampling.
+                        if 'oracle_action' not in state_dict['info']:
+                            raise RuntimeError(
+                                "rollout_config['use_oracle_action'] is True but this env's "
+                                "state_dict['info'] has no 'oracle_action' key."
+                            )
+                        action_id = state_dict['info']['oracle_action']
+                    else:
+                        action_id = np.random.choice(len(action_probs),p=action_probs) # sampling
+                        if action_id ==0 and self.rollout_config['stop_prob_threshold'] is not None:
+                            if action_probs[0] >= self.rollout_config['stop_prob_threshold']:
+                                action_id = 0
+                            else:
+                                vlm_logs['sum/spguard_trigger_count']=1
+                                action_id = np.random.choice(len(action_probs)-1,p=action_probs[1:]/np.sum(action_probs[1:]))+1
                     entropy = -np.sum(action_probs * np.log(action_probs + 1e-9))
                     vlm_logs |= {'mean/entropy':entropy,'mean/action_prob':float(action_probs[action_id]),"action_probs":action_probs.tolist()} 
                 # D. Store Transition
