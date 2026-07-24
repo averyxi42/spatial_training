@@ -1,0 +1,1 @@
+guess a random action out of $action_space_str given the image.
