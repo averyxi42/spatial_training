@@ -21,17 +21,31 @@ services:
     # Ray's object store and habitat's workers need far more than the 64MB default.
     shm_size: "8gb"
     ipc: host
+    # Ray spawns thousands of processes and file descriptors; the docker
+    # defaults make the raylet die under load.
+    pids_limit: -1
     ulimits:
       memlock: -1
       stack: 67108864
+      nofile:
+        soft: 65536
+        hard: 65536
+    # Uncomment for multi-node Ray or if the dashboard/metrics agent can't
+    # connect through docker's NAT. Note it disables port isolation.
+    # network_mode: host
     volumes:
       - ./:/workspace
       - ${LONGNAV_DATA:-./data}:/workspace/data
       - longnav-cache:/home/longnav/.cache
+      # Shell history survives `--rm`.
+      - ${HOME}/.longnav_bash_history:/home/longnav/.bash_history
     environment:
       - WANDB_API_KEY
       - HF_TOKEN
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+      # Keep BLAS from oversubscribing cores across many Ray workers.
+      - OMP_NUM_THREADS=4
+      - MKL_NUM_THREADS=4
     deploy:
       resources:
         reservations:

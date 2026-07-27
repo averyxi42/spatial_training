@@ -26,7 +26,8 @@ This is why the base image is `nvidia/cuda:*-devel-*` rather than `runtime`:
 ## Build
 
 ```bash
-export UID GID          # so files written to mounts are owned by you
+export UID GID                        # files on mounts stay owned by you
+touch ~/.longnav_bash_history         # else docker creates it as a directory
 docker compose build
 ```
 
@@ -69,9 +70,20 @@ exhaust the 64MB default immediately; tune it alongside `resources.osm_gb`.
 
 ## Known sharp edges
 
-- **numpy is pinned `<2`** image-wide. habitat-sim's magnum bindings are
-  compiled against the numpy C API present at build time; letting a later
-  `pip install` upgrade numpy silently breaks `import habitat_sim`.
+These are the things that actually break habitat containers, all of them
+handled in the Dockerfile:
+
+- **numpy is pinned to exactly `1.26.4`** image-wide, and the pin is re-asserted
+  at the end of the build. habitat-sim's magnum bindings are compiled against
+  the numpy C API present at build time; letting a later `pip install` move
+  numpy silently breaks `import habitat_sim`. If you add a package that drags
+  numpy along, reinstall `numpy==1.26.4` afterwards.
+- **CUDA architectures are listed explicitly** (`TORCH_CUDA_ARCH_LIST` /
+  `CMAKE_CUDA_ARCHITECTURES`). No GPU is visible during `docker build`, so
+  nothing can be autodetected. Trim the list to shorten the build.
+- **The conda env's `libstdc++` is symlinked to the system one.** The env ships
+  an older copy than Ubuntu 22.04, and magnum/CUDA extensions otherwise die on
+  `GLIBCXX_3.4.30 not found`.
 - **`NVIDIA_DRIVER_CAPABILITIES` must include `graphics`**, not just `compute`.
   Headless EGL rendering fails with an opaque context error otherwise.
 - The image installs `opencv-python-headless` instead of `opencv-python` to

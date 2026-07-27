@@ -11,7 +11,7 @@
 #
 # The CUDA *devel* image is required: --with-cuda needs nvcc and the CUDA
 # headers at build time.
-ARG CUDA_IMAGE=docker.io/library/nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04
+ARG CUDA_IMAGE=nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04
 FROM ${CUDA_IMAGE}
 
 ARG PYTHON_VERSION=3.10.16
@@ -26,8 +26,21 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Etc/UTC \
     CONDA_DIR=/opt/conda \
     CONDA_ENV=${CONDA_ENV} \
-    CUDA_HOME=/usr/local/cuda \
     PYTHONUNBUFFERED=1
+
+# habitat-sim's CMake and any later CUDA extension build look for the toolkit
+# under several different variable names; set them all.
+ENV CUDA_HOME=/usr/local/cuda \
+    CUDAToolkit_ROOT=/usr/local/cuda \
+    CUDA_PATH=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+# No GPU is visible during `docker build`, so CUDA architectures cannot be
+# autodetected — they must be listed explicitly or the build targets nothing.
+# Volta through Blackwell; trim the list to shorten build time.
+ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0;10.0;12.0" \
+    CMAKE_CUDA_ARCHITECTURES="70;75;80;86;89;90;100;120"
 
 # --- system deps -------------------------------------------------------------
 # The list below is habitat-sim's documented build dependency set plus the
@@ -56,15 +69,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libglm-dev \
         libomp-dev \
         libhdf5-dev \
+        libglvnd-dev \
+        libegl1 \
         libegl1-mesa-dev \
+        libgles2 \
         libgl1-mesa-dev \
-        libgles2-mesa-dev \
+        libgl1-mesa-dri \
+        libglu1-mesa \
+        mesa-common-dev \
+        mesa-utils \
+        libosmesa6-dev \
         libx11-dev \
+        libxrandr-dev \
+        libxinerama-dev \
+        libxcursor-dev \
+        libxi-dev \
         xorg-dev \
         freeglut3-dev \
         libglfw3-dev \
         libbullet-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Software-GL fallback path: without these symlinks a headless container with no
+# usable EGL device fails to find swrast instead of degrading to it.
+RUN mkdir -p /usr/lib/dri \
+    && ln -sf /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so /usr/lib/dri/ 2>/dev/null || true
 
 # Headless EGL rendering needs the graphics capability, not just compute.
 ENV NVIDIA_VISIBLE_DEVICES=all \
@@ -85,17 +114,33 @@ ENV PATH=${CONDA_DIR}/bin:${PATH}
 # conda package would drag the env back to 3.9.
 RUN conda create -y -n ${CONDA_ENV} python=${PYTHON_VERSION} cmake=3.27 \
     && conda run -n ${CONDA_ENV} python -m pip install --upgrade pip setuptools wheel \
+    && conda run -n ${CONDA_ENV} pip install --upgrade urllib3 \
     && conda clean -afy
+
+# The conda env ships an older libstdc++ than the CUDA/Ubuntu 22.04 system one;
+# magnum and several CUDA extensions load the system copy and then fail on
+# `GLIBCXX_3.4.30 not found`. Align the env with the system toolchain.
+RUN conda install -y -n ${CONDA_ENV} -c conda-forge \
+        "libgcc-ng>=12" "libstdcxx-ng>=12" "libgomp>=12" \
+    && conda clean -afy \
+    && if [ -e ${CONDA_DIR}/envs/${CONDA_ENV}/lib/libstdc++.so.6 ]; then \
+           mv ${CONDA_DIR}/envs/${CONDA_ENV}/lib/libstdc++.so.6 \
+              ${CONDA_DIR}/envs/${CONDA_ENV}/lib/libstdc++.so.6.old ; \
+           ln -s /usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
+                 ${CONDA_DIR}/envs/${CONDA_ENV}/lib/libstdc++.so.6 ; \
+       fi \
+    && ldconfig
 
 # Make `vln` the env for every shell, interactive or not.
 ENV PATH=${CONDA_DIR}/envs/${CONDA_ENV}/bin:${PATH} \
     CONDA_DEFAULT_ENV=${CONDA_ENV}
 
 # --- habitat-sim (source build) ---------------------------------------------
-# numpy is pinned below 2 for the whole image: habitat-sim's magnum bindings are
-# compiled against the numpy C API present at build time, and letting a later
-# pip install pull numpy 2.x in silently breaks `import habitat_sim`.
-RUN conda run -n ${CONDA_ENV} pip install "numpy<2"
+# numpy is pinned to exactly 1.26.4 for the whole image: habitat-sim's magnum
+# bindings are compiled against the numpy C API present at build time, and
+# letting a later pip install move numpy silently breaks `import habitat_sim`.
+# The pin is re-asserted at the end of the build.
+RUN conda run -n ${CONDA_ENV} pip install "numpy==1.26.4"
 
 WORKDIR /opt
 RUN git clone --branch ${HABITAT_VERSION} --depth 1 --recursive \
@@ -124,7 +169,7 @@ RUN conda run -n ${CONDA_ENV} pip install \
         torch==2.8.0 torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu128 \
     && conda run -n ${CONDA_ENV} pip install \
-        "numpy<2" \
+        "numpy==1.26.4" \
         "transformers<5.0" \
         "ray[default]==2.53.0" \
         datasets \
@@ -145,6 +190,15 @@ RUN if [ "${INSTALL_FLASH_ATTN}" = "true" ]; then \
         conda run --no-capture-output -n ${CONDA_ENV} \
             pip install flash-attn --no-build-isolation ; \
     fi
+
+# Fail the build loudly rather than shipping an image where habitat_sim imports
+# against the wrong numpy ABI.
+RUN conda run -n ${CONDA_ENV} pip install "numpy==1.26.4" \
+    && conda run -n ${CONDA_ENV} python -c \
+        "import numpy; assert numpy.__version__ == '1.26.4', numpy.__version__" \
+    && conda run -n ${CONDA_ENV} python -c "import habitat_sim, habitat; \
+print('habitat_sim', habitat_sim.__version__, 'cuda', habitat_sim.cuda_enabled, \
+'bullet', habitat_sim.built_with_bullet)"
 
 # --- user + mount points -----------------------------------------------------
 # Reuse the group/uid if the base image already claims it (e.g. uid 1000), and
