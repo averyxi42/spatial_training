@@ -1,0 +1,44 @@
+# Usage:
+#   docker compose build          # ~30-50 min, mostly the habitat-sim build
+#   docker compose run --rm longnav            # interactive shell in `vln`
+#   docker compose run --rm longnav python tests/eval_smoke.py
+#
+# Set LONGNAV_DATA in a .env file (or the shell) to point at datasets living
+# outside the repo; it defaults to ./data.
+services:
+  longnav:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        USER_UID: "${UID:-1000}"
+        USER_GID: "${GID:-1000}"
+        # Set to "true" to also build flash-attn into the image (slow).
+        INSTALL_FLASH_ATTN: "false"
+    image: longnav:dev
+    stdin_open: true
+    tty: true
+    # Ray's object store and habitat's workers need far more than the 64MB default.
+    shm_size: "8gb"
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    volumes:
+      - ./:/workspace
+      - ${LONGNAV_DATA:-./data}:/workspace/data
+      - longnav-cache:/home/longnav/.cache
+    environment:
+      - WANDB_API_KEY
+      - HF_TOKEN
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  longnav-cache:
