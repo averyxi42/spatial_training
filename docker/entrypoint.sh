@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Activates the `vln` conda env, then execs whatever the container was given.
 set -euo pipefail
-
+echo "initializaing"
 # shellcheck disable=SC1091
 source "${CONDA_DIR:-/opt/conda}/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV:-vln}"
@@ -17,5 +17,7 @@ if [ -z "${LONGNAV_SKIP_INSTALL:-}" ] && [ -f /workspace/pyproject.toml ]; then
         pip install --no-dependencies -e /workspace >/dev/null
     fi
 fi
-
+echo "activating env"
+conda deactivate
+conda activate longnav
 exec "$@"

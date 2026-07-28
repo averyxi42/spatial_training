@@ -15,17 +15,19 @@ ARG CUDA_IMAGE=nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04
 FROM ${CUDA_IMAGE}
 
 ARG PYTHON_VERSION=3.10.16
-ARG CONDA_ENV=vln
+ARG HABITAT_CONDA_ENV=vln
+ARG VLM_CONDA_ENV=longnav
 ARG HABITAT_VERSION=v0.3.3
 # Match the host user so files written into bind-mounted volumes stay writable.
 ARG USERNAME=longnav
-ARG USER_UID=1000
-ARG USER_GID=1000
+ENV USER_UID=1000
+ENV USER_GID=1000
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Etc/UTC \
     CONDA_DIR=/opt/conda \
-    CONDA_ENV=${CONDA_ENV} \
+    HABITAT_CONDA_ENV=${HABITAT_CONDA_ENV} \
+    VLM_CONDA_ENV=${VLM_CONDA_ENV} \
     PYTHONUNBUFFERED=1
 
 # habitat-sim's CMake and any later CUDA extension build look for the toolkit
@@ -112,35 +114,35 @@ ENV PATH=${CONDA_DIR}/bin:${PATH}
 
 # python 3.10.16 is the version the rest of the project pins; the stock habitat
 # conda package would drag the env back to 3.9.
-RUN conda create -y -n ${CONDA_ENV} python=${PYTHON_VERSION} cmake=3.27 \
-    && conda run -n ${CONDA_ENV} python -m pip install --upgrade pip setuptools wheel \
-    && conda run -n ${CONDA_ENV} pip install --upgrade urllib3 \
+RUN conda create -y -n ${HABITAT_CONDA_ENV} python=${PYTHON_VERSION} cmake=3.27 \
+    && conda run -n ${HABITAT_CONDA_ENV} python -m pip install --upgrade pip setuptools wheel \
+    && conda run -n ${HABITAT_CONDA_ENV} pip install --upgrade urllib3 \
     && conda clean -afy
 
 # The conda env ships an older libstdc++ than the CUDA/Ubuntu 22.04 system one;
 # magnum and several CUDA extensions load the system copy and then fail on
 # `GLIBCXX_3.4.30 not found`. Align the env with the system toolchain.
-RUN conda install -y -n ${CONDA_ENV} -c conda-forge \
+RUN conda install -y -n ${HABITAT_CONDA_ENV} -c conda-forge \
         "libgcc-ng>=12" "libstdcxx-ng>=12" "libgomp>=12" \
     && conda clean -afy \
-    && if [ -e ${CONDA_DIR}/envs/${CONDA_ENV}/lib/libstdc++.so.6 ]; then \
-           mv ${CONDA_DIR}/envs/${CONDA_ENV}/lib/libstdc++.so.6 \
-              ${CONDA_DIR}/envs/${CONDA_ENV}/lib/libstdc++.so.6.old ; \
+    && if [ -e ${CONDA_DIR}/envs/${HABITAT_CONDA_ENV}/lib/libstdc++.so.6 ]; then \
+           mv ${CONDA_DIR}/envs/${HABITAT_CONDA_ENV}/lib/libstdc++.so.6 \
+              ${CONDA_DIR}/envs/${HABITAT_CONDA_ENV}/lib/libstdc++.so.6.old ; \
            ln -s /usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
-                 ${CONDA_DIR}/envs/${CONDA_ENV}/lib/libstdc++.so.6 ; \
+                 ${CONDA_DIR}/envs/${HABITAT_CONDA_ENV}/lib/libstdc++.so.6 ; \
        fi \
     && ldconfig
 
 # Make `vln` the env for every shell, interactive or not.
-ENV PATH=${CONDA_DIR}/envs/${CONDA_ENV}/bin:${PATH} \
-    CONDA_DEFAULT_ENV=${CONDA_ENV}
+ENV PATH=${CONDA_DIR}/envs/${HABITAT_CONDA_ENV}/bin:${PATH} \
+    CONDA_DEFAULT_ENV=${HABITAT_CONDA_ENV}
 
 # --- habitat-sim (source build) ---------------------------------------------
 # numpy is pinned to exactly 1.26.4 for the whole image: habitat-sim's magnum
 # bindings are compiled against the numpy C API present at build time, and
 # letting a later pip install move numpy silently breaks `import habitat_sim`.
 # The pin is re-asserted at the end of the build.
-RUN conda run -n ${CONDA_ENV} pip install "numpy==1.26.4"
+RUN conda run -n ${HABITAT_CONDA_ENV} pip install "numpy==1.26.4"
 
 WORKDIR /opt
 RUN git clone --branch ${HABITAT_VERSION} --depth 1 --recursive \
@@ -151,8 +153,8 @@ RUN git clone --branch ${HABITAT_VERSION} --depth 1 --recursive \
 ARG CMAKE_BUILD_PARALLEL_LEVEL=8
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}
 RUN cd /opt/habitat-sim \
-    && conda run -n ${CONDA_ENV} pip install -r requirements.txt \
-    && conda run --no-capture-output -n ${CONDA_ENV} \
+    && conda run -n ${HABITAT_CONDA_ENV} pip install -r requirements.txt \
+    && conda run --no-capture-output -n ${HABITAT_CONDA_ENV} \
         python setup.py install --headless --with-cuda --bullet \
     && rm -rf /opt/habitat-sim/build
 
@@ -160,15 +162,15 @@ RUN cd /opt/habitat-sim \
 RUN git clone --branch ${HABITAT_VERSION} --depth 1 \
         https://github.com/facebookresearch/habitat-lab.git /opt/habitat-lab \
     && cd /opt/habitat-lab \
-    && conda run -n ${CONDA_ENV} pip install -e habitat-lab
+    && conda run -n ${HABITAT_CONDA_ENV} pip install -e habitat-lab
 
 # --- torch + project deps ----------------------------------------------------
 # Installed after habitat so the habitat build never sees a half-resolved env.
 # Kept in sync with pyproject.toml (torch 2.8.0 / cu128).
-RUN conda run -n ${CONDA_ENV} pip install \
+RUN conda run -n ${HABITAT_CONDA_ENV} pip install \
         torch==2.8.0 torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu128 \
-    && conda run -n ${CONDA_ENV} pip install \
+    && conda run -n ${HABITAT_CONDA_ENV} pip install \
         "numpy==1.26.4" \
         "transformers<5.0" \
         "ray[default]==2.53.0" \
@@ -182,25 +184,34 @@ RUN conda run -n ${CONDA_ENV} pip install \
         tensordict \
         huggingface-hub \
         codetiming \
-    && conda run -n ${CONDA_ENV} pip cache purge || true
+    && conda run -n ${HABITAT_CONDA_ENV} pip cache purge || true
 
 # flash-attn is a separate, very slow build; leave it opt-in.
 ARG INSTALL_FLASH_ATTN=false
 RUN if [ "${INSTALL_FLASH_ATTN}" = "true" ]; then \
-        conda run --no-capture-output -n ${CONDA_ENV} \
+        conda run --no-capture-output -n ${HABITAT_CONDA_ENV} \
             pip install flash-attn --no-build-isolation ; \
     fi
 
 # Fail the build loudly rather than shipping an image where habitat_sim imports
 # against the wrong numpy ABI.
-RUN conda run -n ${CONDA_ENV} pip install "numpy==1.26.4" \
-    && conda run -n ${CONDA_ENV} python -c \
+RUN conda run -n ${HABITAT_CONDA_ENV} pip install "numpy==1.26.4" \
+    && conda run -n ${HABITAT_CONDA_ENV} python -c \
         "import numpy; assert numpy.__version__ == '1.26.4', numpy.__version__" \
-    && conda run -n ${CONDA_ENV} python -c "import habitat_sim, habitat; \
+    && conda run -n ${HABITAT_CONDA_ENV} python -c "import habitat_sim, habitat; \
 print('habitat_sim', habitat_sim.__version__, 'cuda', habitat_sim.cuda_enabled, \
 'bullet', habitat_sim.built_with_bullet)"
 
-# --- user + mount points -----------------------------------------------------
+
+# python 3.10.16 is the version the rest of the project pins; the stock habitat
+# conda package would drag the env back to 3.9.
+RUN conda create -y -n ${VLM_CONDA_ENV} python=${PYTHON_VERSION} cmake=3.27 \
+    && conda run -n ${VLM_CONDA_ENV} python -m pip install --upgrade pip setuptools wheel \
+    && conda run -n ${VLM_CONDA_ENV} pip install --upgrade urllib3 \
+    && conda clean -afy
+
+
+    # --- user + mount points -----------------------------------------------------
 # Reuse the group/uid if the base image already claims it (e.g. uid 1000), and
 # rename that account to ${USERNAME} so the paths below stay predictable.
 RUN if ! getent group ${USER_GID} >/dev/null; then groupadd -g ${USER_GID} ${USERNAME}; fi \
@@ -212,7 +223,8 @@ RUN if ! getent group ${USER_GID} >/dev/null; then groupadd -g ${USER_GID} ${USE
        fi \
     && mkdir -p /workspace /workspace/data /home/${USERNAME}/.cache \
     && chown -R ${USER_UID}:${USER_GID} /workspace /home/${USERNAME} /opt/habitat-lab \
-    && chown -R ${USER_UID}:${USER_GID} ${CONDA_DIR}/envs/${CONDA_ENV}
+    && chown -R ${USER_UID}:${USER_GID} ${CONDA_DIR} 
+    #/envs/${HABITAT_CONDA_ENV}
 
 # No VOLUME declarations on purpose: anonymous volumes would shadow the bind
 # mounts. Mount points are /workspace (repo), /workspace/data (datasets) and
@@ -227,15 +239,18 @@ ENV HF_HOME=/home/${USERNAME}/.cache/huggingface \
 
 # conda init so `docker exec -it ... bash` lands in the vln env.
 RUN conda init bash \
-    && echo "conda activate ${CONDA_ENV}" >> /etc/skel/.bashrc \
-    && echo "conda activate ${CONDA_ENV}" >> /home/${USERNAME}/.bashrc \
-    && echo "conda activate ${CONDA_ENV}" >> /root/.bashrc
+    && echo "conda activate ${HABITAT_CONDA_ENV}" >> /etc/skel/.bashrc \
+    && echo "conda activate ${HABITAT_CONDA_ENV}" >> /home/${USERNAME}/.bashrc \
+    && echo "conda activate ${HABITAT_CONDA_ENV}" >> /root/.bashrc
 
 COPY --chown=${USER_UID}:${USER_GID} docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
-
+RUN apt-get update && apt-get install -y sudo \
+    && echo "ALL ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 USER ${USERNAME}
 WORKDIR /workspace
+
+RUN git config --global --add safe.directory /workspace
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash"]

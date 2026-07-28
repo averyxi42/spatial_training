@@ -23,39 +23,85 @@ Requires-Dist: tensordict
 Requires-Dist: huggingface-hub
 Requires-Dist: codetiming
 
-# LongNav
-This repository provides the implementation of LongNav. 
+# LongNav-R1
 
-### 🚧 🚧 under construction 🚧🚧
+[![arXiv](https://img.shields.io/badge/arXiv-Paper-brightgreen?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2602.12351)
+[![Project Page](https://img.shields.io/badge/project-Page-blue)](https://chloeqxq.github.io/LongNav_ProjectPage/)
+
+This repository contains the official implementation of
+
+**[LongNav-R1: Horizon-Adaptive Multi-Turn RL for Long-Horizon VLA Navigation](https://arxiv.org/abs/2602.12351)**
+
+[Yue Hu](https://phyllish.github.io/), Avery Xi, [Qixin Xiao](https://scholar.google.com/citations?hl=en&user=lqyNeO4AAAAJ), [Seth Isaacson](https://sethisaacson.me/), [Henry X. Liu](https://traffic.engin.umich.edu/), [Ram Vasudevan](https://www.roahmlab.com/ram-personal), [Maani Ghaffari](https://curly.engin.umich.edu/)
+
 ## Installation 🛠️
-### RL trainer
-Create the main conda environment responsible for vlm trainer
+### 1. Clone Repo 
+Clone this repo with submodules:
 ```
-conda create -n longnav_vlm python=3.10.16 && conda activate longnav_vlm
+git clone --recursive https://@github.com:UMich-CURLY/LongNav-R1.git
 ```
 
-Install with pip:
+### 2. Habitat Simulation Setup
+Install habitat in a separate conda env.
 ```
-pip install -e .
+# initialize conda
+conda create -y -n habitat python=3.11
+conda run -n habitat python -m pip install --upgrade pip setuptools wheel
+conda run -n habitat pip install --upgrade urllib3
+
+# habitat-sim
+git clone --branch v0.3,3 https://github.com/facebookresearch/habitat-sim.git && \
+    cd habitat-sim && \
+    conda run -n habitat pip install -r requirements.txt && \
+    conda run -n habitat python setup.py install --headless --with-cuda --bullet
+
+# habitat-lab
+git clone --branch v0.3.3 https://github.com/facebookresearch/habitat-lab.git && \
+    cd habitat-lab && conda run -n habitat pip install -e habitat-lab
+
+conda run -n habitat pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+```
+### 3. HM3D ObjectNav Dataset Setup
+Apply for [HM3D access](https://aihabitat.org/datasets/hm3d/) to get an api token id and secret. Then run [data_scripts/setup_dataset.sh](data_scripts/setup_dataset.sh) to download the dataset and setup the folder structure.
+
+The code requires the datasets in a `data` folder in the following format:
+```
+LongNav-R1/
+  data/
+    scene_datasets/
+    versioned_data/
+    datasets/
+        objectgoal_hm3d/
+        vlobjectnav_hm3d/
+```
+`objectgoal_hm3d` is used for object-goal navigation, and `vlobjectnav_hm3d` is used for language descriptive target navigation.
+
+### 4. Model Env Setup
+Initialize the main conda environment.
+```
+conda create -n longnav python=3.10.16
+conda activate longnav
+```
+
+Install dependencies.
+```
+# Flash attention
 pip install flash-attn --no-build-isolation
-```
 
-Make sure that the verl submodule is installed. 
-```
+# Verl
 git submodule update --init --recursive
 cd verl && pip install --no-dependencies -e .
 ```
 
-You may optionally install flash attention in the same env.
-### Environment
-Install habitat lab in a separate conda env named vln. Then run under the repo root directory:
+Install.
 ```
+cd ../
 pip install --no-dependencies -e .
 ```
 This allows ray to resolve the interface correctly.
 
-### Testing the Install
-Two basic tests are currently available to validate your install:
+### 5. Testing the Installation
+Two basic tests are currently available to validate your install. The code should be run with the longnav conda env active.
 
 [eval smoke test](tests/eval_smoke.py) (tests the rollout collection)
 ```
@@ -69,33 +115,57 @@ python3 tests/rl_smoke.py
 
 These may be referenced for integrating new Envs.
 
-## Quickstart
+## Quickstart ⚡
 Run our framework with a dummy environment (doesn't require habitat dependencies)
 ```
-python3 -m longnav.training_scripts.train_dummy.py
+python3 -m longnav.scripts.train_dummy.py
 ```
-## ObjectNav Training 🚀
+
+### Training
 
 ```
-python3 -m longnav.training_scripts.train_rl.py +experiment=<experiment_name>
+python3 -m longnav.scripts.train_rl +checkpoint=sft +dataset=hm3d_train +experiment=train +resources=octo +training=hapo task.run_name=my_awesome_training_run
 ```
-- experiment_name must be a config that exists in src/conf/experiment.
 
-## Eval ⏱️
+### Eval
 ```
-python3 -m longnav.eval.py +experiment=<experiment_name>
+python -m longnav.scripts.eval +checkpoint=longnav +dataset=hm3d_val +experiment=eval +resources=octo task.run_name=my_awesome_eval_run
 ```
-## Sim to Real Serving 🤖
+
+### Sim to Real Serving 🤖
 Serve the FAST API:
 ```
 python3 -m longnav.serve
 ```
 
 See the [client example](tools/client.py) for API usage.
-## Project Structure:
-### Configuration Management
-Config schemas are defined via data class in [config_schema.py](src/longnav/config_schema.py). The 
-### RL Env Interface
+## Project Structure 📂
+### Configuration Management ⚙️
+Config schemas are defined via data class in [config_schema.py](src/longnav/config_schema.py). 
+
+Config overrides are defined within the [config directory](src/longnav/config) which provides presets that can be composed. 
+#### Key Configs 🔑
+- sim.workspace: directory containing "data", see [habitat lab datasets](https://github.com/facebookresearch/habitat-lab/blob/main/DATASETS.md)
+- resources.num_vlms and resources.num_sims: number of workers for policy and simualator respectively. the former must be less than your number of GPUs. the latter is recommended to be 1+num_vlms. when training, num_vlms must divide the number of rollouts (default 16) or the code will hang.
+- task.run_name: run name used for wandb, default behavior is to resume. 
+- resources.osm_gb: size of ray objectstore, tune according to available shared memory and spilling situation
+
+### RL Env Interface 🔌
 See [dummy env structure](src/longnav/env/env_base.py) for reference. Any compatible Env may be used by the [rollout collection orchestration](src/longnav/utils/rollout_core.py) to produce rollouts for training steps.
 
 At a high level, the Env Actors return dictionaries of standard RL outputs. However, RGB observation is separated out for better Ray performance.
+
+## Citation
+If you find this code useful in your research then please cite
+
+```
+@inproceedings{hu2026longnavr1,
+  title={LongNav-R1: Horizon-Adaptive Multi-Turn RL for Long-Horizon VLA Navigation},
+  author={Hu, Yue and Xi, Avery and Xiao, Qixin and Isaacson, Seth and Liu, Henry X. and Vasudevan, Ram and Ghaffari, Maani},
+  booktitle={Robotics: Science and Systems (RSS)},
+  year={2026},
+  note={RSS 2026}
+}
+```
+## Contact
+If you have any problem with this code, please feel free to contact phyllis1sjtu@outlook.com.

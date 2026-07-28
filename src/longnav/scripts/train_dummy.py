@@ -43,6 +43,8 @@ env_actor_cls = ColorBanditEnvActor
 register_configs()
 @hydra.main(version_base=None, config_name="rl_config",config_path='../config')
 def main(cfg: RLConfig):
+    cfg.vlm.save_outputs = True
+
     # keep heavy imports here so hydra tab complete is snappier?
     import ray
     import numpy as np

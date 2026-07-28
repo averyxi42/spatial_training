@@ -2,8 +2,6 @@ README.md
 pyproject.toml
 src/longnav/config_schema.py
 src/longnav/constants.py
-src/longnav/eval.py
-src/longnav/serve.py
 src/longnav.egg-info/PKG-INFO
 src/longnav.egg-info/SOURCES.txt
 src/longnav.egg-info/dependency_links.txt
@@ -25,8 +23,10 @@ src/longnav/habitat_training/train_rl.py
 src/longnav/habitat_training/train_sft.py
 src/longnav/habitat_training/train_sft_bev.py
 src/longnav/habitat_training/train_sft_sparse.py
-src/longnav/training_scripts/train_dummy.py
-src/longnav/training_scripts/train_rl.py
+src/longnav/scripts/eval.py
+src/longnav/scripts/serve.py
+src/longnav/scripts/train_dummy.py
+src/longnav/scripts/train_rl.py
 src/longnav/utils/__init__.py
 src/longnav/utils/bev_utils.py
 src/longnav/utils/collators.py
