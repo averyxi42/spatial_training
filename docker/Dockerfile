@@ -1,33 +1,43 @@
+# syntax=docker/dockerfile:1.7
 # LongNav-R1 reproduction image.
 #
 # The hard part of this project is habitat-sim: the conda package for 0.3.3 is
-# only published against python 3.9, so we build it from source inside a
-# python 3.10.16 conda env ("vln") using --headless --with-cuda --bullet.
+# only published against python 3.9, so we build it from source in a python
+# 3.10.16 conda env using --headless --with-cuda --bullet.
+#
+# Two conda envs exist because the code requires them: config_schema.py defaults
+# vlm_conda_env="longnav" / habitat_conda_env="vln", and factories.py hands those
+# to Ray as runtime_env={"conda": ...}. Ray re-execs each actor inside the named
+# env, so both must exist under those exact names and both must carry a matching
+# ray version.
 #
 # Build:
-#   DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile \
-#     --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) \
-#     -t longnav:dev .
+#   docker compose build                       # -> target: runtime
+#   docker build --target habitat -t longnav-base:habitat0.3.3 -f docker/Dockerfile .
+#
+# Stages are ordered by volatility: editing anything in `runtime` can never
+# invalidate the ~40 minute habitat-sim compile in `habitat`.
+#
+# LAYERING RULES, please keep them:
+#   1. Declare an ARG immediately before the RUN that consumes it, never at the
+#      top of a stage. An ARG/ENV change invalidates every layer below it.
+#   2. Every RUN that writes into /opt/conda ends with `chmod -R a+rwX` on what
+#      it touched, in the SAME RUN. A trailing chmod in its own layer would
+#      force an overlayfs copy-up of the whole ~15GB conda tree.
 #
 # The CUDA *devel* image is required: --with-cuda needs nvcc and the CUDA
 # headers at build time.
 ARG CUDA_IMAGE=nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04
-FROM ${CUDA_IMAGE}
 
-ARG PYTHON_VERSION=3.10.16
-ARG HABITAT_CONDA_ENV=vln
-ARG VLM_CONDA_ENV=longnav
-ARG HABITAT_VERSION=v0.3.3
-# Match the host user so files written into bind-mounted volumes stay writable.
-ARG USERNAME=longnav
-ENV USER_UID=1000
-ENV USER_GID=1000
+
+# =============================================================================
+FROM ${CUDA_IMAGE} AS system
+# System packages, GL stack, conda itself, and policy that never changes.
+# =============================================================================
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Etc/UTC \
     CONDA_DIR=/opt/conda \
-    HABITAT_CONDA_ENV=${HABITAT_CONDA_ENV} \
-    VLM_CONDA_ENV=${VLM_CONDA_ENV} \
     PYTHONUNBUFFERED=1
 
 # habitat-sim's CMake and any later CUDA extension build look for the toolkit
@@ -44,9 +54,17 @@ ENV CUDA_HOME=/usr/local/cuda \
 ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0;10.0;12.0" \
     CMAKE_CUDA_ARCHITECTURES="70;75;80;86;89;90;100;120"
 
-# --- system deps -------------------------------------------------------------
-# The list below is habitat-sim's documented build dependency set plus the
-# usual EGL/OpenMP bits needed for headless GPU rendering.
+# Headless EGL rendering needs the graphics capability, not just compute.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+
+# Note: deliberately NOT a login shell (`-lc`). Ubuntu's /etc/profile resets
+# PATH unconditionally for uid 0, which would wipe the conda and CUDA entries
+# set above.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# habitat-sim's documented build dependencies, plus the EGL/OSMesa runtime bits
+# needed for headless GPU rendering.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -65,6 +83,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tmux \
         htop \
         rsync \
+        sudo \
         ffmpeg \
         libjpeg-dev \
         libpng-dev \
@@ -92,165 +111,186 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libbullet-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Software-GL fallback path: without these symlinks a headless container with no
-# usable EGL device fails to find swrast instead of degrading to it.
+# Software-GL fallback: without this a headless container with no usable EGL
+# device fails to find swrast instead of degrading to it.
 RUN mkdir -p /usr/lib/dri \
     && ln -sf /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so /usr/lib/dri/ 2>/dev/null || true
 
-# Headless EGL rendering needs the graphics capability, not just compute.
-ENV NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+# --- policy ------------------------------------------------------------------
+# System-level git config applies to every uid regardless of $HOME, which a
+# --global config cannot do once the container runs as an arbitrary user.
+#   safe.directory '*' : the repo is bind-mounted from the host and will always
+#     have a "wrong" owner inside the container. '*' also covers the verl and
+#     ovon submodules and their .git/modules/* gitdirs.
+#   url.insteadOf      : .gitmodules declares both submodules over SSH
+#     (git@github.com:...), and a container has no SSH key. Both repos are
+#     public, so rewriting to https lets `git clone --recursive` work with no
+#     credential story at all.
+RUN git config --system --add safe.directory '*' \
+    && git config --system url."https://github.com/".insteadOf "git@github.com:" \
+    && echo "ALL ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
-# --- conda -------------------------------------------------------------------
-# Miniforge (conda-forge channel by default) avoids the Anaconda default-channel
-# terms-of-service prompt that breaks unattended builds.
+# Miniforge (conda-forge by default) avoids the Anaconda default-channel terms
+# of service prompt that breaks unattended builds.
 RUN curl -fsSL -o /tmp/miniforge.sh \
         "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh" \
     && bash /tmp/miniforge.sh -b -p ${CONDA_DIR} \
     && rm /tmp/miniforge.sh \
-    && ${CONDA_DIR}/bin/conda clean -afy
+    && ${CONDA_DIR}/bin/conda clean -afy \
+    && chmod -R a+rwX ${CONDA_DIR}
 
 ENV PATH=${CONDA_DIR}/bin:${PATH}
 
-# python 3.10.16 is the version the rest of the project pins; the stock habitat
-# conda package would drag the env back to 3.9.
+# --- arbitrary-uid support ---------------------------------------------------
+# The image is deliberately uid-agnostic: no USER_UID/USER_GID build args exist,
+# so changing the runtime user can never invalidate a single cached layer.
+# `longnav` (uid 1000) is only the default when compose does not pass `user:`.
+# /etc/passwd and /etc/group are world-writable so the entrypoint can synthesize
+# an entry for whatever uid it is actually given — sudo, `id -gn` and git all
+# misbehave for a uid absent from the passwd database.
+RUN useradd -m -u 1000 -s /bin/bash longnav \
+    && chmod 777 /home/longnav \
+    && chmod 666 /etc/passwd /etc/group \
+    && mkdir -p /workspace \
+    && chmod 777 /workspace
+
+
+# =============================================================================
+FROM system AS habitat
+# The expensive stage. ~40 minutes, dominated by the habitat-sim compile.
+# Nothing below this line in `runtime` can invalidate it.
+# =============================================================================
+
+ARG PYTHON_VERSION=3.10.16
+ARG HABITAT_CONDA_ENV=vln
+ENV HABITAT_CONDA_ENV=${HABITAT_CONDA_ENV}
+
+# python 3.10.16 is what the project pins; the stock habitat conda package would
+# drag the env back to 3.9, which is the whole reason for building from source.
+#
+# The libstdc++ dance: the conda env ships an older libstdc++ than Ubuntu 22.04,
+# and magnum plus several CUDA extensions load the system copy and then die on
+# `GLIBCXX_3.4.30 not found`.
+#
+# numpy is pinned to exactly 1.26.4 image-wide: habitat-sim's magnum bindings
+# compile against the numpy C API present at build time, so any later move
+# silently breaks `import habitat_sim`. Re-asserted at the end of the build.
 RUN conda create -y -n ${HABITAT_CONDA_ENV} python=${PYTHON_VERSION} cmake=3.27 \
+    && conda install -y -n ${HABITAT_CONDA_ENV} -c conda-forge \
+        "libgcc-ng>=12" "libstdcxx-ng>=12" "libgomp>=12" \
     && conda run -n ${HABITAT_CONDA_ENV} python -m pip install --upgrade pip setuptools wheel \
     && conda run -n ${HABITAT_CONDA_ENV} pip install --upgrade urllib3 \
-    && conda clean -afy
-
-# The conda env ships an older libstdc++ than the CUDA/Ubuntu 22.04 system one;
-# magnum and several CUDA extensions load the system copy and then fail on
-# `GLIBCXX_3.4.30 not found`. Align the env with the system toolchain.
-RUN conda install -y -n ${HABITAT_CONDA_ENV} -c conda-forge \
-        "libgcc-ng>=12" "libstdcxx-ng>=12" "libgomp>=12" \
-    && conda clean -afy \
+    && conda run -n ${HABITAT_CONDA_ENV} pip install "numpy==1.26.4" \
     && if [ -e ${CONDA_DIR}/envs/${HABITAT_CONDA_ENV}/lib/libstdc++.so.6 ]; then \
            mv ${CONDA_DIR}/envs/${HABITAT_CONDA_ENV}/lib/libstdc++.so.6 \
               ${CONDA_DIR}/envs/${HABITAT_CONDA_ENV}/lib/libstdc++.so.6.old ; \
            ln -s /usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
                  ${CONDA_DIR}/envs/${HABITAT_CONDA_ENV}/lib/libstdc++.so.6 ; \
        fi \
-    && ldconfig
+    && ldconfig \
+    && conda clean -afy \
+    && chmod -R a+rwX ${CONDA_DIR}/envs/${HABITAT_CONDA_ENV}
 
-# Make `vln` the env for every shell, interactive or not.
-ENV PATH=${CONDA_DIR}/envs/${HABITAT_CONDA_ENV}/bin:${PATH} \
-    CONDA_DEFAULT_ENV=${HABITAT_CONDA_ENV}
-
-# --- habitat-sim (source build) ---------------------------------------------
-# numpy is pinned to exactly 1.26.4 for the whole image: habitat-sim's magnum
-# bindings are compiled against the numpy C API present at build time, and
-# letting a later pip install move numpy silently breaks `import habitat_sim`.
-# The pin is re-asserted at the end of the build.
-RUN conda run -n ${HABITAT_CONDA_ENV} pip install "numpy==1.26.4"
-
-WORKDIR /opt
-RUN git clone --branch ${HABITAT_VERSION} --depth 1 --recursive \
-        https://github.com/facebookresearch/habitat-sim.git /opt/habitat-sim
-
-# Build is long (~20-40 min) and memory hungry; cap parallelism if the build
-# host OOMs by overriding CMAKE_BUILD_PARALLEL_LEVEL.
+ARG HABITAT_VERSION=v0.3.3
+# Long and memory hungry; lower this if the build host OOMs.
 ARG CMAKE_BUILD_PARALLEL_LEVEL=8
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}
-RUN cd /opt/habitat-sim \
+RUN git clone --branch ${HABITAT_VERSION} --depth 1 --recursive \
+        https://github.com/facebookresearch/habitat-sim.git /opt/habitat-sim \
+    && cd /opt/habitat-sim \
     && conda run -n ${HABITAT_CONDA_ENV} pip install -r requirements.txt \
     && conda run --no-capture-output -n ${HABITAT_CONDA_ENV} \
         python setup.py install --headless --with-cuda --bullet \
-    && rm -rf /opt/habitat-sim/build
+    && rm -rf /opt/habitat-sim/build \
+    && chmod -R a+rwX ${CONDA_DIR}/envs/${HABITAT_CONDA_ENV}
 
-# --- habitat-lab -------------------------------------------------------------
 RUN git clone --branch ${HABITAT_VERSION} --depth 1 \
         https://github.com/facebookresearch/habitat-lab.git /opt/habitat-lab \
     && cd /opt/habitat-lab \
-    && conda run -n ${HABITAT_CONDA_ENV} pip install -e habitat-lab
-
-# --- torch + project deps ----------------------------------------------------
-# Installed after habitat so the habitat build never sees a half-resolved env.
-# Kept in sync with pyproject.toml (torch 2.8.0 / cu128).
-RUN conda run -n ${HABITAT_CONDA_ENV} pip install \
-        torch==2.8.0 torchvision torchaudio \
-        --index-url https://download.pytorch.org/whl/cu128 \
-    && conda run -n ${HABITAT_CONDA_ENV} pip install \
-        "numpy==1.26.4" \
-        "transformers<5.0" \
-        "ray[default]==2.53.0" \
-        datasets \
-        hydra-core \
-        "fastapi[standard]" \
-        pillow \
-        opencv-python-headless \
-        peft \
-        wandb \
-        tensordict \
-        huggingface-hub \
-        codetiming \
-    && conda run -n ${HABITAT_CONDA_ENV} pip cache purge || true
-
-# flash-attn is a separate, very slow build; leave it opt-in.
-ARG INSTALL_FLASH_ATTN=false
-RUN if [ "${INSTALL_FLASH_ATTN}" = "true" ]; then \
-        conda run --no-capture-output -n ${HABITAT_CONDA_ENV} \
-            pip install flash-attn --no-build-isolation ; \
-    fi
-
-# Fail the build loudly rather than shipping an image where habitat_sim imports
-# against the wrong numpy ABI.
-RUN conda run -n ${HABITAT_CONDA_ENV} pip install "numpy==1.26.4" \
-    && conda run -n ${HABITAT_CONDA_ENV} python -c \
-        "import numpy; assert numpy.__version__ == '1.26.4', numpy.__version__" \
-    && conda run -n ${HABITAT_CONDA_ENV} python -c "import habitat_sim, habitat; \
-print('habitat_sim', habitat_sim.__version__, 'cuda', habitat_sim.cuda_enabled, \
-'bullet', habitat_sim.built_with_bullet)"
+    && conda run -n ${HABITAT_CONDA_ENV} pip install -e habitat-lab \
+    && chmod -R a+rwX ${CONDA_DIR}/envs/${HABITAT_CONDA_ENV} /opt/habitat-lab
 
 
-# python 3.10.16 is the version the rest of the project pins; the stock habitat
-# conda package would drag the env back to 3.9.
-RUN conda create -y -n ${VLM_CONDA_ENV} python=${PYTHON_VERSION} cmake=3.27 \
+# =============================================================================
+FROM habitat AS runtime
+# Everything volatile. Edit freely: the habitat stage above stays cached.
+# =============================================================================
+
+ARG PYTHON_VERSION=3.10.16
+ARG VLM_CONDA_ENV=longnav
+ENV VLM_CONDA_ENV=${VLM_CONDA_ENV}
+
+RUN conda create -y -n ${VLM_CONDA_ENV} python=${PYTHON_VERSION} \
+    && conda install -y -n ${VLM_CONDA_ENV} -c conda-forge \
+        "libgcc-ng>=12" "libstdcxx-ng>=12" "libgomp>=12" \
     && conda run -n ${VLM_CONDA_ENV} python -m pip install --upgrade pip setuptools wheel \
     && conda run -n ${VLM_CONDA_ENV} pip install --upgrade urllib3 \
-    && conda clean -afy
+    && conda clean -afy \
+    && chmod -R a+rwX ${CONDA_DIR}/envs/${VLM_CONDA_ENV}
 
+# Fail the build loudly rather than shipping an image whose habitat_sim imports
+# against the wrong numpy ABI.
+RUN conda run -n ${HABITAT_CONDA_ENV} python -c \
+        "import numpy; assert numpy.__version__ == '1.26.4', numpy.__version__" \
+    && conda run -n ${HABITAT_CONDA_ENV} python -c \
+        "import habitat_sim, habitat; print('habitat_sim', habitat_sim.__version__, \
+'cuda', habitat_sim.cuda_enabled, 'bullet', habitat_sim.built_with_bullet)"
 
-    # --- user + mount points -----------------------------------------------------
-# Reuse the group/uid if the base image already claims it (e.g. uid 1000), and
-# rename that account to ${USERNAME} so the paths below stay predictable.
-RUN if ! getent group ${USER_GID} >/dev/null; then groupadd -g ${USER_GID} ${USERNAME}; fi \
-    && if getent passwd ${USER_UID} >/dev/null; then \
-           usermod -l ${USERNAME} -d /home/${USERNAME} -m -s /bin/bash \
-               "$(getent passwd ${USER_UID} | cut -d: -f1)"; \
-       else \
-           useradd -m -u ${USER_UID} -g ${USER_GID} -s /bin/bash ${USERNAME}; \
-       fi \
-    && mkdir -p /workspace /workspace/data /home/${USERNAME}/.cache \
-    && chown -R ${USER_UID}:${USER_GID} /workspace /home/${USERNAME} /opt/habitat-lab \
-    && chown -R ${USER_UID}:${USER_GID} ${CONDA_DIR} 
-    #/envs/${HABITAT_CONDA_ENV}
+# flash-attn is deliberately not built here. Its setup.py imports torch, and no
+# python packages are installed at image build time, so it belongs to
+# docker/install.sh alongside the [vlm] extra that provides torch:
+#   INSTALL_FLASH_ATTN=1 docker/install.sh
 
 # No VOLUME declarations on purpose: anonymous volumes would shadow the bind
 # mounts. Mount points are /workspace (repo), /workspace/data (datasets) and
 # /home/longnav/.cache (HF/torch caches) — see docker-compose.yml.
+# Put the VLM env first on PATH. `docker compose exec` does NOT run the
+# ENTRYPOINT, so without this a plain `exec longnav python ...` would land on
+# the conda *base* interpreter, where nothing is installed. With it, exec
+# behaves the same as an interactive shell. Ray still reaches the habitat env by
+# name, and `conda run -n vln ...` still works for one-off habitat commands.
+ENV PATH=${CONDA_DIR}/envs/${VLM_CONDA_ENV}/bin:${PATH}
 
-ENV HF_HOME=/home/${USERNAME}/.cache/huggingface \
-    TORCH_HOME=/home/${USERNAME}/.cache/torch \
+ENV HF_HOME=/home/longnav/.cache/huggingface \
+    TORCH_HOME=/home/longnav/.cache/torch \
+    HISTFILE=/home/longnav/.cache/bash_history \
     MAGNUM_LOG=quiet \
     HABITAT_SIM_LOG=quiet \
-    GLOG_minloglevel=2 \
-    PYTHONPATH=/workspace/src
+    GLOG_minloglevel=2
 
-# conda init so `docker exec -it ... bash` lands in the vln env.
+# So that `docker compose exec ... bash` lands in an activated env.
 RUN conda init bash \
-    && echo "conda activate ${HABITAT_CONDA_ENV}" >> /etc/skel/.bashrc \
-    && echo "conda activate ${HABITAT_CONDA_ENV}" >> /home/${USERNAME}/.bashrc \
-    && echo "conda activate ${HABITAT_CONDA_ENV}" >> /root/.bashrc
+    && echo "conda activate \${LONGNAV_ENV:-${VLM_CONDA_ENV}}" >> /etc/skel/.bashrc \
+    && echo "conda activate \${LONGNAV_ENV:-${VLM_CONDA_ENV}}" >> /home/longnav/.bashrc \
+    && echo "conda activate \${LONGNAV_ENV:-${VLM_CONDA_ENV}}" >> /root/.bashrc \
+    && mkdir -p /home/longnav/.cache \
+    && chmod -R 777 /home/longnav
 
-COPY --chown=${USER_UID}:${USER_GID} docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
-RUN apt-get update && apt-get install -y sudo \
-    && echo "ALL ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-USER ${USERNAME}
-WORKDIR /workspace
 
-RUN git config --global --add safe.directory /workspace
+# Python dependencies are not installed here. The project is pip-installable and
+# the repo is bind-mounted rather than baked in, so `docker/install.sh` runs once
+# against the mount after the image is built:
+#
+#   docker compose up -d
+#   docker compose exec longnav bash docker/install.sh
+#
+# It must run in a container you keep: the installs land in that container's
+# writable layer, so `docker compose run --rm` would discard them on exit.
+# Shipped into the image as `longnav-install` so it can also be run from a
+# container with no repo mounted yet.
+COPY docker/install.sh /usr/local/bin/longnav-install
+RUN chmod +x /usr/local/bin/longnav-install
+
+ARG install_packages=false
+RUN if [ "${install_packages}" = "true" ]; then \
+        /usr/local/bin/longnav-install --repo /workspace; \
+    fi
+# Only the default when compose does not pass `user:`. Overriding it costs a
+# container restart, never a rebuild.
+USER longnav
+WORKDIR /workspace
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash"]

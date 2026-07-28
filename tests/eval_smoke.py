@@ -5,7 +5,7 @@ from longnav.utils.rollout_core import collect_rollouts
 import ray
 
 cfg = RLConfig()
-cfg.resources.osm_gb=28
+cfg.resources.osm_gb=8
 cfg.resources.vlm_conda_env=None
 cfg.vlm.attn_impl = "sdpa"
 cfg.rollout.convo_start_template=[

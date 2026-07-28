@@ -1,25 +1,32 @@
 # Usage:
-#   docker compose build          # ~30-50 min, mostly the habitat-sim build
-#   docker compose run --rm longnav            # interactive shell in `vln`
+#   bash docker/setup_env.sh      # once: writes .env with your uid/gid
+#   docker compose build          # ~40-60 min, mostly the habitat-sim build
+#   docker compose run --rm longnav                        # shell in `longnav` env
+#   docker compose run --rm -e LONGNAV_ENV=vln longnav bash  # shell in `vln` env
 #   docker compose run --rm longnav python tests/eval_smoke.py
 #
-# Set LONGNAV_DATA in a .env file (or the shell) to point at datasets living
-# outside the repo; it defaults to ./data.
+# Set LONGNAV_DATA in .env to point at datasets living outside the repo.
 services:
   longnav:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      target: runtime
       args:
-        USER_UID: "${UID:-1000}"
-        USER_GID: "${GID:-1000}"
         # Set to "true" to also build flash-attn into the image (slow).
-        INSTALL_FLASH_ATTN: "false"
+        INSTALL_FLASH_ATTN: "true"
     image: longnav:dev
+
+    # The image bakes in no uid, so switching users is a restart, not a rebuild.
+    # Populated by docker/setup_env.sh — do NOT change these to ${UID}/${GID},
+    # which bash does not export (UID) or define at all (GID), and which would
+    # silently pin every user to 1000:1000.
+    user: "${LONGNAV_UID:-1000}:${LONGNAV_GID:-1000}"
+
     stdin_open: true
     tty: true
     # Ray's object store and habitat's workers need far more than the 64MB default.
-    shm_size: "8gb"
+    shm_size: "16gb"
     ipc: host
     # Ray spawns thousands of processes and file descriptors; the docker
     # defaults make the raylet die under load.
@@ -36,13 +43,14 @@ services:
     volumes:
       - ./:/workspace
       - ${LONGNAV_DATA:-./data}:/workspace/data
+      # HF/torch caches and bash history (HISTFILE points here) survive --rm.
       - longnav-cache:/home/longnav/.cache
-      # Shell history survives `--rm`.
-      - ${HOME}/.longnav_bash_history:/home/longnav/.bash_history
     environment:
       - WANDB_API_KEY
       - HF_TOKEN
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+      # Which conda env the shell lands in. Ray reaches the other one by name.
+      - LONGNAV_ENV=${LONGNAV_ENV:-longnav}
       # Keep BLAS from oversubscribing cores across many Ray workers.
       - OMP_NUM_THREADS=4
       - MKL_NUM_THREADS=4

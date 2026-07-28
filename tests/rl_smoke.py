@@ -9,7 +9,7 @@ import ray
 import numpy as np
 import json
 cfg = RLConfig()
-cfg.resources.osm_gb=28
+cfg.resources.osm_gb=8
 cfg.resources.num_vlms=1
 cfg.resources.vlm_gpu_fraction=0.3
 cfg.resources.num_sims=2

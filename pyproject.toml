@@ -16,11 +16,15 @@ classifiers = [
 license = "MIT"
 license-files = ["LICEN[CS]E*"]
 dependencies = [
+    "ray[default]==2.53.0",
+    "hydra-core",
+    "regex"
+]
+[project.optional-dependencies]
+vlm = [
     "datasets",
     "torch==2.8.0",
     "transformers<5.0",
-    "ray[default]==2.53.0",
-    "hydra-core",
     "fastapi[standard]",
     "pillow",
     "opencv-python",
@@ -32,6 +36,8 @@ dependencies = [
     "huggingface-hub",
     "codetiming"
 ]
+
+
 [project.urls]
 #Homepage = ""
 #Issues = ""
@@ -39,3 +45,4 @@ dependencies = [
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+

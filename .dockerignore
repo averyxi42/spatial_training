@@ -1,0 +1,5 @@
+# The build context only needs the entrypoint and the install script. The repo
+# itself arrives via bind mount at run time, so keep the context tiny.
+*
+!docker/entrypoint.sh
+!docker/install.sh

@@ -1,53 +1,159 @@
 # Docker setup
 
-Reproduces the LongNav-R1 environment in one image. Everything (habitat-sim,
-habitat-lab, torch, project deps) lives in a single conda env named `vln` with
-**python 3.10.16**.
+Reproduces the LongNav-R1 environment. Two conda envs, both python 3.10.16:
 
-## Why the source build
+| env | contents |
+| --- | --- |
+| `vln` | habitat-sim 0.3.3 + habitat-lab built from source, plus the project core |
+| `longnav` | the project with its `[vlm]` extra — torch, transformers, verl |
 
-The published `habitat-sim==0.3.3` conda package is built against python 3.9, so
-`conda install habitat-sim` would pull the env back to 3.9 and break the rest of
-the project (`requires-python >= 3.10`). The image therefore builds habitat-sim
-from source with:
+**Naming Convention** `src/longnav/config_schema.py` defaults
+`habitat_conda_env="vln"` / `vlm_conda_env="longnav"`, and `src/longnav/utils/factories.py`
+hands those to Ray as `runtime_env={"conda": ...}`. Ray re-execs each actor inside the named
+env, so both must exist under exactly those names, both must have the project installed, and
+both must carry the same `ray` version — a mismatch fails at actor startup, not at import.
+That is also why the habitat env gets a project install at all: it only needs the core
+(`ray` + `hydra-core`), which is precisely what `pyproject.toml` declares outside the
+`[vlm]` extra.
 
-```
-python setup.py install --headless --with-cuda --bullet
-```
+## Requirements
 
-This is why the base image is `nvidia/cuda:*-devel-*` rather than `runtime`:
-`--with-cuda` needs `nvcc` and the CUDA headers at build time.
+An NVIDIA driver plus the [NVIDIA Container
+Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
+Docker Compose v2, and ~60 GB of disk for the image.
 
-## Prerequisites
+## Setup
 
-- NVIDIA driver on the host + [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-- Docker Compose v2
-
-## Build
+Four commands, once. The container is a long-lived dev box: start it and leave it running.
 
 ```bash
-export UID GID                        # files on mounts stay owned by you
-touch ~/.longnav_bash_history         # else docker creates it as a directory
-docker compose build
+bash docker/setup_env.sh                          # writes .env with your uid/gid
+docker compose build                              # 40-60 min (the habitat-sim compile)
+docker compose up -d                              # start the dev container
+docker compose exec longnav bash docker/install.sh   # install into both envs, ~10 min
 ```
 
-Expect 30–50 minutes; the habitat-sim compile dominates. Useful build args:
+Check it worked:
 
-| Arg | Default | Notes |
+```bash
+docker compose exec longnav python docker/verify_install.py
+docker compose exec longnav conda run --no-capture-output -n vln python docker/verify_install.py
+```
+
+You also need the datasets — see [../setup/DATASET_SETUP.md](../setup/DATASET_SETUP.md) and
+point `LONGNAV_DATA` in `.env` at them if they do not live in `./data`.
+
+## Daily use
+
+```bash
+docker compose exec longnav bash          # shell in the longnav env, at /workspace
+docker compose exec longnav python tests/eval_smoke.py
+docker compose exec longnav python -m longnav.scripts.eval \
+    +checkpoint=longnav +dataset=hm3d_val +experiment=eval +resources=octo \
+    task.run_name=my_eval_run
+```
+
+`/workspace` is your repo bind-mounted live, so edits on the host take effect immediately —
+no rebuild, no reinstall, no restart. Everything is installed editable.
+
+Commands run in the `longnav` env by default, interactively or not. You rarely need the
+habitat env directly — Ray activates `vln` for the sim actors itself — but when you do:
+
+```bash
+docker compose exec longnav conda run --no-capture-output -n vln python -c "import habitat_sim"
+docker compose exec -e LONGNAV_ENV=vln longnav bash      # interactive shell in vln
+```
+
+### Container lifecycle — what survives
+
+`install.sh` writes into `/opt/conda`, which lives in the **container**, not in a volume.
+That determines what you can safely do:
+
+| Command | Installed packages | Notes |
 | --- | --- | --- |
-| `CUDA_IMAGE` | `nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04` | Match your driver if it's older than 12.8 |
-| `PYTHON_VERSION` | `3.10.16` | |
-| `HABITAT_VERSION` | `v0.3.3` | Tag used for both habitat-sim and habitat-lab |
-| `CMAKE_BUILD_PARALLEL_LEVEL` | `8` | Lower it if the build OOMs |
-| `INSTALL_FLASH_ATTN` | `false` | Slow; set `true` for training |
+| `docker compose stop` / `start` | kept | the normal way to pause work |
+| `docker compose exec` | kept | never creates a container |
+| `docker compose run --rm` | **discarded on exit** | fine for one-off commands, never for installing |
+| `docker compose down` | **destroyed** | you must re-run `install.sh` afterwards |
+| `docker compose build` + `up -d` | **destroyed** | same |
 
-## Run
+If you do have to recreate the container, re-running `install.sh` is much faster the second
+time: pip's cache lives at `/home/longnav/.cache/pip`, inside the `longnav-cache` named
+volume, so nothing large is re-downloaded. Named volumes survive `down`; they only go away
+with `docker compose down -v`.
+
+## Installing
+
+`docker/install.sh` is the single install path, used for the container and a bare machine
+alike. It populates both envs in one run; pip reads `pyproject.toml`, so the script carries no
+dependency list of its own.
 
 ```bash
-docker compose run --rm longnav                              # shell, vln active
-docker compose run --rm longnav python docker/verify_install.py
-docker compose run --rm longnav python tests/eval_smoke.py
+docker/install.sh                        # both envs
+docker/install.sh --repo /path/to/repo   # if the repo is not the script's parent
+INSTALL_FLASH_ATTN=1 docker/install.sh   # add flash-attn to the VLM env (slow)
 ```
+
+It installs the project editable into both: the bare core into `vln` and the `[vlm]` extra
+into `longnav`, plus `verl` (no deps) into `longnav`. Env names default to `vln` / `longnav`
+and can be overridden with `HABITAT_ENV_NAME` / `VLM_ENV_NAME`, but they must then match the
+config or Ray will look for envs that do not exist. The script is also baked into the image as
+`longnav-install`, for a container with no repo mounted yet.
+
+**flash-attn is not built into the image.** Its `setup.py` imports torch, and with
+`--no-build-isolation` it uses the env's torch — which does not exist until the `[vlm]` extra
+is installed. So it lives in `install.sh`, after that step, behind `INSTALL_FLASH_ATTN=1`.
+
+## Why habitat-sim is built from source
+
+The published `habitat-sim==0.3.3` conda package targets python 3.9, which would drag the env
+below the project's `requires-python >= 3.10`. So it is compiled with
+`python setup.py install --headless --with-cuda --bullet`, which is why the base image is
+`nvidia/cuda:*-devel-*` rather than `runtime` — `--with-cuda` needs nvcc and the CUDA headers.
+This is the 40 minutes of the build, and the reason the stages are ordered the way they are.
+
+## Build layout
+
+Three stages, ordered by volatility. Editing anything in `runtime` can never invalidate the
+40-minute compile in `habitat`.
+
+```
+system   apt, GL/EGL stack, miniforge, git policy         rarely changes
+habitat  vln env, habitat-sim source build, habitat-lab   ~40 min
+runtime  longnav env, entrypoint, install script          edit freely
+```
+
+`docker build --target habitat -t longnav-base:habitat0.3.3 -f docker/Dockerfile .` snapshots
+the expensive stage for pushing to a registry so teammates never compile habitat at all.
+
+Two rules the Dockerfile depends on — please keep them when editing:
+
+1. **Declare an `ARG` immediately before the `RUN` that uses it**, never at the top of a
+   stage. An `ARG`/`ENV` change invalidates every layer below it; this is exactly how a
+   previous revision made a user-config tweak rebuild habitat-sim.
+2. **Every `RUN` that writes into `/opt/conda` ends with `chmod -R a+rwX` in the same `RUN`.**
+   A trailing `chmod`/`chown` in its own layer forces an overlayfs copy-up of the whole ~15 GB
+   conda tree. That permissive mode is also what lets an arbitrary runtime uid pip-install
+   into either env, which `install.sh` relies on.
+
+Build args: `CUDA_IMAGE`, `PYTHON_VERSION` (3.10.16), `HABITAT_VERSION` (v0.3.3),
+`CMAKE_BUILD_PARALLEL_LEVEL` (lower it if the build OOMs).
+
+## The user model
+
+The image bakes in **no** uid. It is built as root, and `docker-compose.yml` passes
+`user: "${LONGNAV_UID}:${LONGNAV_GID}"` at run time, so switching users is a container
+restart, never a rebuild. The entrypoint synthesizes `/etc/passwd` and `/etc/group` entries
+for whatever uid it is handed (both files are mode 666), because a uid missing from the passwd
+database breaks `sudo`, `id -gn`, and anything resolving `$HOME`.
+
+`docker/setup_env.sh` writes those into `.env`, which compose reads automatically.
+**Do not replace them with `${UID}`/`${GID}`**: bash does not export `UID` and does not define
+`GID` at all (it is a zsh builtin), so compose would see neither and silently pin everyone to
+1000:1000 — which looks like it works right up until someone's gid isn't 1000.
+
+With `user:` set there is no root in the container, so use the preinstalled `sudo` for
+`apt-get`.
 
 ## Mounts
 
@@ -55,36 +161,29 @@ docker compose run --rm longnav python tests/eval_smoke.py
 | --- | --- | --- |
 | `/workspace` | repo root | live-edit code; no rebuild needed |
 | `/workspace/data` | `$LONGNAV_DATA` (default `./data`) | scene/episode datasets |
-| `/home/longnav/.cache` | named volume `longnav-cache` | HF + torch checkpoint cache |
+| `/home/longnav/.cache` | named volume `longnav-cache` | HF + torch caches, bash history |
 
-Set `LONGNAV_DATA=/mnt/big-disk/habitat-data` in a `.env` file next to
-`docker-compose.yml` when the datasets live outside the repo.
-
-The entrypoint activates `vln` and, on first start, runs
-`pip install --no-dependencies -e .` for the repo (and `verl/` if present),
-since editable installs of a bind mount can't be baked into the image. Set
-`LONGNAV_SKIP_INSTALL=1` to suppress that.
-
-`shm_size` is set to 32GB because Ray's object store and the habitat workers
-exhaust the 64MB default immediately; tune it alongside `resources.osm_gb`.
+`shm_size` is 16 GB because Ray's object store and the habitat workers exhaust the 64 MB
+default immediately; tune it alongside `resources.osm_gb`. `pids_limit: -1` and
+`nofile: 65536` are there because Ray's raylet dies under the docker defaults.
 
 ## Known sharp edges
 
-These are the things that actually break habitat containers, all of them
-handled in the Dockerfile:
-
-- **numpy is pinned to exactly `1.26.4`** image-wide, and the pin is re-asserted
-  at the end of the build. habitat-sim's magnum bindings are compiled against
-  the numpy C API present at build time; letting a later `pip install` move
-  numpy silently breaks `import habitat_sim`. If you add a package that drags
-  numpy along, reinstall `numpy==1.26.4` afterwards.
+- **numpy must stay at exactly `1.26.4` in the `vln` env.** habitat-sim's magnum bindings
+  compile against the numpy C API present at build time, so any later move silently breaks
+  `import habitat_sim`. The build asserts it and `install.sh` warns if it drifted. Keeping the
+  core dependency set small is what makes this safe — the `[vlm]` extra, which does pull numpy
+  around, only lands in the `longnav` env.
 - **CUDA architectures are listed explicitly** (`TORCH_CUDA_ARCH_LIST` /
-  `CMAKE_CUDA_ARCHITECTURES`). No GPU is visible during `docker build`, so
-  nothing can be autodetected. Trim the list to shorten the build.
-- **The conda env's `libstdc++` is symlinked to the system one.** The env ships
-  an older copy than Ubuntu 22.04, and magnum/CUDA extensions otherwise die on
-  `GLIBCXX_3.4.30 not found`.
-- **`NVIDIA_DRIVER_CAPABILITIES` must include `graphics`**, not just `compute`.
-  Headless EGL rendering fails with an opaque context error otherwise.
-- The image installs `opencv-python-headless` instead of `opencv-python` to
-  avoid pulling X11 runtime deps into a headless container.
+  `CMAKE_CUDA_ARCHITECTURES`). No GPU is visible during `docker build`, so nothing can be
+  autodetected. Trim the list to shorten the build.
+- **The conda env's `libstdc++` is symlinked to the system one.** The env ships an older copy
+  than Ubuntu 22.04, and magnum/CUDA extensions otherwise die on `GLIBCXX_3.4.30 not found`.
+- **`NVIDIA_DRIVER_CAPABILITIES` must include `graphics`**, not just `compute`, or headless
+  EGL fails with an opaque context error.
+- **The Dockerfile is not a login shell.** Ubuntu's `/etc/profile` resets `PATH` for uid 0,
+  which would wipe the conda and CUDA entries, so `SHELL` is `bash -o pipefail -c`.
+- `git config --system --add safe.directory '*'` and a `url.insteadOf` rewrite for
+  `git@github.com:` are set image-wide: the former because a bind-mounted repo always looks
+  foreign-owned inside the container, the latter because `.gitmodules` declares `verl` and
+  `ovon` over SSH and a container has no key.

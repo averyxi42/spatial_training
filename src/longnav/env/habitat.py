@@ -417,7 +417,7 @@ class ObjectNavOracle:
         return self.follower.get_next_action(best_target)
     
 class HabitatWorker:
-    def __init__(self, assigned_episode_labels=None,workspace='/Projects/SG_VLN_HumanData/SG-VLN', config_path="configs/objectnav_hm3d_rgbd_semantic.yaml", enable_caching=True,dataset_path = None, scenes_dir=None,split="val",postprocess= True,output_schema=None,logging_schema=None,fn_guard=False,fp_guard=False,voxel_kwargs=None,ep_seed=None,log_oracle=False,
+    def __init__(self, assigned_episode_labels=None,workspace='.', config_path="configs/objectnav_hm3d_rgbd_semantic.yaml", enable_caching=True,dataset_path = None, scenes_dir=None,split="val",postprocess= True,output_schema=None,logging_schema=None,fn_guard=False,fp_guard=False,voxel_kwargs=None,ep_seed=None,log_oracle=False,
                  explr_bonus = None,
                  collision_penalty = None,
                  fpstop_penalty = None,add_top_down_map = False

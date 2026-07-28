@@ -1,38 +1,106 @@
-"""Quick sanity check for the container: python version, habitat, torch, CUDA.
+"""Sanity check the container environment.
 
     docker compose run --rm longnav python docker/verify_install.py
+    docker compose run --rm -e LONGNAV_ENV=vln longnav python docker/verify_install.py
+
+Checks what is expected of whichever conda env is active, and reports the rest.
+Exits non-zero if a required piece is missing.
 """
 
+import os
 import sys
 
-print(f"python           {sys.version.split()[0]}")
+RAY_PIN = "2.53.0"
+NUMPY_PIN = "1.26.4"
 
-import numpy as np
+# Derive the env from the running interpreter rather than CONDA_DEFAULT_ENV,
+# which is only set when the env was activated by a shell. `docker compose exec`
+# bypasses the entrypoint, so it is often unset even though the right python is
+# on PATH.
+env_name = os.path.basename(sys.prefix)
+if env_name != os.environ.get("CONDA_DEFAULT_ENV", env_name):
+    env_name = os.environ["CONDA_DEFAULT_ENV"]
 
-print(f"numpy            {np.__version__}")
+failures = []
 
-import habitat_sim
 
-print(f"habitat_sim      {habitat_sim.__version__}")
-print(f"  cuda enabled   {habitat_sim.cuda_enabled}")
-print(f"  bullet enabled {habitat_sim.built_with_bullet}")
+def check(label, fn, required=True):
+    try:
+        print(f"{label:<18} {fn()}")
+    except Exception as exc:  # noqa: BLE001 - report, don't mask
+        mark = "FAIL" if required else "skip"
+        print(f"{label:<18} {mark}: {type(exc).__name__}: {exc}")
+        if required:
+            failures.append(label)
 
-import habitat
 
-print(f"habitat_lab      {habitat.__version__}")
+def ray_version():
+    import ray
 
-import torch
+    if ray.__version__ != RAY_PIN:
+        raise AssertionError(f"{ray.__version__} != pinned {RAY_PIN}")
+    return ray.__version__
 
-print(f"torch            {torch.__version__}")
-print(f"  cuda available {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"  devices        {torch.cuda.device_count()} x {torch.cuda.get_device_name(0)}")
 
-cfg = habitat_sim.SimulatorConfiguration()
-cfg.gpu_device_id = 0
-print("sim config       ok")
+def numpy_version():
+    import numpy
+
+    if numpy.__version__ != NUMPY_PIN:
+        raise AssertionError(f"{numpy.__version__} != pinned {NUMPY_PIN}")
+    return numpy.__version__
+
+
+def longnav_importable():
+    import longnav.config_schema as cs
+
+    r = cs.ResourceConfig()
+    return f"ok (habitat_conda_env={r.habitat_conda_env}, vlm_conda_env={r.vlm_conda_env})"
+
+
+def habitat_sim_info():
+    import habitat_sim
+
+    return (
+        f"{habitat_sim.__version__} cuda={habitat_sim.cuda_enabled} "
+        f"bullet={habitat_sim.built_with_bullet}"
+    )
+
+
+def torch_info():
+    import torch
+
+    out = f"{torch.__version__} cuda_available={torch.cuda.is_available()}"
+    if torch.cuda.is_available():
+        out += f" ({torch.cuda.device_count()}x {torch.cuda.get_device_name(0)})"
+    return out
+
+
+print(f"conda env          {env_name}")
+print(f"python             {sys.version.split()[0]}")
+
+# Required in both envs. Ray re-execs actors into the *other* env by name
+# (runtime_env={"conda": ...}), so both need ray at the same version or actor
+# startup fails. Both also need the project importable via the baked .pth.
+check("ray", ray_version)
+check("numpy", numpy_version)
+check("longnav", longnav_importable)
+
+if env_name == "vln":
+    check("habitat_sim", habitat_sim_info)
+    check("habitat_lab", lambda: __import__("habitat").__version__)
+    check("torch", torch_info)
+else:
+    check("torch", torch_info)
+    check("transformers", lambda: __import__("transformers").__version__)
+    # verl commonly pulls vllm / flash-attn at import, which are optional here,
+    # so a failure is informational rather than a broken environment.
+    check("verl", lambda: __import__("verl").__file__, required=False)
+
+if failures:
+    print(f"\nFAILED: {', '.join(failures)}")
+    sys.exit(1)
+
 print(
-    "\nNote: this does not open an EGL context. To confirm headless GPU rendering "
-    "end to end, load a scene (e.g. `bash setup/download_example_data.sh`) and run "
-    "tests/eval_smoke.py."
+    "\nAll required checks passed. This does not open an EGL context — for "
+    "end-to-end headless rendering run tests/eval_smoke.py with a scene present."
 )
