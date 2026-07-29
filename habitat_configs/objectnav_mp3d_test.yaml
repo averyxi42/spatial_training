@@ -1,0 +1,58 @@
+# @package _global_
+
+defaults:
+  - /habitat: habitat_config_base
+  - /habitat/task: objectnav
+  - /habitat/simulator/sensor_setups@habitat.simulator.agents.main_agent: rgbd_agent
+  - /habitat/dataset/objectnav: mp3d
+  - _self_
+habitat:
+  # The stock ObjectNav dataset, restricted to the one scene the example scene
+  # set provides. content_scenes is habitat's own per-scene loader: it reads only
+  # data/datasets/objectnav/mp3d/v1/train/content/17DRP5sb8fy.json.gz instead of
+  # every scene, so no episode ever references a scene that was not downloaded.
+  # Widen this list (or set it to ["*"]) as you download more MP3D scenes.
+  #
+  # 17DRP5sb8fy is a *train* scene, hence split: train — it does not appear in
+  # val. HabitatWorker defaults its `split` argument to "val" and overrides the
+  # config, so the test passes split="train" explicitly.
+  dataset:
+    type: ObjectNav-v1
+    split: train
+    data_path: data/datasets/objectnav/mp3d/v1/{split}/{split}.json.gz
+    content_scenes: ["17DRP5sb8fy"]
+    # A scene root of its own, deliberately NOT data/scene_datasets. Episodes
+    # store scene_id as "mp3d/<scene>/<scene>.glb", so something has to answer to
+    # the name "mp3d"; putting that symlink inside data/scene_datasets would
+    # collide with a later full-MP3D download, which writes to exactly that path
+    # — and would follow the symlink, dumping 90 scenes into the example
+    # directory. Keeping it here leaves data/scene_datasets untouched.
+    #
+    # To run against full MP3D instead: set this back to data/scene_datasets and
+    # widen content_scenes (or drop it for ["*"]).
+    scenes_dir: data/scene_datasets_example
+  environment:
+    iterator_options:
+      shuffle: false
+    max_episode_steps: 500
+  simulator:
+    scene: data/scene_datasets/mp3d_example/17DRP5sb8fy/17DRP5sb8fy.glb
+    turn_angle: 30
+    agents:
+      main_agent:
+        sim_sensors:
+          rgb_sensor:
+            width: 640
+            height: 480
+            hfov: 79
+            position: [0, 0.88, 0]
+        radius: 0.18
+    habitat_sim_v0:
+      gpu_device_id: 0
+      allow_sliding: True # default is False, vln-game uses True whcih makes the task easier
+  task: # zero out noise
+    base_noise: 0.0
+    base_angle_noise: 0.0
+    measurements:
+      success:
+        success_distance: 1.0
