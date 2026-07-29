@@ -66,21 +66,29 @@ docker compose exec -e LONGNAV_ENV=vln longnav bash      # interactive shell in 
 
 ### Container lifecycle — what survives
 
-`install.sh` writes into `/opt/conda`, which lives in the **container**, not in a volume.
-That determines what you can safely do:
+The conda envs live on the `longnav-conda-envs` named volume, so what `install.sh` writes
+outlives the container:
 
 | Command | Installed packages | Notes |
 | --- | --- | --- |
 | `docker compose stop` / `start` | kept | the normal way to pause work |
 | `docker compose exec` | kept | never creates a container |
-| `docker compose run --rm` | **discarded on exit** | fine for one-off commands, never for installing |
-| `docker compose down` | **destroyed** | you must re-run `install.sh` afterwards |
-| `docker compose build` + `up -d` | **destroyed** | same |
+| `docker compose run --rm` | kept | the envs are on a volume, not the writable layer |
+| `docker compose down` | kept | volumes survive; just `up -d` again |
+| `docker compose down -v` | **destroyed** | removes volumes; re-run `install.sh` |
 
-If you do have to recreate the container, re-running `install.sh` is much faster the second
-time: pip's cache lives at `/home/longnav/.cache/pip`, inside the `longnav-cache` named
-volume, so nothing large is re-downloaded. Named volumes survive `down`; they only go away
-with `docker compose down -v`.
+The first `up -d` seeds the volume from the image (~15 GB copy, a minute or two). That is
+also the catch: **the volume then shadows the image's envs.** After rebuilding the image
+with a different `HABITAT_VERSION` or `PYTHON_VERSION`, the old envs are still what you
+get, and the rebuild looks like it did nothing. Reset with:
+
+```bash
+docker compose down -v                          # drops caches too
+docker volume rm spatial_training_longnav-conda-envs   # or just this one
+```
+
+Re-running `install.sh` after a reset is fast anyway: pip's cache lives at
+`/home/longnav/.cache/pip` inside `longnav-cache`, so nothing large is re-downloaded.
 
 ## Installing
 
@@ -169,11 +177,14 @@ default immediately; tune it alongside `resources.osm_gb`. `pids_limit: -1` and
 
 ## Known sharp edges
 
-- **numpy must stay at exactly `1.26.4` in the `vln` env.** habitat-sim's magnum bindings
-  compile against the numpy C API present at build time, so any later move silently breaks
-  `import habitat_sim`. The build asserts it and `install.sh` warns if it drifted. Keeping the
-  core dependency set small is what makes this safe — the `[vlm]` extra, which does pull numpy
-  around, only lands in the `longnav` env.
+- **The two envs are deliberately asymmetric, and that is not a bug.**
+  `vln` holds habitat plus only the project core (`ray`, `hydra-core`) and pins numpy at
+  `1.26.4`, because habitat-sim's magnum bindings are compiled against that C API and any
+  drift silently breaks `import habitat_sim`. `longnav` gets the `[vlm]` extra and is free
+  to run numpy 2.x, and has no torch counterpart in `vln` — the sim actors do not need it,
+  and duplicating a multi-GB CUDA wheel per env is not free. Arrays crossing between the
+  envs go through Ray's serialisation, not a shared ABI, so the numpy versions need not
+  match. `docker/verify_install.py` checks by capability rather than env name.
 - **CUDA architectures are listed explicitly** (`TORCH_CUDA_ARCH_LIST` /
   `CMAKE_CUDA_ARCHITECTURES`). No GPU is visible during `docker build`, so nothing can be
   autodetected. Trim the list to shorten the build.

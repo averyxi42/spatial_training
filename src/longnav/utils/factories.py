@@ -215,9 +215,11 @@ class WandbFactory:
         Returns a Ray Actor for logging to WandB, and set of episode labels to skip.
         Checks the episode_label column of the existing run (if any) to determine which episodes have already been logged, and returns that as a set to skip.
         '''
-        if not run_cfg.wandb_project: 
-            return None
-        
+        if not run_cfg.wandb_project:
+            # Callers unpack (actor, episodes_to_skip); returning a bare None here
+            # broke the no-wandb path with "cannot unpack non-iterable NoneType".
+            return None, set()
+
         from longnav.utils.logging_workers import WandbLoggerActor
         
         RemoteLogger = ray.remote(WandbLoggerActor).options(

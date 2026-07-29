@@ -1,0 +1,29 @@
+# @package _global_
+#
+# Production ObjectNav eval restricted to the one downloadable MP3D example scene
+# (17DRP5sb8fy, ~93 MB), so the whole pipeline can be exercised without the full
+# ~15 GB MP3D set. These are the stock MP3D episodes, unmodified — the scene
+# restriction lives in habitat_configs/objectnav_mp3d_test.yaml via habitat's own
+# `content_scenes`. See setup/DATASET_SETUP.md.
+#
+#   python -m longnav.scripts.eval +checkpoint=longnav +dataset=mp3d_example \
+#       +experiment=eval +resources=single task.run_name=mp3d_example_eval
+#
+# 17DRP5sb8fy is a train-split scene; it does not appear in val.
+sim:
+  config_path: habitat_configs/objectnav_mp3d_test.yaml
+  split: train
+
+task:
+  # shard_size <= 0 selects the trivial shard: habitat picks episodes itself
+  # using the config above, rather than longnav filtering by episode label.
+  #
+  # This is not just convenience — label filtering is unsafe on MP3D. Labels are
+  # "{scene}_{episode_id}", but MP3D episode_id is only unique *within* an object
+  # category: the 50,000 episodes of 17DRP5sb8fy collapse into 11,364 distinct
+  # labels, so one label pulls in ~4 unrelated episodes. subset_label and
+  # episode_json are therefore not usable here (they are fine for HM3D, where ids
+  # are globally unique).
+  shard_size: 0
+  subset_label: ""
+  episode_json: ""

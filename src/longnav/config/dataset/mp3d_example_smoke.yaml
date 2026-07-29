@@ -1,0 +1,38 @@
+# @package _global_
+#
+# Bounded version of dataset/mp3d_example: 6 episodes instead of 256, so a run
+# finishes in about a minute. Use it to check the pipeline end to end; report
+# numbers from +dataset=mp3d_example.
+#
+#   python -m longnav.scripts.eval +checkpoint=sft +dataset=mp3d_example_smoke \
+#       +experiment=eval_fast +resources=single task.run_name=smoke
+#
+# Why an explicit episode list rather than a smaller trivial shard: the trivial
+# shard path (shard_size <= 0) always yields trivial_shard_iterator(n=256), which
+# is not configurable, so 256 episodes is the floor there. episode_json is the
+# supported way to bound the count.
+#
+# The six labels are chosen on two criteria, so the run is both exact and a
+# meaningful check:
+#
+#   1. Unambiguous episode_id. MP3D episode_ids are only unique *within* an
+#      object category, so most labels ("{scene}_{episode_id}") match ~4
+#      unrelated episodes — 50,000 episodes of 17DRP5sb8fy collapse into 11,364
+#      labels. Only ids that map 1:1 are used, which makes the count exactly 6.
+#      Those all happen to carry the "cushion" goal; mp3d_example covers every
+#      category.
+#   2. Geodesic distance between 2 and 4 metres. Below ~1.5 m the agent starts
+#      inside the 1.0 m success radius and the episode proves nothing; longer
+#      ones need a bigger step budget than a smoke test wants. In this band the
+#      SFT policy completes about 5 of 6 within max_steps=150.
+#
+# To reselect (e.g. for a different example scene), pick episode_ids whose count
+# in the scene's content file is 1, then filter on info.geodesic_distance.
+sim:
+  config_path: habitat_configs/objectnav_mp3d_test.yaml
+  split: train
+
+task:
+  shard_size: 1
+  subset_label: ""
+  episode_json: eval_episodes/mp3d_example_smoke.json

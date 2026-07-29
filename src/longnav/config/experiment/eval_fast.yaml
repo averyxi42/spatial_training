@@ -1,0 +1,33 @@
+# @package _global_
+#
+# Same eval as experiment/eval, cut down so a run finishes in minutes rather than
+# hours. Use it to check the pipeline end to end; report numbers from
+# +experiment=eval instead.
+#
+#   python -m longnav.scripts.eval +checkpoint=longnav +dataset=mp3d_example \
+#       +experiment=eval_fast +resources=single task.run_name=smoke
+#
+# What is traded away: max_steps 500 -> 60 truncates long episodes, so success
+# and SPL are pessimistic and not comparable to published numbers. The top-down
+# map is dropped because rendering it costs a few ms per step.
+task:
+  run_name: "name me"
+  # null disables the wandb logger entirely, so this runs with no account and no
+  # `wandb login` — note WANDB_MODE=offline is not enough on its own, since
+  # wandb.Api() verifies the key against api.wandb.ai regardless. Results still
+  # land in output_dir. Set a project name to log a real run.
+  wandb_project: null
+  output_dir: ./dump/longnav_eval_fast
+  jobtype: eval
+rollout:
+  # Enough budget for the short episodes in mp3d_example_smoke to actually reach
+  # the goal and call STOP. At 60 the policy was arriving (final distance 0.01 m)
+  # and then being truncated, which reads as failure and makes the demo useless
+  # as a sanity check. Episodes that succeed end early, so raising the cap costs
+  # little wall clock.
+  max_steps: 150
+sim:
+  fp_guard: false
+  fn_guard: false
+  ep_seed: 17 # determinism
+  add_top_down_map: false

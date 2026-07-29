@@ -21,6 +21,15 @@ env_name = os.path.basename(sys.prefix)
 if env_name != os.environ.get("CONDA_DEFAULT_ENV", env_name):
     env_name = os.environ["CONDA_DEFAULT_ENV"]
 
+# Check by capability, not by env name: the names are configurable
+# (HABITAT_ENV_NAME / VLM_ENV_NAME) and what matters is what is installed.
+try:
+    import habitat_sim as _habitat_sim  # noqa: F401
+
+    HAS_HABITAT_SIM = True
+except Exception:
+    HAS_HABITAT_SIM = False
+
 failures = []
 
 
@@ -43,10 +52,19 @@ def ray_version():
 
 
 def numpy_version():
+    """Only the habitat env is ABI-pinned.
+
+    habitat-sim's magnum bindings are compiled against numpy 1.26.4, so that env
+    must not drift. The VLM env is free to run numpy 2.x: it has no compiled
+    habitat extensions, and arrays crossing between the envs go through Ray's
+    serialisation rather than a shared ABI, so the two versions need not match.
+    """
     import numpy
 
-    if numpy.__version__ != NUMPY_PIN:
-        raise AssertionError(f"{numpy.__version__} != pinned {NUMPY_PIN}")
+    if HAS_HABITAT_SIM and numpy.__version__ != NUMPY_PIN:
+        raise AssertionError(
+            f"{numpy.__version__} != {NUMPY_PIN}, required by the habitat_sim build"
+        )
     return numpy.__version__
 
 
@@ -85,10 +103,12 @@ check("ray", ray_version)
 check("numpy", numpy_version)
 check("longnav", longnav_importable)
 
-if env_name == "vln":
+if HAS_HABITAT_SIM:
+    # The habitat env carries only the project core (ray + hydra-core) on top of
+    # habitat. torch deliberately is not installed here — the sim actors do not
+    # need it, and duplicating a multi-GB CUDA wheel per env is not free.
     check("habitat_sim", habitat_sim_info)
     check("habitat_lab", lambda: __import__("habitat").__version__)
-    check("torch", torch_info)
 else:
     check("torch", torch_info)
     check("transformers", lambda: __import__("transformers").__version__)

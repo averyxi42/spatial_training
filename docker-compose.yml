@@ -12,9 +12,6 @@ services:
       context: .
       dockerfile: docker/Dockerfile
       target: runtime
-      args:
-        # Set to "true" to also build flash-attn into the image (slow).
-        INSTALL_FLASH_ATTN: "true"
     image: longnav:dev
 
     # The image bakes in no uid, so switching users is a restart, not a rebuild.
@@ -45,12 +42,25 @@ services:
       - ${LONGNAV_DATA:-./data}:/workspace/data
       # HF/torch caches and bash history (HISTFILE points here) survive --rm.
       - longnav-cache:/home/longnav/.cache
+      # The conda envs, so `docker/install.sh` survives container recreation.
+      # Docker seeds an empty named volume from the image on first start, so the
+      # habitat-sim build baked into the image lands here once (~15 GB copy,
+      # a minute or two) and is reused from then on.
+      #
+      # Consequence worth knowing: this volume now SHADOWS the image's envs. After
+      # rebuilding the image (new HABITAT_VERSION, new python, ...) the volume
+      # still holds the old envs, and the rebuild appears to do nothing. Reset it
+      # with `docker compose down -v` — which also clears longnav-cache — or
+      # `docker volume rm <project>_longnav-conda-envs` to drop just this one.
+      - longnav-conda-envs:/opt/conda/envs
     environment:
       - WANDB_API_KEY
       - HF_TOKEN
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
       # Which conda env the shell lands in. Ray reaches the other one by name.
       - LONGNAV_ENV=${LONGNAV_ENV:-longnav}
+      # Consumed by docker/install.sh; set to 1 to add flash-attn to the VLM env.
+      - INSTALL_FLASH_ATTN=${INSTALL_FLASH_ATTN:-0}
       # Keep BLAS from oversubscribing cores across many Ray workers.
       - OMP_NUM_THREADS=4
       - MKL_NUM_THREADS=4
@@ -64,3 +74,4 @@ services:
 
 volumes:
   longnav-cache:
+  longnav-conda-envs:

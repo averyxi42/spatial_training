@@ -16,6 +16,17 @@ Clone this repo with submodules:
 git clone --recursive https://@github.com:UMich-CURLY/LongNav-R1.git
 ```
 
+> 🐳 **Docker.** The steps below can be skipped entirely — the container builds habitat-sim
+> from source and sets up both conda envs for you:
+> ```
+> bash docker/setup_env.sh
+> docker compose build          # 40-60 min
+> docker compose up -d
+> docker compose exec longnav bash docker/install.sh
+> ```
+> Then work in it with `docker compose exec longnav bash`. You still need the datasets
+> (step 3). See [docker/README.md](docker/README.md).
+
 ### 2. Habitat Simulation Setup
 Install habitat in a separate conda env.
 ```
@@ -89,6 +100,16 @@ python3 tests/rl_smoke.py
 ```
 
 These may be referenced for integrating new Envs.
+
+Both run without habitat scenes. To validate the habitat side as well — and the full
+eval pipeline — on just the ~93 MB example scene rather than the full MP3D download,
+see [setup/EXAMPLE_EVAL.md](setup/EXAMPLE_EVAL.md):
+
+```
+conda run -n vln python tests/mp3d_example_env.py       # habitat worker only
+python -m longnav.scripts.eval +checkpoint=sft +dataset=mp3d_example_smoke \
+    +experiment=eval_fast +resources=single task.run_name=smoke   # ~50s, 6 episodes
+```
 
 ## Quickstart ⚡
 Run our framework with a dummy environment (doesn't require habitat dependencies)

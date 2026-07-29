@@ -1,0 +1,15 @@
+# @package _global_
+#
+# One GPU. Sized so the fractions fit a single 24 GB card:
+#   0.7 (vlm) + 2 x 0.14 (sims) = 0.98
+#
+# num_sims is deliberately one more than num_vlms so a simulator is always ready
+# with the next observation while the policy is busy. Note num_vlms must divide
+# the rollout count (16 by default) or rollout collection hangs.
+resources:
+  ray_address: local
+  osm_gb: 16
+  num_vlms: 1
+  num_sims: 2
+  vlm_gpu_fraction: 0.7
+  sim_gpu_fraction: 0.14
