@@ -29,13 +29,24 @@ import pytest
 import torch
 from transformers import AutoProcessor
 
-from longnav.utils.vector_rollout import (
-    DEFAULT_SYSTEM_PROMPT,
-    RolloutConfig,
-    assistant_tail,
-    full_context_text,
-    render_turn,
+from longnav.utils.turn_vectors import (
+    ACTION_POSTFIX,
+    ACTION_PREFIX,
+    DEFAULT_POSTFIX,
+    DEFAULT_PREFIX,
+    resolve_affix_ids,
 )
+from longnav.utils.vector_rollout import (
+    CHAT_ASSISTANT_OPEN,
+    DEFAULT_SYSTEM_PROMPT,
+    TURN_CLOSE,
+    RolloutConfig,
+    full_context_text,
+    render_user_block,
+    split_assistant_turn,
+)
+
+PLACEHOLDER = "**____**"
 
 MODEL_ID = "Qwen/Qwen3-VL-2B-Instruct"
 
@@ -45,7 +56,7 @@ def processor():
     return AutoProcessor.from_pretrained(MODEL_ID)
 
 
-def training_conversation(n_turns, goal="chest_of_drawers", placeholder="**forward**"):
+def training_conversation(n_turns, goal="chest_of_drawers", placeholder=PLACEHOLDER):
     """Exactly what `format_action_chunk_dataset.build_messages` produces."""
     messages = [
         {
@@ -103,8 +114,8 @@ def test_incremental_chunks_concatenate_to_the_same_ids(processor):
     )
     chunks, pending = [], prologue
     for i in range(n_turns):
-        chunks.append(pending + render_turn(processor, cfg, i))
-        pending = assistant_tail(cfg)
+        chunks.append(pending + render_user_block(processor, cfg, i) + "**")
+        pending = cfg.placeholder[len("**"):] + TURN_CLOSE
 
     per_chunk = [tok.encode(c, add_special_tokens=False) for c in chunks]
     incremental = [t for c in per_chunk for t in c]
@@ -118,43 +129,96 @@ def test_incremental_chunks_concatenate_to_the_same_ids(processor):
     assert tok.decode(incremental[-1:]) == "**", "the pooled position must be the '**' token"
 
 
+@pytest.mark.parametrize("placeholder,middle", [
+    ("**____**", "____"), ("**___**", "___"), ("**...**", "..."),
+    ("**XXX**", "XXX"), ("**?**", "?"), ("**█**", "█"),
+])
+def test_placeholder_tokenizes_as_three_tokens(processor, placeholder, middle):
+    """The placeholder's middle must be ONE token that does not merge into the '**' affixes.
+
+    `**[…]**` is the counter-example this guards: BPE merges `]` with the closing `**` into
+    `]**`, the postfix never matches, and turn discovery silently finds nothing.
+    """
+    tok = processor.tokenizer
+    ids = tok.encode(CHAT_ASSISTANT_OPEN + placeholder + "<|im_end|>", add_special_tokens=False)
+    pieces = [tok.decode([i]) for i in ids]
+    assert pieces == ["<|im_start|>", "assistant", "\n", "**", middle, "**", "<|im_end|>"]
+
+
+def test_elided_placeholder_is_rejected(processor):
+    """`**[...]**` cannot be split, and must fail loudly rather than yield zero turns."""
+    cfg = RolloutConfig(placeholder="**[\u2026]**")
+    pre, post = resolve_affix_ids(processor.tokenizer, ACTION_PREFIX, ACTION_POSTFIX)
+    with pytest.raises(ValueError, match="readout span"):
+        split_assistant_turn(processor.tokenizer, cfg, pre, post, shift_left=True)
+
+
+@pytest.mark.parametrize("placeholder,affixes,shift,expect_readout,expect_emit_tail", [
+    # current design: '**' pooled via shift_left, placeholder body owed to the next turn
+    ("**____**", "action", True, ["**"], ["____", "**", "<|im_end|>", "\n"]),
+    # pool the placeholder itself, no ** wrapper
+    ("____", "template", False, ["____"], ["<|im_end|>", "\n"]),
+    # several latents per turn, pooled together
+    ("█ █ █", "template", False, ["█", " █", " █"], ["<|im_end|>", "\n"]),
+])
+def test_split_is_derived_not_hardcoded(processor, placeholder, affixes, shift,
+                                        expect_readout, expect_emit_tail):
+    """Any affix/placeholder combination is located by find_turn_spans, no special cases."""
+    tok = processor.tokenizer
+    cfg = RolloutConfig(placeholder=placeholder)
+    pre_s, post_s = ((ACTION_PREFIX, ACTION_POSTFIX) if affixes == "action"
+                     else (DEFAULT_PREFIX, DEFAULT_POSTFIX))
+    pre, post = resolve_affix_ids(tok, pre_s, post_s)
+    emit, tail, n = split_assistant_turn(tok, cfg, pre, post, shift_left=shift)
+    assert n == len(expect_readout)
+    # the readout is always the final n tokens of what gets emitted -- that is what lets
+    # step() slice last_hidden_state[:, -n:]
+    assert [tok.decode([t]) for t in emit[-n:]] == expect_readout
+    assert [tok.decode([t]) for t in tail] == expect_emit_tail
+
+
 def test_pooled_position_is_the_last_token(processor):
-    """The reason `step()` can read `last_hidden_state[:, -1]` with no span search."""
+    """The reason `step()` can read `last_hidden_state[:, -n_readout:]` without a search."""
     cfg = RolloutConfig()
-    ids = processor.tokenizer.encode(render_turn(processor, cfg, 0), add_special_tokens=False)
+    ids = processor.tokenizer.encode(
+        render_user_block(processor, cfg, 0) + "**", add_special_tokens=False
+    )
     assert processor.tokenizer.decode(ids[-1:]) == "**"
 
 
-def test_placeholder_must_open_with_the_pooled_token():
+def test_head_readout_mismatch_is_caught(processor):
+    """A flat head trained on k positions must not be fed a different k.
+
+    Shapes work out for pooled modes regardless, so without this assert a mismatch is
+    silent -- the head just pools the wrong number of states.
+    """
     from longnav.utils.vector_rollout import VectorRolloutPolicy
 
-    class _FakeModel:
-        class model_cfg:
-            affixes = "action"
-            shift_left = True
+    class _Head:
+        mode = "flat"
+        content_len = 3
 
-    with pytest.raises(ValueError, match="must start with"):
-        VectorRolloutPolicy.__init__(
-            object.__new__(VectorRolloutPolicy),
-            _FakeModel(),
-            None,
-            RolloutConfig(placeholder="forward"),
-        )
+    policy = object.__new__(VectorRolloutPolicy)
+    policy.cfg = RolloutConfig()
+    policy.n_readout = 1
+    policy.model = type("M", (), {"head": _Head(), "train_content_len": None})()
+    with pytest.raises(ValueError, match="flat"):
+        policy._assert_head_matches_readout()
 
 
-def test_rejects_content_pooling_models():
-    """A model trained to pool assistant content cannot be rolled out incrementally."""
+def test_trained_content_len_mismatch_is_caught():
     from longnav.utils.vector_rollout import VectorRolloutPolicy
 
-    class _FakeModel:
-        class model_cfg:
-            affixes = "template"
-            shift_left = False
+    class _Head:
+        mode = "mean"
+        content_len = None
 
-    with pytest.raises(ValueError, match="affixes='action'"):
-        VectorRolloutPolicy.__init__(
-            object.__new__(VectorRolloutPolicy), _FakeModel(), None, RolloutConfig()
-        )
+    policy = object.__new__(VectorRolloutPolicy)
+    policy.cfg = RolloutConfig()
+    policy.n_readout = 1
+    policy.model = type("M", (), {"head": _Head(), "train_content_len": 3})()
+    with pytest.raises(ValueError, match="pooling 3 position"):
+        policy._assert_head_matches_readout()
 
 
 # ======================================================================================

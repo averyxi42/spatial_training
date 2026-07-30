@@ -7,11 +7,14 @@ episode with `images` (paths, one per observation) and `action_chunks`
 `(n_obs, action_chunk_len, 3)`, but no conversation formatting. The trainer wants the
 standard HF conversational layout, so this script writes it -- and nothing else.
 
-The assistant turns carry a fixed placeholder (`**forward**` by default). That is not a
+The assistant turns carry a fixed placeholder (`**____**` by default). That is not a
 label: the continuous action comes from the regression head reading that turn's vector,
 which is why `train_vector_sft.py` defaults to `--affixes action` + shift-left, pooling
 the single `**` token that opens each turn. Change the placeholder here and nothing
-downstream cares, as long as it stays constant across turns.
+downstream cares, as long as it stays constant across turns and its middle stays a single
+token that does not merge into the `**` affixes -- `docs/placeholder_tokens.md` explains
+why `**forward**` was a poor choice (it asserts a false action history in every later
+turn's context) and why `**[…]**` is broken outright (BPE merges `]**`).
 
     python data_scripts/format_action_chunk_dataset.py \
         --in-dir  ~/codes/habitat/continuous_demos/data/arrowtable \
@@ -72,8 +75,10 @@ def main():
     p.add_argument("--target-column", default="action_chunks")
     p.add_argument("--images-column", default="images")
     p.add_argument("--goal-column", default="goal_text")
-    p.add_argument("--placeholder", default="**forward**",
-                   help="constant assistant text; the real action comes from the head")
+    p.add_argument("--placeholder", default="**____**",
+                   help="constant assistant text; the real action comes from the head. "
+                        "Keep the middle a single token that does not merge into '**' "
+                        "(see docs/placeholder_tokens.md)")
     p.add_argument("--image-root", default=None,
                    help="prepend to relative image paths (the builder may emit relative ones)")
     p.add_argument("--val-fraction", type=float, default=0.1)

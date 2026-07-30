@@ -53,12 +53,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Standard Qwen chat-template affixes. Content is then the raw assistant message,
-# e.g. "**forward**".
+# e.g. "**____**".
 DEFAULT_PREFIX = "<|im_start|>assistant\n"
 DEFAULT_POSTFIX = "<|im_end|>"
 
 # Action-style affixes matching `VLMWorker`'s defaults; content is then the bare
-# action word, e.g. "forward" (the `**` markers become part of the affixes).
+# action word or placeholder, e.g. "____" (the `**` markers become part of the affixes).
 ACTION_PREFIX = "<|im_start|>assistant\n**"
 ACTION_POSTFIX = "**<|im_end|>"
 

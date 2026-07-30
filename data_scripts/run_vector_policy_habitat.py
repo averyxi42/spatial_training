@@ -78,14 +78,16 @@ DEFAULT_WIDTH, DEFAULT_HEIGHT = 640, 480
 class LocalPolicy:
     """Runs `VectorRolloutPolicy` in this process (model env, or an env with both)."""
 
-    def __init__(self, ckpt, device="cuda", merge_lora=True, max_context_tokens=0):
+    def __init__(self, ckpt, device="cuda", merge_lora=True, max_context_tokens=0,
+                 placeholder=None):
         from longnav.utils.vector_rollout import RolloutConfig, VectorRolloutPolicy
 
-        self.policy = VectorRolloutPolicy.from_checkpoint(
-            ckpt,
-            RolloutConfig(device=device, merge_lora=merge_lora,
-                          max_context_tokens=max_context_tokens),
-        )
+        cfg = RolloutConfig(device=device, merge_lora=merge_lora,
+                            max_context_tokens=max_context_tokens)
+        if placeholder:
+            cfg.placeholder = placeholder
+        self.policy = VectorRolloutPolicy.from_checkpoint(ckpt, cfg)
+        print(self.policy.describe())
 
     def reset(self, goal_text):
         self.policy.reset(goal_text=goal_text)
@@ -173,7 +175,7 @@ class PolicyClient:
     """Runs the policy in a subprocess under a different interpreter."""
 
     def __init__(self, ckpt, policy_python, device="cuda", log_path=None,
-                 max_context_tokens=0):
+                 max_context_tokens=0, placeholder=None):
         from multiprocessing.connection import Listener
 
         self.socket_path = Path(tempfile.mkdtemp(prefix="vecpolicy_")) / "sock"
@@ -184,7 +186,7 @@ class PolicyClient:
             "--serve", "--socket", str(self.socket_path),
             "--ckpt", str(ckpt), "--device", device,
             "--max-context-tokens", str(max_context_tokens),
-        ]
+        ] + (["--placeholder", placeholder] if placeholder else [])
         print(f"[bridge] launching policy server: {' '.join(cmd)}")
         print(f"[bridge] server log -> {self.log_path}")
         self._log = open(self.log_path, "w")
@@ -238,11 +240,12 @@ def serve_policy(args):
     from longnav.utils.vector_rollout import RolloutConfig, VectorRolloutPolicy
 
     print(f"loading {args.ckpt} on {args.device}...", flush=True)
-    policy = VectorRolloutPolicy.from_checkpoint(
-        args.ckpt,
-        RolloutConfig(device=args.device, merge_lora=True,
-                      max_context_tokens=args.max_context_tokens),
-    )
+    cfg = RolloutConfig(device=args.device, merge_lora=True,
+                        max_context_tokens=args.max_context_tokens)
+    if args.placeholder:
+        cfg.placeholder = args.placeholder
+    policy = VectorRolloutPolicy.from_checkpoint(args.ckpt, cfg)
+    print(policy.describe(), flush=True)
     conn = Client(args.socket, family="AF_UNIX", authkey=AUTHKEY)
     print("connected to sim process", flush=True)
     while True:
@@ -668,6 +671,10 @@ def main():
     p.add_argument("--dataset-dir", default="dump/datasets/action_chunks_conversational")
     p.add_argument("--split", default="validation")
     p.add_argument("--num-episodes", type=int, default=3)
+    p.add_argument("--episode-ids", default=None,
+                   help="comma-separated episode_id values to run. Overrides --select and "
+                        "--num-episodes, so a single named episode costs one episode of "
+                        "compute instead of walking the ordering up to its index")
     p.add_argument("--select", default="first", choices=["first", "longest", "median"],
                    help="'median' picks episodes closest to the split's median length -- "
                         "usually the most informative: the shortest episodes barely move, "
@@ -716,6 +723,10 @@ def main():
                    help="interpreter with torch/transformers, if this env lacks them. "
                         "Defaults to $VECTOR_POLICY_PYTHON")
 
+    p.add_argument("--placeholder", default=None,
+                   help="override the constant assistant placeholder (default: the "
+                        "RolloutConfig default, '**____**'). Must match what the checkpoint "
+                        "was trained with, or the context differs from training")
     p.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--socket", default=None, help=argparse.SUPPRESS)
     args = p.parse_args()
@@ -730,7 +741,8 @@ def main():
         policy = None  # built after the dataset loads (the mean comes from the data)
     elif _importable("transformers") and _importable("torch"):
         policy = LocalPolicy(args.ckpt, device=args.device,
-                             max_context_tokens=args.max_context_tokens)
+                             max_context_tokens=args.max_context_tokens,
+                             placeholder=args.placeholder)
     else:
         if not args.policy_python:
             raise SystemExit(
@@ -739,13 +751,23 @@ def main():
                 "$VECTOR_POLICY_PYTHON)"
             )
         policy = PolicyClient(args.ckpt, args.policy_python, device=args.device,
-                              max_context_tokens=args.max_context_tokens)
+                              max_context_tokens=args.max_context_tokens,
+                              placeholder=args.placeholder)
 
     from datasets import load_from_disk
 
     ds = load_from_disk(os.path.expanduser(args.dataset_dir))
     ds = ds[args.split] if hasattr(ds, "keys") else ds
-    if args.select in ("longest", "median"):
+    if args.episode_ids:
+        wanted = [e for e in args.episode_ids.split(",") if e]
+        keep = [i for i in range(len(ds)) if ds[i]["episode_id"] in wanted]
+        missing = set(wanted) - {ds[i]["episode_id"] for i in keep}
+        if missing:
+            raise SystemExit(f"episode_id(s) not in {args.split}: {sorted(missing)}")
+        ds = ds.select(keep)
+        args.num_episodes = len(ds)
+        print(f"selected {len(ds)} episode(s) by id")
+    elif args.select in ("longest", "median"):
         lengths = [len(ds[i]["images"]) for i in range(len(ds))]
         if args.select == "longest":
             order = sorted(range(len(ds)), key=lambda i: -lengths[i])

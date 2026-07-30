@@ -4,7 +4,7 @@ end-to-end overfit run through `Trainer` + LoRA + gradient checkpointing.
 
 The synthetic task mirrors the intended application without needing the navigation data:
 each turn shows an image whose dominant color encodes a target action chunk of shape
-`(4, 3)`, the assistant message is the fixed `**forward**` placeholder, and the head has
+`(4, 3)`, the assistant message is the fixed `**____**` placeholder, and the head has
 to regress the chunk from that turn's vector. Because the mapping color -> chunk is
 deterministic, a working pipeline must drive the loss down hard; a broken one (no grad
 path through gradient checkpointing, misaligned turns, a detached head) plateaus.
@@ -68,7 +68,7 @@ SYSTEM_PROMPT = "You are a navigation policy. Output the next action."
 # Synthetic dataset in the format the trainer expects
 # ======================================================================================
 def make_episode(rng, image_dir: Path, ep: str, n_turns: int, size: int = 128):
-    """One conversation row: prologue + n_turns of (image -> `**forward**`)."""
+    """One conversation row: prologue + n_turns of (image -> `**____**`)."""
     messages = [{"role": "user", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}]
     image_paths, chunks = [], []
     for t in range(n_turns):
@@ -88,7 +88,7 @@ def make_episode(rng, image_dir: Path, ep: str, n_turns: int, size: int = 128):
                 ],
             },
             # Fixed placeholder: the real action comes from the head, not these tokens.
-            {"role": "assistant", "content": [{"type": "text", "text": "**forward**"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "**____**"}]},
         ]
     return {
         "messages": messages,
@@ -117,7 +117,7 @@ def _toy_conversation(n_turns=5):
     for t in range(n_turns):
         messages += [
             {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": f"o{t}"}]},
-            {"role": "assistant", "content": [{"type": "text", "text": "**forward**"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "**____**"}]},
         ]
     images = [f"img{t}" for t in range(n_turns)]
     targets = torch.arange(n_turns, dtype=torch.float32)[:, None].repeat(1, 3)

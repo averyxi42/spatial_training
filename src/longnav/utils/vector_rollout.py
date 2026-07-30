@@ -7,13 +7,25 @@ rollout buffers. This is the same KV-cache mechanics with none of that -- feed o
 observation, get one continuous action chunk, repeat. Nothing here trains, distributes or
 logs. `vlm_worker.py` is untouched.
 
-The whole thing rests on one property of the training convention (see `vector_sft.py`):
-the head pools the single `**` token that opens each assistant turn. At rollout we simply
-stop the prompt at that token and read `last_hidden_state[:, -1]`, so no span search and
-no generation is needed -- the action for step k is available the moment step k's image is
-encoded. A model trained to pool assistant *content* instead cannot be rolled out this
-way (the content does not exist yet), and `VectorRolloutPolicy` refuses to load one
-rather than silently pooling a different position than it trained on.
+Turn structure is described the way `VLMWorker` describes it: give it the affix strings
+and the constant placeholder, and it derives the rest. `split_assistant_turn` runs the
+*training-time* `find_turn_spans` over the assistant turn to locate the readout positions,
+splits the turn's tokens there into what to emit now and what is owed to the next forward,
+and reports how many positions the head will be handed. `_assert_head_matches_readout`
+then checks that count against the head, because a pooled head accepts the wrong number of
+positions without complaint. Nothing hardcodes `**`, a single readout token, or a
+particular placeholder -- change `RolloutConfig.prefix/postfix/placeholder` and the split
+follows, or fails loudly if that combination cannot be located (e.g. `'**[…]**'`, where BPE
+merges `]` into the closing `**`).
+
+Because the emitted block ends exactly at the last readout position, `step()` reads
+`last_hidden_state[:, -n_readout:]` with no span search, and no generation is needed -- the
+action for step k is available as soon as step k's image is encoded. Those positions are
+text tokens, which the sparsifier never drops.
+
+Composition is done in token ids rather than text: the user block comes from the processor
+(which expands the image placeholder) and the assistant pieces are constant id lists, so
+concatenation cannot merge differently than the training-time single-shot tokenization did.
 
 Per-step mechanics, mirroring `VLMWorker.infer_step`:
 
@@ -32,6 +44,7 @@ asserts this; if it ever drifts, the rollout context stops matching what the mod
 training and the head silently degrades.
 
     policy = VectorRolloutPolicy.from_checkpoint("dump/vector_sft_3090/final")
+    print(policy.describe())                # affixes, emitted tokens, readout width
     policy.reset(goal_text="chest_of_drawers")
     for image in observations:
         chunk = policy.step(image)          # (N_action, 3) in the target's own units
@@ -51,6 +64,8 @@ from longnav.utils.vector_sft import TurnVectorRegressor
 # The assistant turn's closing text, appended to the *next* forward pass because with a
 # KV cache it is context, not output.
 TURN_CLOSE = "<|im_end|>\n"
+# What the chat template emits to open an assistant turn.
+CHAT_ASSISTANT_OPEN = "<|im_start|>assistant\n"
 
 # The canonical prompt, imported by `data_scripts/format_action_chunk_dataset.py` so the
 # training conversations and the rollout context cannot drift apart.
@@ -66,11 +81,21 @@ DEFAULT_SYSTEM_PROMPT = (
 class RolloutConfig:
     """Everything the policy needs that is not stored in the checkpoint.
 
-    `placeholder` and the user-turn strings must match the training data's conversation
-    format; a mismatch changes the context the head was trained under.
+    Turn structure is described the way `VLMWorker` describes it -- by the affix strings --
+    and everything else is derived, so no convention is hardcoded. `prefix`/`postfix`
+    default to the checkpoint's own (`ModelConfig.affixes`), and `placeholder` is the
+    constant assistant message; together with `shift_left` they determine which token
+    positions the head reads, via the same `find_turn_spans` the training used.
+
+    The strings must match the training data's conversation format. A mismatch changes the
+    context the head was trained under, so `VectorRolloutPolicy` re-derives the span and
+    asserts it against what the head expects rather than trusting them.
     """
 
-    placeholder: str = "**forward**"
+    placeholder: str = "**____**"
+    prefix: Optional[str] = None   # None -> from the checkpoint's affixes
+    postfix: Optional[str] = None
+    shift_left: Optional[bool] = None
     user_text_before: str = "Observation {step}:"
     user_text_after: str = "Action:"
     use_sparse: bool = True
@@ -90,8 +115,8 @@ def render_prologue(processor, system_prompt: str) -> str:
     )
 
 
-def render_turn(processor, cfg: RolloutConfig, step: int) -> str:
-    """One turn's user block plus the assistant opening, ending at the `**` token."""
+def render_user_block(processor, cfg: RolloutConfig, step: int) -> str:
+    """One turn's user block, ending with the chat template's assistant opening."""
     user = {
         "role": "user",
         "content": [
@@ -100,13 +125,50 @@ def render_turn(processor, cfg: RolloutConfig, step: int) -> str:
             {"type": "text", "text": cfg.user_text_after},
         ],
     }
-    head = processor.apply_chat_template([user], tokenize=False, add_generation_prompt=True)
-    return head + "**"
+    return processor.apply_chat_template([user], tokenize=False, add_generation_prompt=True)
 
 
-def assistant_tail(cfg: RolloutConfig) -> str:
-    """What is still owed once a turn's action has been read out of the `**` position."""
-    return cfg.placeholder[len("**"):] + TURN_CLOSE
+def assistant_turn_text(cfg: RolloutConfig) -> str:
+    """The complete assistant turn as it appears in training data."""
+    return CHAT_ASSISTANT_OPEN + cfg.placeholder + TURN_CLOSE
+
+
+def split_assistant_turn(tokenizer, cfg: RolloutConfig, prefix_ids, postfix_ids,
+                         shift_left: bool):
+    """Split the assistant turn at the readout boundary. Returns (emit, tail, n_readout).
+
+    `emit` is everything up to and including the last position the head reads, so a forward
+    pass ending there leaves those states as the final `n_readout` positions of the
+    sequence -- which is why `step()` can take `last_hidden_state[:, -n:]` with no span
+    search. `tail` is the remainder, owed to the next forward because with a KV cache it is
+    context rather than output.
+
+    The split is found with `find_turn_spans` -- the same function training used -- so any
+    affix/placeholder combination is handled without special cases, and a combination that
+    cannot be split (e.g. `'**[…]**'`, where BPE merges `]` into the closing `**` so the
+    postfix never matches) fails here instead of silently training on nothing.
+    """
+    import torch as _torch
+
+    from longnav.utils.turn_vectors import find_turn_spans
+
+    turn = tokenizer.encode(assistant_turn_text(cfg), add_special_tokens=False)
+    # Two copies: find_turn_spans needs a closed turn, and repeating it proves the split is
+    # stable rather than an artifact of the sequence end.
+    ids = _torch.tensor([turn * 2])
+    spans = find_turn_spans(ids, prefix_ids, postfix_ids, shift_left=shift_left)[0]
+    if len(spans) != 2:
+        raise ValueError(
+            f"placeholder {cfg.placeholder!r} with prefix {tokenizer.decode(prefix_ids)!r} / "
+            f"postfix {tokenizer.decode(postfix_ids)!r} yields {len(spans)} readout span(s) "
+            f"in two turns, expected 2. Its tokens are "
+            f"{[tokenizer.decode([t]) for t in turn]} -- a placeholder whose characters "
+            "merge into the affixes cannot be located"
+        )
+    start, end = spans[0].start, spans[0].end
+    if end > len(turn):
+        raise ValueError("readout span crosses the turn boundary; check the affixes")
+    return turn[:end], turn[end:], end - start
 
 
 def full_context_text(processor, cfg: RolloutConfig, n_turns: int,
@@ -116,8 +178,8 @@ def full_context_text(processor, cfg: RolloutConfig, n_turns: int,
     `tests/test_vector_rollout.py`."""
     parts = [render_prologue(processor, system_prompt)] if system_prompt else []
     for i in range(n_turns):
-        parts.append(render_turn(processor, cfg, i))
-        parts.append(assistant_tail(cfg))
+        parts.append(render_user_block(processor, cfg, i))
+        parts.append(cfg.placeholder + TURN_CLOSE)
     return "".join(parts)
 
 
@@ -129,18 +191,26 @@ class VectorRolloutPolicy:
         self.model = model
         self.processor = processor
 
-        if not (self.model.model_cfg.affixes == "action" and self.model.model_cfg.shift_left):
-            raise ValueError(
-                "step-by-step rollout requires a model trained with affixes='action' and "
-                f"shift_left=True (got affixes={self.model.model_cfg.affixes!r}, "
-                f"shift_left={self.model.model_cfg.shift_left}). Any other convention "
-                "pools assistant content, which does not exist until it is generated."
-            )
-        if not self.cfg.placeholder.startswith("**"):
-            raise ValueError(
-                f"placeholder {self.cfg.placeholder!r} must start with '**' to match "
-                "ACTION_PREFIX, which is the token the head pools"
-            )
+        # Affixes come from the checkpoint unless overridden, exactly as VLMWorker takes
+        # them from config: no convention is assumed anywhere below.
+        from longnav.utils.turn_vectors import resolve_affix_ids
+
+        from longnav.utils.vector_sft import affix_strings
+
+        ckpt_prefix, ckpt_postfix = affix_strings(self.model.model_cfg.affixes)
+        self.prefix = self.cfg.prefix if self.cfg.prefix is not None else ckpt_prefix
+        self.postfix = self.cfg.postfix if self.cfg.postfix is not None else ckpt_postfix
+        self.shift_left = (
+            self.cfg.shift_left if self.cfg.shift_left is not None
+            else self.model.model_cfg.shift_left
+        )
+        self.prefix_ids, self.postfix_ids = resolve_affix_ids(
+            processor.tokenizer, self.prefix, self.postfix
+        )
+        self.emit_ids, self.tail_ids, self.n_readout = split_assistant_turn(
+            processor.tokenizer, self.cfg, self.prefix_ids, self.postfix_ids, self.shift_left
+        )
+        self._assert_head_matches_readout()
 
         self.model.to(self.cfg.device).eval()
         backbone = self.model.backbone
@@ -156,6 +226,41 @@ class VectorRolloutPolicy:
         self.vl_model = self.vl_for_cond_gen.model
         self.language_model = self.vl_model.language_model
         self.reset()
+
+    def _assert_head_matches_readout(self):
+        """The head pools a fixed number of positions; the affixes must produce that many.
+
+        Cheap to check, and the failure it prevents is silent: a head trained on 3 content
+        tokens fed 1 position (or vice versa) still returns a vector of the right shape.
+        """
+        head = self.model.head
+        if head.mode == "flat" and head.content_len != self.n_readout:
+            raise ValueError(
+                f"head was trained with mode='flat' over {head.content_len} position(s) but "
+                f"placeholder {self.cfg.placeholder!r} with these affixes yields "
+                f"{self.n_readout}; the flat head's input width would not match"
+            )
+        if self.n_readout < 1:
+            raise ValueError("affixes yield an empty readout span")
+        # Any pooling mode still has to see the same *number* of positions it trained on,
+        # or the pooled statistic changes meaning even though the shapes work out.
+        trained = getattr(self.model, "train_content_len", None)
+        if trained is not None and trained != self.n_readout:
+            raise ValueError(
+                f"head was trained pooling {trained} position(s) per turn, rollout would "
+                f"pool {self.n_readout}"
+            )
+
+    def describe(self) -> str:
+        tok = self.processor.tokenizer
+        return (
+            f"prefix={self.prefix!r} postfix={self.postfix!r} "
+            f"placeholder={self.cfg.placeholder!r} shift_left={self.shift_left}\n"
+            f"  emitted per turn: {[tok.decode([t]) for t in self.emit_ids]}\n"
+            f"  readout: last {self.n_readout} token(s) = "
+            f"{[tok.decode([t]) for t in self.emit_ids[-self.n_readout:]]}\n"
+            f"  owed to next turn: {[tok.decode([t]) for t in self.tail_ids]}"
+        )
 
     # ---------------------------------------------------------------------------------
     @classmethod
@@ -194,54 +299,91 @@ class VectorRolloutPolicy:
         self.step_index = 0
         self.cached_tokens = 0
         self.dense_tokens = 0
-        self._pending = ""  # previous assistant turn's tail, owed to the next forward
         if system_prompt is None and goal_text is not None:
             system_prompt = DEFAULT_SYSTEM_PROMPT.format(goal=goal_text)
-        self._pending = self._render_prologue(system_prompt) if system_prompt else ""
+        # Owed to the next forward pass, as token ids: the prologue on the first step, the
+        # previous turn's tail afterwards.
+        self._pending: List[int] = (
+            self.processor.tokenizer.encode(
+                render_prologue(self.processor, system_prompt), add_special_tokens=False
+            )
+            if system_prompt
+            else []
+        )
         self.last_stats: Dict[str, Any] = {}
         return self
 
     def _render_prologue(self, system_prompt: str) -> str:
         return render_prologue(self.processor, system_prompt)
 
-    def _render_turn(self, step: int) -> str:
-        return render_turn(self.processor, self.cfg, step)
-
-    def assistant_tail(self) -> str:
-        return assistant_tail(self.cfg)
-
     # ---------------------------------------------------------------------------------
     @torch.inference_mode()
     def step(self, image, user_text: Optional[str] = None) -> torch.Tensor:
-        """Encode one observation and return its action chunk, shaped `target_shape`."""
-        text = self._pending + (
-            user_text + "**" if user_text is not None else self._render_turn(self.step_index)
+        """Encode one observation and return its action chunk, shaped `target_shape`.
+
+        Composition is done in *token ids*, not text: the user block comes from the
+        processor (which expands the image placeholder), and the assistant pieces are the
+        constant `tail`/`emit` id lists derived once in `__init__`. Concatenating ids
+        removes any chance of BPE merging differently at a chunk boundary than it did in
+        the training-time single-shot tokenization.
+        """
+        block = self._render_user_block(image, user_text)
+        ids = torch.tensor(
+            [self._pending + block["input_ids"][0].tolist() + self.emit_ids],
+            dtype=torch.long,
         )
-        inputs = self.processor(
-            text=text, images=[image], videos=None, padding=False, return_tensors="pt"
-        )
+        inputs = {
+            k: v for k, v in block.items()
+            # The processor's mask/ids describe the user block alone; ids below are the
+            # concatenation, so a stale mask would be shorter than the sequence and
+            # get_rope_index would index past it.
+            if k not in ("input_ids", "attention_mask") and v is not None
+        }
+        inputs["input_ids"] = ids
+        inputs["attention_mask"] = torch.ones_like(ids)
+
         t0 = time.perf_counter()
         outputs = self._forward(inputs)
 
-        # The prompt ends at the `**` the head was trained to pool, so the position is
-        # simply the last one -- and it is a text token, hence never sparsified away.
-        hidden = outputs["last_hidden_state"][:, -1:, :]
-        vector = self.model.head(hidden.to(next(self.model.head.parameters()).dtype))
+        # The emitted block ends exactly at the last readout position, so the states the
+        # head wants are the final `n_readout` of the sequence -- no span search needed, and
+        # they are text tokens, which the sparsifier never drops.
+        n = self.n_readout
+        hidden = outputs["last_hidden_state"][:, -n:, :]
+        head_dtype = next(self.model.head.parameters()).dtype
+        vector = self.model.head(hidden.to(head_dtype))
         chunk = self.model.normalizer.denormalize(
             vector.view(-1, *self.model.target_shape)
         )[0].float().cpu()
 
-        self._pending = self.assistant_tail()
+        self._pending = list(self.tail_ids)
         self.step_index += 1
         self.last_stats = {
             "step": self.step_index,
-            "new_tokens": int(inputs["input_ids"].shape[1]),
+            "new_tokens": int(ids.shape[1]),
+            "readout_tokens": n,
             "sparse_tokens": int(outputs["last_hidden_state"].shape[1]),
             "cached_tokens": self.cached_tokens,
             "dense_tokens": self.dense_tokens,
             "latency_s": time.perf_counter() - t0,
         }
         return chunk
+
+    def _render_user_block(self, image, user_text: Optional[str]):
+        """Processor output for this turn's user block (image expanded), without the
+        assistant opening -- that comes from `emit_ids`."""
+        text = (
+            user_text
+            if user_text is not None
+            else render_user_block(self.processor, self.cfg, self.step_index)
+        )
+        # The chat template already appends the assistant opening; drop it, since emit_ids
+        # carries the opening plus whatever of the placeholder precedes the readout.
+        if text.endswith(CHAT_ASSISTANT_OPEN):
+            text = text[: -len(CHAT_ASSISTANT_OPEN)]
+        return self.processor(
+            text=text, images=[image], videos=None, padding=False, return_tensors="pt"
+        )
 
     def _forward(self, inputs):
         device = self.cfg.device

@@ -11,10 +11,15 @@ Grounding example (the shape this was built against, without being specific to i
 vision-language navigation where each turn's target is an action chunk of
 `[N_action, 3]` relative poses `(dx, dy, dtheta)`. `data_scripts/build_*_dataset.py` in
 the `continuous_demos` project emits exactly this -- per-observation image plus an
-`action_chunks` column of shape `(n_obs, N_action, 3)` -- and its conversation builder
-writes `**forward**` as the assistant message with the comment "actual action will be
-predicted by a different head than LMHead". Nothing below knows any of that: the target
-is an arbitrary fixed-shape tensor from a configurable column.
+`action_chunks` column of shape `(n_obs, N_action, 3)`, and the conversation builder writes
+a constant placeholder as the assistant message because the action comes from this head
+rather than from `lm_head`. Nothing below knows any of that: the target is an arbitrary
+fixed-shape tensor from a configurable column.
+
+The placeholder is `**____**` (see `docs/placeholder_tokens.md`). It is not `**forward**`
+because that asserts a false action history -- the placeholder stays in the KV cache for
+every later turn, so a 200-observation episode would claim the robot went forward 200
+times. `____` is a single token (id 2130) that reads as an elision instead.
 
 What the dataset must provide
 -----------------------------
@@ -36,7 +41,9 @@ With `ACTION_PREFIX`/`ACTION_POSTFIX` and `shift_left=True`, the pooled span is 
 single `**` token that opens every assistant turn. Two consequences, both wanted:
 
   * The assistant content is a constant placeholder, so pooling it adds nothing -- the
-    vector is a pure function of the multimodal context up to that turn.
+    vector is a pure function of the multimodal context up to that turn. The `**` opener
+    also carries a "a word follows" prior from pretraining, which measurably keeps the
+    readout more sensitive to the image than a bare placeholder token does.
   * At inference the prompt ends `<|im_start|>assistant\\n**`, so that position exists
     *before* anything is generated. The head can be read turn-by-turn during rollout
     with no generation at all, which is what makes a continuous-action policy possible.
@@ -409,6 +416,10 @@ class TurnVectorRegressor(nn.Module):
         self.postfix_ids = list(postfix_ids)
         self.model_cfg = model_cfg
         self.loss_cfg = loss_cfg
+        # How many positions per turn the head pools. Observed on the first forward and
+        # saved with the checkpoint, so inference can assert its affixes reproduce it --
+        # a pooled head silently accepts the wrong count.
+        self.train_content_len: Optional[int] = None
 
     # -- construction ------------------------------------------------------------------
     @classmethod
@@ -564,6 +575,8 @@ class TurnVectorRegressor(nn.Module):
                 f"Last 64 input_ids: {tail}"
             )
 
+        if self.train_content_len is None and spans:
+            self.train_content_len = int(len(spans[0]))
         targets = targets.to(next(self.head.parameters()).dtype).to(vectors.device)
         pred = vectors.view(-1, *self.target_shape)
         tgt_norm = self.normalizer.normalize(targets)
@@ -614,6 +627,7 @@ class TurnVectorRegressor(nn.Module):
                     "model": asdict(self.model_cfg),
                     "loss": asdict(self.loss_cfg),
                     "target_shape": list(self.target_shape),
+                    "train_content_len": self.train_content_len,
                     "prefix_ids": self.prefix_ids,
                     "postfix_ids": self.postfix_ids,
                 },
@@ -684,6 +698,7 @@ class TurnVectorRegressor(nn.Module):
             model_cfg, loss_cfg, lora=None,
             target_shape=meta["target_shape"], processor=processor, dtype=dtype,
         )
+        model.train_content_len = meta.get("train_content_len")
         adapter_dir = checkpoint_dir / ADAPTER_SUBDIR
         if adapter_dir.exists():
             from peft import PeftModel
