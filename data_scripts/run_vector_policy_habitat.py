@@ -546,10 +546,11 @@ def main():
     p.add_argument("--dataset-dir", default="dump/datasets/action_chunks_conversational")
     p.add_argument("--split", default="validation")
     p.add_argument("--num-episodes", type=int, default=3)
-    p.add_argument("--select", default="first", choices=["first", "longest"],
-                   help="'longest' picks the episodes with the most observations, which is "
-                        "what you want for a long-horizon run: short episodes cap the "
-                        "rollout well before --max-steps")
+    p.add_argument("--select", default="first", choices=["first", "longest", "median"],
+                   help="'median' picks episodes closest to the split's median length -- "
+                        "usually the most informative: the shortest episodes barely move, "
+                        "and the longest are outliers where the demonstrator got lost. "
+                        "'longest' maximizes horizon at the cost of that bias")
     p.add_argument("--max-steps", type=int, default=24,
                    help="policy steps per episode (0 = the whole episode). Each step adds "
                         "~330 tokens to the KV cache, so long episodes are a memory cost")
@@ -606,10 +607,15 @@ def main():
 
     ds = load_from_disk(os.path.expanduser(args.dataset_dir))
     ds = ds[args.split] if hasattr(ds, "keys") else ds
-    if args.select == "longest":
-        order = sorted(range(len(ds)), key=lambda i: -len(ds[i]["images"]))
+    if args.select in ("longest", "median"):
+        lengths = [len(ds[i]["images"]) for i in range(len(ds))]
+        if args.select == "longest":
+            order = sorted(range(len(ds)), key=lambda i: -lengths[i])
+        else:
+            median = sorted(lengths)[len(lengths) // 2]
+            order = sorted(range(len(ds)), key=lambda i: abs(lengths[i] - median))
         ds = ds.select(order[: args.num_episodes])
-        print(f"selected the {len(ds)} longest episode(s): "
+        print(f"selected {len(ds)} {args.select} episode(s): "
               f"{[len(ds[i]['images']) for i in range(len(ds))]} observations")
     mean_chunk = dataset_mean_chunk(ds)
     if policy is None:
