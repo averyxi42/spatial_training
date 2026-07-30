@@ -285,6 +285,26 @@ def goal_distance(planar_pose, goal_xy: np.ndarray) -> float:
     return float(d.min())
 
 
+def annotate_frame(rgb, step, dtg, dtg_start, goal):
+    """Burn the step index, goal and distance-to-goal into the frame.
+
+    Overlaying on a *copy* used only for the video -- the policy never sees these pixels
+    (it is handed the raw frame before this is called).
+    """
+    import cv2
+
+    img = np.ascontiguousarray(rgb).copy()
+    bar = 34
+    cv2.rectangle(img, (0, 0), (img.shape[1], bar), (0, 0, 0), -1)
+    closer = dtg <= dtg_start
+    cv2.putText(img, f"step {step:>3}  goal: {goal}", (8, 23),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(img, f"dist {dtg:5.2f} m  (start {dtg_start:5.2f})",
+                (img.shape[1] - 275, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (120, 255, 160) if closer else (140, 160, 255), 1, cv2.LINE_AA)
+    return img
+
+
 def plot_goal_progress(out_path, episode_id, goal_category, ref, actual, goal_xy,
                        dtg_trace, dtg_ref_trace=None):
     """Two panels: the path from above with the goal marked, and distance-to-goal vs step."""
@@ -470,9 +490,17 @@ def run_closed_loop(policy, dataset, args):
         dtg = lambda pose: goal_distance(pose, goal_xy)  # noqa: E731
         actual, pred_chunks, latencies = [robot_sim.get_2d_pose()], [], []
         dtg_trace = [dtg(actual[0])]
+        frames = []
         for i in range(n_steps):
             rgb = np.asarray(robot_sim.get_obs()[args.sensor_uuid])[..., :3]
             pose_now = robot_sim.get_2d_pose()
+            if args.record_video:
+                # The observation the policy is about to act on, annotated with what it
+                # knows and how it is doing -- so the video explains itself.
+                frames.append(
+                    annotate_frame(rgb, step=i, dtg=dtg_trace[-1],
+                                   dtg_start=dtg_trace[0], goal=ex.get("goal_text"))
+                )
             chunk = policy.act(np.ascontiguousarray(rgb, dtype=np.uint8))
             pred_chunks.append(chunk)
             latencies.append(policy.last_stats.get("latency_s", float("nan")))
@@ -492,6 +520,17 @@ def run_closed_loop(policy, dataset, args):
             )
             actual.extend(seg["actual_poses"])
             dtg_trace.append(dtg(robot_sim.get_2d_pose()))
+
+        if args.record_video and frames:
+            import imageio.v2 as imageio
+
+            video_path = (
+                out_dir / "videos"
+                / f"{args.policy}_{e}_{ex['episode_id'].replace(':', '_')}.mp4"
+            )
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+            imageio.mimsave(video_path, frames, fps=args.video_fps)
+            print(f"        video -> {video_path}")
 
         actual = np.asarray(actual, dtype=float)
         n = min(len(actual), len(ref_traj))
@@ -572,6 +611,11 @@ def main():
     s.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     s.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
     s.add_argument("--sensor-uuid", default="color_sensor")
+    s.add_argument("--record-video", action="store_true",
+                   help="write an MP4 per episode of exactly the frames the policy saw, "
+                        "annotated with step and distance to goal")
+    s.add_argument("--video-fps", type=int, default=8,
+                   help="policy steps are 0.25 s apart, so 4 fps is real time")
     s.add_argument("--success-distance", type=float, default=1.0,
                    help="geodesic distance to a goal view point counted as reaching it")
     s.add_argument("--max-context-tokens", type=int, default=110000,
