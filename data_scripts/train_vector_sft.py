@@ -297,6 +297,12 @@ def main():
 
     if not args.no_preflight and is_main:
         model.to("cuda" if torch.cuda.is_available() else "cpu")
+        if args.resume_from:
+            # Preflight runs before Trainer restores the checkpoint, so without this the
+            # reported loss would be the freshly initialized head's -- alarming and
+            # meaningless on a resumed run. Loading here is idempotent with the restore.
+            model.load_trainable(args.resume_from)
+            print(f"[preflight] loaded trainable weights from {args.resume_from}")
         preflight(model, train_collator, train_ds, processor, model_cfg)
 
     # ---- trainer -------------------------------------------------------------------
