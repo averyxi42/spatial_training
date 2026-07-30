@@ -24,16 +24,20 @@ than carried into training, where they would trip the trainer's alignment assert
 
 import argparse
 import os
+import sys
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+for p in (str(_ROOT), str(_ROOT / "src")):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 from datasets import DatasetDict, load_from_disk
 
-SYSTEM_PROMPT = (
-    "You are a robot navigating an indoor environment toward a goal object.\n"
-    "Goal: {goal}\n"
-    "At each step you receive the current RGB observation. Produce the next short "
-    "trajectory of poses to follow, relative to your current pose."
-)
+# Imported, not duplicated: `vector_rollout.py` builds the rollout context from the same
+# string, and a silent divergence between the two would change the head's input
+# distribution at deployment without any error.
+from longnav.utils.vector_rollout import DEFAULT_SYSTEM_PROMPT as SYSTEM_PROMPT
 
 
 def build_messages(example, placeholder: str, goal_column: str, images_column: str):

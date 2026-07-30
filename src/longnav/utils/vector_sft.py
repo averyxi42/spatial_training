@@ -834,6 +834,12 @@ class TurnVectorSFTTrainer(Trainer):
         # `eval_loss` is the key `load_best_model_at_end` / early stopping look for.
         if f"{metric_key_prefix}_turn_loss" in metrics:
             metrics[f"{metric_key_prefix}_loss"] = metrics[f"{metric_key_prefix}_turn_loss"]
+        # Explicit print: the callback that echoes `log()` to stdout does not surface
+        # these when a tqdm bar owns the terminal, and a silent eval is worse than noise.
+        if self.args.local_rank in (-1, 0):
+            print("  " + "  ".join(
+                f"{k}={v:.4f}" for k, v in sorted(metrics.items()) if isinstance(v, float)
+            ), flush=True)
         self.log(metrics)
         self.control = self.callback_handler.on_evaluate(
             self.args, self.state, self.control, metrics
