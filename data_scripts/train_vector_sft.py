@@ -25,7 +25,7 @@ Single GPU:
 Multi-GPU (DDP; per-device batch is forced to 1, so scale with accumulation x ranks):
 
     torchrun --nproc_per_node=4 data_scripts/train_vector_sft.py \
-        --train-dataset ... --grad-accum 8 --output-dir dump/vector_sft_run1
+        --train-dataset data/continuous_sft_formatted --grad-accum 8 --output-dir dump/vector_sft_run1
 
 Resume:
 
@@ -88,7 +88,7 @@ def parse_args():
 
     m = p.add_argument_group("model / head")
     m.add_argument("--model-id", default="Qwen/Qwen3-VL-2B-Instruct")
-    m.add_argument("--attn-impl", default="sdpa", choices=["sdpa", "flash_attention_2"])
+    m.add_argument("--attn-impl", default="flash_attention_2", choices=["sdpa", "flash_attention_2"])
     # A turn is prefix + content + postfix; these ARE the affixes, not a named preset.
     # Escapes are decoded, so '\n' can be written literally on the command line.
     m.add_argument("--prefix", default=ACTION_PREFIX,
@@ -129,7 +129,7 @@ def parse_args():
     t.add_argument("--head-lr", type=float, default=None,
                    help="separate LR for the head (defaults to --lr). A fresh head "
                         "usually wants a larger step than the adapters")
-    t.add_argument("--weight-decay", type=float, default=0.01)
+    t.add_argument("--weight-decay", type=float, default=0.001)
     t.add_argument("--grad-accum", type=int, default=8)
     t.add_argument("--max-steps", type=int, default=5000)
     t.add_argument("--warmup-ratio", type=float, default=0.03)

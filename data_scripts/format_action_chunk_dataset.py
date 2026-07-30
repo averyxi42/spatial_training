@@ -82,7 +82,8 @@ def main():
                         "(see docs/placeholder_tokens.md)")
     p.add_argument("--image-root", default=None,
                    help="prepend to relative image paths (the builder may emit relative ones)")
-    p.add_argument("--val-fraction", type=float, default=0.1)
+    p.add_argument("--val-fraction", type=float, default=0.1, help = "only used if --val-split is not set")
+    p.add_argument("--val-split", default=None, help="split to read validation rows from when the input is a DatasetDict")
     p.add_argument("--max-turns", type=int, default=0,
                    help="drop episodes with more observations than this (0 = keep all). "
                         "The trainer windows long episodes anyway; this is for pruning "
@@ -92,8 +93,7 @@ def main():
     args = p.parse_args()
 
     ds = load_from_disk(os.path.expanduser(args.in_dir))
-    if hasattr(ds, "keys"):
-        ds = ds[args.split]
+   
     print(f"Loaded {len(ds)} episode(s) from {args.in_dir}")
 
     def consistent(ex):
@@ -134,11 +134,14 @@ def main():
         desc="messages",
     )
 
-    if args.val_fraction > 0:
+    if args.val_fraction > 0 and args.val_split is None:
         split = ds.train_test_split(test_size=args.val_fraction, seed=args.seed)
         out = DatasetDict({"train": split["train"], "validation": split["test"]})
     else:
-        out = DatasetDict({"train": ds})
+        if args.val_split is not None:
+            out = DatasetDict({"train": ds[args.split], "validation": ds[args.val_split]})
+        else:
+            out = DatasetDict({"train": ds})
 
     Path(args.out_dir).parent.mkdir(parents=True, exist_ok=True)
     out.save_to_disk(args.out_dir)
