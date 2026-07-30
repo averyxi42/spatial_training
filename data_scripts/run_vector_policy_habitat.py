@@ -137,6 +137,38 @@ class ConstantPolicy:
         pass
 
 
+class OraclePolicy:
+    """VERIFICATION: replays the dataset's ground-truth chunk at every step.
+
+    Not a baseline -- a test of the harness. The chunks are lossless relative encodings of
+    the recorded trajectory, so driving them through this loop must reproduce that
+    trajectory to within the PID controller's own tracking error. A large error here means
+    the execution timing is wrong (bad `gap`, wrong `dt`, or anchoring against the wrong
+    pose), and every policy number measured through the loop would be suspect.
+    """
+
+    def __init__(self):
+        self.rows, self.i = None, 0
+
+    def set_episode(self, rows):
+        self.rows, self.i = rows, 0
+
+    def reset(self, goal_text):
+        self.i = 0
+
+    def act(self, rgb):
+        chunk = np.asarray(self.rows[self.i]["action_chunk"], dtype=float)
+        self.i += 1
+        return chunk
+
+    @property
+    def last_stats(self):
+        return {"latency_s": 0.0}
+
+    def close(self):
+        pass
+
+
 class PolicyClient:
     """Runs the policy in a subprocess under a different interpreter."""
 
@@ -285,7 +317,7 @@ def goal_distance(planar_pose, goal_xy: np.ndarray) -> float:
     return float(d.min())
 
 
-def annotate_frame(rgb, step, dtg, dtg_start, goal):
+def annotate_frame(rgb, step, dtg, dtg_start, goal, t=None, is_obs=False):
     """Burn the step index, goal and distance-to-goal into the frame.
 
     Overlaying on a *copy* used only for the video -- the policy never sees these pixels
@@ -297,7 +329,12 @@ def annotate_frame(rgb, step, dtg, dtg_start, goal):
     bar = 34
     cv2.rectangle(img, (0, 0), (img.shape[1], bar), (0, 0, 0), -1)
     closer = dtg <= dtg_start
-    cv2.putText(img, f"step {step:>3}  goal: {goal}", (8, 23),
+    label = f"step {step:>3}  goal: {goal}"
+    if t is not None:
+        label += f"   t={t:5.2f}s"
+    if is_obs:
+        label += "  [obs]"  # the frames the policy actually acts on
+    cv2.putText(img, label, (8, 23),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(img, f"dist {dtg:5.2f} m  (start {dtg_start:5.2f})",
                 (img.shape[1] - 275, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -454,6 +491,8 @@ def run_closed_loop(policy, dataset, args):
         episode = episodes_by_id[ex["episode_id"]]
         rows = episode_rows(ex)[args.start_obs:]
         n_steps = min(args.max_steps, len(rows)) if args.max_steps else len(rows)
+        if hasattr(policy, "set_episode"):
+            policy.set_episode(rows)
         dt_native = float(ex["dt_native"])
 
         # Ground truth for reference: the trajectory the recorded chunks decode to.
@@ -490,16 +529,17 @@ def run_closed_loop(policy, dataset, args):
         dtg = lambda pose: goal_distance(pose, goal_xy)  # noqa: E731
         actual, pred_chunks, latencies = [robot_sim.get_2d_pose()], [], []
         dtg_trace = [dtg(actual[0])]
-        frames = []
+        frames, lag = [], []
+        sim_time = 0.0  # simulated seconds, = ticks * dt_native
         for i in range(n_steps):
             rgb = np.asarray(robot_sim.get_obs()[args.sensor_uuid])[..., :3]
             pose_now = robot_sim.get_2d_pose()
             if args.record_video:
-                # The observation the policy is about to act on, annotated with what it
-                # knows and how it is doing -- so the video explains itself.
+                # The observation the policy is about to act on. Reuses the frame already
+                # rendered for the policy, so this costs nothing.
                 frames.append(
-                    annotate_frame(rgb, step=i, dtg=dtg_trace[-1],
-                                   dtg_start=dtg_trace[0], goal=ex.get("goal_text"))
+                    annotate_frame(rgb, step=i, dtg=dtg_trace[-1], dtg_start=dtg_trace[0],
+                                   goal=ex.get("goal_text"), t=sim_time, is_obs=True)
                 )
             chunk = policy.act(np.ascontiguousarray(rgb, dtype=np.uint8))
             pred_chunks.append(chunk)
@@ -514,12 +554,48 @@ def run_closed_loop(policy, dataset, args):
                 else len(chunk)
             )
             gap = int(np.clip(gap, 1, len(chunk)))
-            setpoints = np.stack([relative_to_pose(pose_now, chunk[j]) for j in range(gap)])
-            seg = track_trajectory(
-                robot_sim, controller, setpoints, dt=dt_native, initial_pose=pose_now
+            # Anchor. 'current' is what a deployed policy must do: its chunk is relative to
+            # where it actually is. 'recorded' anchors on the dataset's own obs_pose, which
+            # only makes sense for the oracle -- it isolates how much of the closed-loop
+            # error is chunk execution versus drift from re-anchoring on a lagging pose.
+            anchor = (
+                np.asarray(rows[i]["obs_pose"], dtype=float)
+                if args.anchor == "recorded"
+                else pose_now
             )
-            actual.extend(seg["actual_poses"])
+            setpoints = np.stack([relative_to_pose(anchor, chunk[j]) for j in range(gap)])
+            if args.record_video:
+                # Tick by tick so the video has one frame per dt_native and therefore
+                # plays back in real time at 1/dt_native fps. Feeding one setpoint at a
+                # time with initial_pose=<previous setpoint> reproduces track_trajectory's
+                # own finite-difference feedforward exactly, and the controller instance
+                # carries its integral state across the calls, so the control is unchanged.
+                prev = pose_now
+                for j, setpoint in enumerate(setpoints):
+                    seg = track_trajectory(
+                        robot_sim, controller, setpoint[None, :], dt=dt_native,
+                        initial_pose=prev,
+                    )
+                    actual.extend(seg["actual_poses"])
+                    prev = setpoint
+                    sim_time += dt_native
+                    if j < gap - 1:  # the next step's [obs] frame covers the last tick
+                        frames.append(
+                            annotate_frame(
+                                np.asarray(robot_sim.get_obs()[args.sensor_uuid])[..., :3],
+                                step=i, dtg=dtg(robot_sim.get_2d_pose()),
+                                dtg_start=dtg_trace[0], goal=ex.get("goal_text"),
+                                t=sim_time,
+                            )
+                        )
+            else:
+                seg = track_trajectory(
+                    robot_sim, controller, setpoints, dt=dt_native, initial_pose=pose_now
+                )
+                actual.extend(seg["actual_poses"])
+                sim_time += gap * dt_native
             dtg_trace.append(dtg(robot_sim.get_2d_pose()))
+            lag.append(float(np.linalg.norm(robot_sim.get_2d_pose()[:2] - setpoints[-1][:2])))
 
         if args.record_video and frames:
             import imageio.v2 as imageio
@@ -529,8 +605,11 @@ def run_closed_loop(policy, dataset, args):
                 / f"{args.policy}_{e}_{ex['episode_id'].replace(':', '_')}.mp4"
             )
             video_path.parent.mkdir(parents=True, exist_ok=True)
-            imageio.mimsave(video_path, frames, fps=args.video_fps)
-            print(f"        video -> {video_path}")
+            # Real time by construction: one frame per control tick of dt_native.
+            fps = args.video_fps or round(1.0 / dt_native)
+            imageio.mimsave(video_path, frames, fps=fps)
+            print(f"        video -> {video_path} ({len(frames)} frames @ {fps} fps = "
+                  f"{len(frames) / fps:.1f} s, sim time {sim_time:.1f} s)")
 
         actual = np.asarray(actual, dtype=float)
         n = min(len(actual), len(ref_traj))
@@ -556,7 +635,11 @@ def run_closed_loop(policy, dataset, args):
         metrics = compute_metrics(actual[:n], ref_traj[:n])
         metrics.update(
             episode=ex["episode_id"], model_steps=n_steps, ticks=int(n),
-            mean_policy_latency_s=float(np.nanmean(latencies)), **goal,
+            mean_policy_latency_s=float(np.nanmean(latencies)),
+            # How far the robot is from the last setpoint of each chunk when the next
+            # observation arrives: the controller lag that closed-loop drift accumulates.
+            mean_tracking_lag_m=float(np.mean(lag)), max_tracking_lag_m=float(np.max(lag)),
+            **goal,
         )
         results.append(metrics)
         plot_goal_progress(
@@ -599,10 +682,12 @@ def main():
                         "few observations are not representative of the whole trajectory")
     p.add_argument("--output-dir", default="dump/vector_policy_eval")
     p.add_argument("--device", default="cuda")
-    p.add_argument("--policy", default="model", choices=["model", "zero", "mean"],
+    p.add_argument("--policy", default="model",
+                   choices=["model", "zero", "mean", "oracle"],
                    help="CONTROL: 'zero' stands still, 'mean' replays the dataset mean "
                         "chunk. Both ignore the image, so they bound what an image-blind "
-                        "policy achieves on this data")
+                        "policy achieves on this data. 'oracle' replays the ground-truth "
+                        "chunks, which verifies the harness rather than any policy")
 
     s = p.add_argument_group("closed loop / simulator")
     s.add_argument("--demo-dataset", default=None,
@@ -614,8 +699,14 @@ def main():
     s.add_argument("--record-video", action="store_true",
                    help="write an MP4 per episode of exactly the frames the policy saw, "
                         "annotated with step and distance to goal")
-    s.add_argument("--video-fps", type=int, default=8,
-                   help="policy steps are 0.25 s apart, so 4 fps is real time")
+    s.add_argument("--video-fps", type=int, default=0,
+                   help="0 (default) = real time: frames are captured once per control "
+                        "tick, so the rate is 1/dt_native (20 fps for this data). Override "
+                        "only to deliberately speed up or slow down playback")
+    s.add_argument("--anchor", default="current", choices=["current", "recorded"],
+                   help="pose each chunk is de-relativized against. 'recorded' is a "
+                        "diagnostic for --policy oracle only; a real policy has no access "
+                        "to the recorded pose")
     s.add_argument("--success-distance", type=float, default=1.0,
                    help="geodesic distance to a goal view point counted as reaching it")
     s.add_argument("--max-context-tokens", type=int, default=110000,
@@ -632,7 +723,10 @@ def main():
     if args.serve:
         return serve_policy(args)
 
-    if args.policy != "model":
+    if args.policy == "oracle":
+        policy = OraclePolicy()
+        print("VERIFICATION policy: oracle (replays ground-truth chunks)")
+    elif args.policy != "model":
         policy = None  # built after the dataset loads (the mean comes from the data)
     elif _importable("transformers") and _importable("torch"):
         policy = LocalPolicy(args.ckpt, device=args.device,
