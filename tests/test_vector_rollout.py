@@ -153,21 +153,24 @@ def test_elided_placeholder_is_rejected(processor):
         split_assistant_turn(processor.tokenizer, cfg, pre, post, shift_left=True)
 
 
-@pytest.mark.parametrize("placeholder,affixes,shift,expect_readout,expect_emit_tail", [
-    # current design: '**' pooled via shift_left, placeholder body owed to the next turn
-    ("**____**", "action", True, ["**"], ["____", "**", "<|im_end|>", "\n"]),
-    # pool the placeholder itself, no ** wrapper
-    ("____", "template", False, ["____"], ["<|im_end|>", "\n"]),
+@pytest.mark.parametrize("placeholder,pre_s,post_s,shift,expect_readout,expect_emit_tail", [
+    # content wrapped in '**', pooled via shift_left; body owed to the next turn
+    ("**____**", ACTION_PREFIX, ACTION_POSTFIX, True, ["**"],
+     ["____", "**", "<|im_end|>", "\n"]),
+    # bare chat template: pool the placeholder itself
+    ("____", DEFAULT_PREFIX, DEFAULT_POSTFIX, False, ["____"], ["<|im_end|>", "\n"]),
     # several latents per turn, pooled together
-    ("█ █ █", "template", False, ["█", " █", " █"], ["<|im_end|>", "\n"]),
+    ("█ █ █", DEFAULT_PREFIX, DEFAULT_POSTFIX, False, ["█", " █", " █"],
+     ["<|im_end|>", "\n"]),
+    # an affix pair nobody has used before: the point is that nothing is a named preset
+    ("<<____>>", "<|im_start|>assistant\n<<", ">><|im_end|>", True, ["<<"],
+     ["____", ">>", "<|im_end|>", "\n"]),
 ])
-def test_split_is_derived_not_hardcoded(processor, placeholder, affixes, shift,
+def test_split_is_derived_not_hardcoded(processor, placeholder, pre_s, post_s, shift,
                                         expect_readout, expect_emit_tail):
     """Any affix/placeholder combination is located by find_turn_spans, no special cases."""
     tok = processor.tokenizer
     cfg = RolloutConfig(placeholder=placeholder)
-    pre_s, post_s = ((ACTION_PREFIX, ACTION_POSTFIX) if affixes == "action"
-                     else (DEFAULT_PREFIX, DEFAULT_POSTFIX))
     pre, post = resolve_affix_ids(tok, pre_s, post_s)
     emit, tail, n = split_assistant_turn(tok, cfg, pre, post, shift_left=shift)
     assert n == len(expect_readout)

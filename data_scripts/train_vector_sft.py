@@ -50,6 +50,7 @@ import numpy as np
 import torch
 from transformers import AutoProcessor, TrainingArguments
 
+from longnav.utils.turn_vectors import ACTION_POSTFIX, ACTION_PREFIX
 from longnav.utils.vector_sft import (
     DataConfig,
     LoraSpec,
@@ -88,7 +89,12 @@ def parse_args():
     m = p.add_argument_group("model / head")
     m.add_argument("--model-id", default="Qwen/Qwen3-VL-2B-Instruct")
     m.add_argument("--attn-impl", default="sdpa", choices=["sdpa", "flash_attention_2"])
-    m.add_argument("--affixes", default="action", choices=["action", "template"])
+    # A turn is prefix + content + postfix; these ARE the affixes, not a named preset.
+    # Escapes are decoded, so '\n' can be written literally on the command line.
+    m.add_argument("--prefix", default=ACTION_PREFIX,
+                   help="turn prefix. Default wraps the content in '**'; pass "
+                        "'<|im_start|>assistant\\n' to pool the assistant content itself")
+    m.add_argument("--postfix", default=ACTION_POSTFIX, help="turn postfix")
     m.add_argument("--no-shift-left", action="store_true",
                    help="pool the assistant content instead of the position that precedes "
                         "it (only sensible when the content is real text, not a placeholder)")
@@ -146,6 +152,14 @@ def parse_args():
                    help="skip the one-batch alignment check before training")
 
     return p.parse_args()
+
+
+def _unescape(text):
+    """Decode backslash escapes so `--prefix '<|im_start|>assistant\n**'` works in a shell.
+
+    Latin-1 round-trip first so non-ASCII placeholders survive `unicode_escape`.
+    """
+    return text.encode("latin-1", "backslashreplace").decode("unicode_escape")
 
 
 def _csv(text, cast=str):
@@ -237,7 +251,8 @@ def main():
     model_cfg = ModelConfig(
         model_id=args.model_id,
         attn_impl=args.attn_impl,
-        affixes=args.affixes,
+        prefix=_unescape(args.prefix),
+        postfix=_unescape(args.postfix),
         shift_left=not args.no_shift_left,
         pool_mode=args.pool_mode,
         head_hidden_dims=_csv(args.head_hidden_dims, int),

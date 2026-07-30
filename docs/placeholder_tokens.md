@@ -109,9 +109,10 @@ context-hygiene improvement, not something expected to move the metrics much alo
 
 ## Options deliberately not taken (yet)
 
-* **Template affixes only** -- drop `**`, let the assistant "say" exactly k placeholder
-  tokens, and pool those. Fully supported today (`affixes="template"`, `shift_left=False`,
-  `pool_mode` over `content_len=k`); the cost is finding (1) above.
+* **Bare chat-template affixes** -- drop `**`, let the assistant "say" exactly k
+  placeholder tokens, and pool those. Fully supported today (set `ModelConfig.prefix` /
+  `postfix` to `DEFAULT_PREFIX` / `DEFAULT_POSTFIX`, `shift_left=False`, `pool_mode` over
+  `content_len=k`); the cost is finding (1) above.
 * **A learned placeholder** -- a new vocab entry whose embedding is trained. Semantically
   inert by construction, but changes the vocabulary and needs the embedding row in
   `modules_to_save`.

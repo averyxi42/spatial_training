@@ -9,7 +9,8 @@ standard HF conversational layout, so this script writes it -- and nothing else.
 
 The assistant turns carry a fixed placeholder (`**____**` by default). That is not a
 label: the continuous action comes from the regression head reading that turn's vector,
-which is why `train_vector_sft.py` defaults to `--affixes action` + shift-left, pooling
+which is why `train_vector_sft.py` defaults to affixes that wrap the content in
+`**` plus shift-left, pooling
 the single `**` token that opens each turn. Change the placeholder here and nothing
 downstream cares, as long as it stays constant across turns and its middle stays a single
 token that does not merge into the `**` affixes -- `docs/placeholder_tokens.md` explains

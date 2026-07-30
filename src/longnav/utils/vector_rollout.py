@@ -83,8 +83,8 @@ class RolloutConfig:
 
     Turn structure is described the way `VLMWorker` describes it -- by the affix strings --
     and everything else is derived, so no convention is hardcoded. `prefix`/`postfix`
-    default to the checkpoint's own (`ModelConfig.affixes`), and `placeholder` is the
-    constant assistant message; together with `shift_left` they determine which token
+    default to the checkpoint's own (`ModelConfig.prefix`/`postfix`), and `placeholder` is
+    the constant assistant message; together with `shift_left` they determine which token
     positions the head reads, via the same `find_turn_spans` the training used.
 
     The strings must match the training data's conversation format. A mismatch changes the
@@ -93,7 +93,7 @@ class RolloutConfig:
     """
 
     placeholder: str = "**____**"
-    prefix: Optional[str] = None   # None -> from the checkpoint's affixes
+    prefix: Optional[str] = None   # None -> the checkpoint's own prefix
     postfix: Optional[str] = None
     shift_left: Optional[bool] = None
     user_text_before: str = "Observation {step}:"
@@ -195,11 +195,9 @@ class VectorRolloutPolicy:
         # them from config: no convention is assumed anywhere below.
         from longnav.utils.turn_vectors import resolve_affix_ids
 
-        from longnav.utils.vector_sft import affix_strings
-
-        ckpt_prefix, ckpt_postfix = affix_strings(self.model.model_cfg.affixes)
-        self.prefix = self.cfg.prefix if self.cfg.prefix is not None else ckpt_prefix
-        self.postfix = self.cfg.postfix if self.cfg.postfix is not None else ckpt_postfix
+        mcfg = self.model.model_cfg
+        self.prefix = self.cfg.prefix if self.cfg.prefix is not None else mcfg.prefix
+        self.postfix = self.cfg.postfix if self.cfg.postfix is not None else mcfg.postfix
         self.shift_left = (
             self.cfg.shift_left if self.cfg.shift_left is not None
             else self.model.model_cfg.shift_left

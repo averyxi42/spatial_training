@@ -35,10 +35,12 @@ The standard HF conversational multimodal layout, one row per conversation:
 Alignment is checked, not assumed: the number of assistant turns the tokenizer actually
 produces must equal the number of targets, on every batch.
 
-Why `shift_left` + action affixes is the default
-------------------------------------------------
-With `ACTION_PREFIX`/`ACTION_POSTFIX` and `shift_left=True`, the pooled span is the
-single `**` token that opens every assistant turn. Two consequences, both wanted:
+Why the default affixes wrap the content in `**`, with `shift_left`
+------------------------------------------------------------------
+A turn is `prefix + content + postfix`; the defaults are `ACTION_PREFIX` /
+`ACTION_POSTFIX` (`"<|im_start|>assistant\n**"` ... `"**<|im_end|>"`), which with
+`shift_left=True` make the pooled span the single `**` token that opens every assistant
+turn. Two consequences, both wanted:
 
   * The assistant content is a constant placeholder, so pooling it adds nothing -- the
     vector is a pure function of the multimodal context up to that turn. The `**` opener
@@ -48,8 +50,9 @@ single `**` token that opens every assistant turn. Two consequences, both wanted
     *before* anything is generated. The head can be read turn-by-turn during rollout
     with no generation at all, which is what makes a continuous-action policy possible.
 
-Set `shift_left=False` (and `affixes="template"`) for datasets whose assistant text is
-real content that should inform the vector.
+Set `shift_left=False` (with `DEFAULT_PREFIX`/`DEFAULT_POSTFIX`, the bare chat template)
+for datasets whose assistant text is real content that should inform the vector -- or any
+other affix pair; nothing downstream is specific to these two.
 
 Hard constraint: batch size 1 per device
 ----------------------------------------
@@ -105,13 +108,20 @@ ADAPTER_SUBDIR = "adapter"
 class ModelConfig:
     """Backbone + head + span-convention settings.
 
-    `affixes`/`shift_left` decide which token positions become the turn vector; see the
-    module docstring for why the defaults are what they are.
+    A turn is `prefix + content + postfix`, and the affixes are exactly those two strings
+    -- there is no enum of blessed conventions. `prefix`/`postfix` plus `shift_left` decide
+    which token positions become the turn vector: with `shift_left` the readout is the last
+    token of `prefix` (so it is content-independent), otherwise it is the content itself.
+    `longnav.utils.turn_vectors` exports the two pairs used so far
+    (`ACTION_PREFIX`/`ACTION_POSTFIX`, which wrap the content in `**`, and
+    `DEFAULT_PREFIX`/`DEFAULT_POSTFIX`, the bare chat template) but any pair the tokenizer
+    can locate works. See the module docstring for why the defaults are what they are.
     """
 
     model_id: str = "Qwen/Qwen3-VL-2B-Instruct"
     attn_impl: str = "sdpa"  # or flash_attention_2
-    affixes: str = "action"  # "action" -> the '**' convention, "template" -> whole message
+    prefix: str = ACTION_PREFIX
+    postfix: str = ACTION_POSTFIX
     shift_left: bool = True
     pool_mode: str = "mean"  # mean/last/attn/flat; irrelevant for 1-token spans
     head_hidden_dims: Tuple[int, ...] = (1024, 1024)
@@ -490,8 +500,9 @@ class TurnVectorRegressor(nn.Module):
             layer_norm=model_cfg.head_layer_norm,
             standardize=model_cfg.standardize_head_inputs,
         )
-        prefix, postfix = affix_strings(model_cfg.affixes)
-        prefix_ids, postfix_ids = resolve_affix_ids(processor.tokenizer, prefix, postfix)
+        prefix_ids, postfix_ids = resolve_affix_ids(
+            processor.tokenizer, model_cfg.prefix, model_cfg.postfix
+        )
         normalizer = TargetNormalizer(target_shape[-1], enabled=loss_cfg.normalize_targets)
         return cls(
             backbone, head, normalizer, target_shape, prefix_ids, postfix_ids,
@@ -570,9 +581,9 @@ class TurnVectorRegressor(nn.Module):
             tail = input_ids[0, -64:].tolist()
             raise RuntimeError(
                 f"found {vectors.shape[0]} assistant turn span(s) but got "
-                f"{targets.shape[0]} target(s). affixes="
-                f"{self.model_cfg.affixes!r} shift_left={self.model_cfg.shift_left}. "
-                f"Last 64 input_ids: {tail}"
+                f"{targets.shape[0]} target(s). prefix={self.model_cfg.prefix!r} "
+                f"postfix={self.model_cfg.postfix!r} "
+                f"shift_left={self.model_cfg.shift_left}. Last 64 input_ids: {tail}"
             )
 
         if self.train_content_len is None and spans:
@@ -692,7 +703,7 @@ class TurnVectorRegressor(nn.Module):
         """Rebuild a trained model for inference from a checkpoint directory."""
         checkpoint_dir = Path(checkpoint_dir)
         meta = json.loads((checkpoint_dir / HEAD_CONFIG_FILE).read_text())
-        model_cfg = ModelConfig(**{**meta["model"], **overrides})
+        model_cfg = ModelConfig(**{**migrate_model_config(meta["model"]), **overrides})
         loss_cfg = LossConfig(**meta["loss"])
         model = cls.build(
             model_cfg, loss_cfg, lora=None,
@@ -712,12 +723,22 @@ class TurnVectorRegressor(nn.Module):
         return model.eval()
 
 
-def affix_strings(kind: str) -> Tuple[str, str]:
-    if kind == "action":
-        return ACTION_PREFIX, ACTION_POSTFIX
-    if kind == "template":
-        return DEFAULT_PREFIX, DEFAULT_POSTFIX
-    raise ValueError(f"affixes must be 'action' or 'template', got {kind!r}")
+def migrate_model_config(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Read a checkpoint's model config, translating the retired `affixes` name.
+
+    Checkpoints written before the affixes became plain strings carry
+    `affixes: "action" | "template"`. Translate rather than break them; the pairs are the
+    ones those names stood for.
+    """
+    meta = dict(meta)
+    kind = meta.pop("affixes", None)
+    if kind is not None and "prefix" not in meta:
+        pairs = {"action": (ACTION_PREFIX, ACTION_POSTFIX),
+                 "template": (DEFAULT_PREFIX, DEFAULT_POSTFIX)}
+        if kind not in pairs:
+            raise ValueError(f"checkpoint has unknown affixes={kind!r}")
+        meta["prefix"], meta["postfix"] = pairs[kind]
+    return meta
 
 
 # ======================================================================================
