@@ -78,11 +78,13 @@ DEFAULT_WIDTH, DEFAULT_HEIGHT = 640, 480
 class LocalPolicy:
     """Runs `VectorRolloutPolicy` in this process (model env, or an env with both)."""
 
-    def __init__(self, ckpt, device="cuda", merge_lora=True):
+    def __init__(self, ckpt, device="cuda", merge_lora=True, max_context_tokens=0):
         from longnav.utils.vector_rollout import RolloutConfig, VectorRolloutPolicy
 
         self.policy = VectorRolloutPolicy.from_checkpoint(
-            ckpt, RolloutConfig(device=device, merge_lora=merge_lora)
+            ckpt,
+            RolloutConfig(device=device, merge_lora=merge_lora,
+                          max_context_tokens=max_context_tokens),
         )
 
     def reset(self, goal_text):
@@ -138,7 +140,8 @@ class ConstantPolicy:
 class PolicyClient:
     """Runs the policy in a subprocess under a different interpreter."""
 
-    def __init__(self, ckpt, policy_python, device="cuda", log_path=None):
+    def __init__(self, ckpt, policy_python, device="cuda", log_path=None,
+                 max_context_tokens=0):
         from multiprocessing.connection import Listener
 
         self.socket_path = Path(tempfile.mkdtemp(prefix="vecpolicy_")) / "sock"
@@ -148,6 +151,7 @@ class PolicyClient:
             str(policy_python), str(Path(__file__).resolve()),
             "--serve", "--socket", str(self.socket_path),
             "--ckpt", str(ckpt), "--device", device,
+            "--max-context-tokens", str(max_context_tokens),
         ]
         print(f"[bridge] launching policy server: {' '.join(cmd)}")
         print(f"[bridge] server log -> {self.log_path}")
@@ -203,7 +207,9 @@ def serve_policy(args):
 
     print(f"loading {args.ckpt} on {args.device}...", flush=True)
     policy = VectorRolloutPolicy.from_checkpoint(
-        args.ckpt, RolloutConfig(device=args.device, merge_lora=True)
+        args.ckpt,
+        RolloutConfig(device=args.device, merge_lora=True,
+                      max_context_tokens=args.max_context_tokens),
     )
     conn = Client(args.socket, family="AF_UNIX", authkey=AUTHKEY)
     print("connected to sim process", flush=True)
@@ -249,6 +255,66 @@ def episode_rows(example):
         }
         for i in range(len(example["images"]))
     ]
+
+
+def goal_view_points(episode) -> np.ndarray:
+    """Habitat-frame positions of every view point of this episode's goal object(s).
+
+    ObjectNav success is defined against the goal's *view points*, not its centre (the
+    centre can be inside furniture and unreachable), and `load_demo_objectnav` already
+    attaches them as `resolved_goals`.
+    """
+    pts = [
+        vp["agent_state"]["position"]
+        for goal in episode.get("resolved_goals", [])
+        for vp in goal.get("view_points", [])
+    ]
+    return np.asarray(pts, dtype=np.float32)
+
+
+def goal_distance(planar_pose, goal_xy: np.ndarray) -> float:
+    """Euclidean distance from a planar pose to the nearest goal view point.
+
+    Straight-line, deliberately: it needs no navmesh queries and no snapping, and for
+    "is the policy heading toward the goal at all" it is the signal we want. It does
+    ignore walls, so a shrinking distance is not proof of a traversable approach.
+    """
+    if goal_xy.size == 0:
+        return float("nan")
+    d = np.linalg.norm(goal_xy - np.asarray(planar_pose[:2], dtype=float)[None, :], axis=1)
+    return float(d.min())
+
+
+def plot_goal_progress(out_path, episode_id, goal_category, ref, actual, goal_xy,
+                       dtg_trace, dtg_ref_trace=None):
+    """Two panels: the path from above with the goal marked, and distance-to-goal vs step."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    ax1.plot(ref[:, 0], ref[:, 1], "-", color="#888", lw=2, label="recorded demo")
+    ax1.plot(actual[:, 0], actual[:, 1], "-", color="#3b5bdb", lw=2, label="policy")
+    ax1.plot(actual[0, 0], actual[0, 1], "o", color="black", ms=7, label="start")
+    ax1.plot(actual[-1, 0], actual[-1, 1], "X", color="#b3261e", ms=10, label="policy end")
+    if goal_xy.size:
+        ax1.scatter(goal_xy[:, 0], goal_xy[:, 1], s=8, color="#1f7a4d", alpha=0.35,
+                    label=f"{goal_category} view points")
+    ax1.set_aspect("equal"); ax1.set_xlabel("x [m]"); ax1.set_ylabel("y [m]")
+    ax1.legend(fontsize=8); ax1.set_title("top-down path")
+
+    ax2.plot(dtg_trace, "-o", ms=3, color="#3b5bdb", label="policy")
+    if dtg_ref_trace is not None:
+        ax2.plot(np.linspace(0, len(dtg_trace) - 1, len(dtg_ref_trace)), dtg_ref_trace,
+                 "-", color="#888", label="recorded demo")
+    ax2.axhline(dtg_trace[0], ls=":", color="black", lw=1, label="start distance")
+    ax2.set_xlabel("policy step"); ax2.set_ylabel("euclidean distance to goal [m]")
+    ax2.legend(fontsize=8); ax2.set_title("distance to goal")
+    fig.suptitle(f"{episode_id}  ({goal_category})", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
 
 
 def chunk_errors(pred: np.ndarray, gt: np.ndarray):
@@ -345,7 +411,7 @@ def run_closed_loop(policy, dataset, args):
         PIDPoseControllerConfig,
         track_trajectory,
     )
-    from continuous_demos.tracking_eval import compute_metrics, plot_bev
+    from continuous_demos.tracking_eval import compute_metrics
 
     demo = load_demo_objectnav(args.demo_dataset)
     episodes_by_id = {ep["episode_id"]: ep for ep in demo["episodes"]}
@@ -394,7 +460,16 @@ def run_closed_loop(policy, dataset, args):
         controller.reset()
         policy.reset(ex.get("goal_text") or "the goal object")
 
+        view_points = goal_view_points(episode)
+        # habitat [x, y, z] -> planar control frame (X = habitat_x, Y = -habitat_z)
+        goal_xy = (
+            np.stack([view_points[:, 0], -view_points[:, 2]], axis=1)
+            if view_points.size
+            else np.zeros((0, 2))
+        )
+        dtg = lambda pose: goal_distance(pose, goal_xy)  # noqa: E731
         actual, pred_chunks, latencies = [robot_sim.get_2d_pose()], [], []
+        dtg_trace = [dtg(actual[0])]
         for i in range(n_steps):
             rgb = np.asarray(robot_sim.get_obs()[args.sensor_uuid])[..., :3]
             pose_now = robot_sim.get_2d_pose()
@@ -416,24 +491,48 @@ def run_closed_loop(policy, dataset, args):
                 robot_sim, controller, setpoints, dt=dt_native, initial_pose=pose_now
             )
             actual.extend(seg["actual_poses"])
+            dtg_trace.append(dtg(robot_sim.get_2d_pose()))
 
         actual = np.asarray(actual, dtype=float)
         n = min(len(actual), len(ref_traj))
+        # Path-tracking error is a debug signal; this is a navigator, so what counts is
+        # whether distance-to-goal actually went down. The recorded demo reaches the goal,
+        # so its own progress over the same window is the ceiling to compare against.
+        trace = np.asarray(dtg_trace, dtype=float)
+        d0 = float(trace[0])
+        ref_dtg_final = dtg(ref_traj[min(n, len(ref_traj)) - 1])
+        goal = {
+            "goal_category": episode.get("object_category"),
+            "n_view_points": int(len(view_points)),
+            "dtg_start": d0,
+            "dtg_final": float(trace[-1]),
+            "dtg_min": float(np.nanmin(trace)),
+            "progress_m": d0 - float(np.nanmin(trace)),
+            "progress_frac": (d0 - float(np.nanmin(trace))) / d0 if d0 > 0 else float("nan"),
+            "reached_1m": bool(np.nanmin(trace) <= args.success_distance),
+            "demo_dtg_final": float(ref_dtg_final),
+            "demo_progress_m": d0 - float(ref_dtg_final),
+            "dtg_trace": [round(float(v), 3) for v in trace],
+        }
         metrics = compute_metrics(actual[:n], ref_traj[:n])
         metrics.update(
             episode=ex["episode_id"], model_steps=n_steps, ticks=int(n),
-            mean_policy_latency_s=float(np.nanmean(latencies)),
+            mean_policy_latency_s=float(np.nanmean(latencies)), **goal,
         )
         results.append(metrics)
-        plot_bev(
-            f"{ex['episode_id']} closed-loop policy vs recorded",
-            ref_traj[:n], actual[:n],
-            out_dir / "plots" / f"closed_loop_{e}_{ex['episode_id'].replace(':', '_')}.png",
+        plot_goal_progress(
+            out_dir / "plots" / f"{args.policy}_{e}_{ex['episode_id'].replace(':', '_')}.png",
+            ex["episode_id"], goal["goal_category"], ref_traj[:n], actual[:n], goal_xy,
+            trace, [dtg(pose) for pose in ref_traj[: min(n, len(ref_traj))]],
         )
-        print(f"  ep {e} {ex['episode_id']}: {n_steps} policy steps, "
-              + ", ".join(f"{k} {v:.3f}" for k, v in metrics.items()
-                          if isinstance(v, float) and k != "mean_policy_latency_s")
-              + f", {metrics['mean_policy_latency_s'] * 1e3:.0f} ms/step")
+        print(f"  ep {e} {ex['episode_id'][:24]} ({goal['goal_category']}, "
+              f"{n_steps} steps): dtg {goal['dtg_start']:.2f} -> {goal['dtg_final']:.2f} m "
+              f"(min {goal['dtg_min']:.2f}, progress {goal['progress_m']:+.2f} m = "
+              f"{100 * goal['progress_frac']:.0f}%; demo reaches {goal['demo_dtg_final']:.2f} m)"
+              f"{'  REACHED' if goal['reached_1m'] else ''}\n"
+              f"        debug: ade {metrics['ade']:.3f} heading_rmse "
+              f"{metrics['heading_rmse_deg']:.1f} deg, "
+              f"{metrics['mean_policy_latency_s'] * 1e3:.0f} ms/policy step")
     return results
 
 
@@ -447,6 +546,10 @@ def main():
     p.add_argument("--dataset-dir", default="dump/datasets/action_chunks_conversational")
     p.add_argument("--split", default="validation")
     p.add_argument("--num-episodes", type=int, default=3)
+    p.add_argument("--select", default="first", choices=["first", "longest"],
+                   help="'longest' picks the episodes with the most observations, which is "
+                        "what you want for a long-horizon run: short episodes cap the "
+                        "rollout well before --max-steps")
     p.add_argument("--max-steps", type=int, default=24,
                    help="policy steps per episode (0 = the whole episode). Each step adds "
                         "~330 tokens to the KV cache, so long episodes are a memory cost")
@@ -468,6 +571,11 @@ def main():
     s.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     s.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
     s.add_argument("--sensor-uuid", default="color_sensor")
+    s.add_argument("--success-distance", type=float, default=1.0,
+                   help="geodesic distance to a goal view point counted as reaching it")
+    s.add_argument("--max-context-tokens", type=int, default=110000,
+                   help="fail loudly rather than OOM: measured ~190 retained tokens per "
+                        "step after visual sparsification, ~11.7 GiB at 350 steps")
     s.add_argument("--policy-python", default=os.environ.get("VECTOR_POLICY_PYTHON"),
                    help="interpreter with torch/transformers, if this env lacks them. "
                         "Defaults to $VECTOR_POLICY_PYTHON")
@@ -482,7 +590,8 @@ def main():
     if args.policy != "model":
         policy = None  # built after the dataset loads (the mean comes from the data)
     elif _importable("transformers") and _importable("torch"):
-        policy = LocalPolicy(args.ckpt, device=args.device)
+        policy = LocalPolicy(args.ckpt, device=args.device,
+                             max_context_tokens=args.max_context_tokens)
     else:
         if not args.policy_python:
             raise SystemExit(
@@ -490,12 +599,18 @@ def main():
                 "another env: pass --policy-python <interpreter> (or set "
                 "$VECTOR_POLICY_PYTHON)"
             )
-        policy = PolicyClient(args.ckpt, args.policy_python, device=args.device)
+        policy = PolicyClient(args.ckpt, args.policy_python, device=args.device,
+                              max_context_tokens=args.max_context_tokens)
 
     from datasets import load_from_disk
 
     ds = load_from_disk(os.path.expanduser(args.dataset_dir))
     ds = ds[args.split] if hasattr(ds, "keys") else ds
+    if args.select == "longest":
+        order = sorted(range(len(ds)), key=lambda i: -len(ds[i]["images"]))
+        ds = ds.select(order[: args.num_episodes])
+        print(f"selected the {len(ds)} longest episode(s): "
+              f"{[len(ds[i]['images']) for i in range(len(ds))]} observations")
     mean_chunk = dataset_mean_chunk(ds)
     if policy is None:
         shape = target_shape_from_checkpoint(args.ckpt)
@@ -522,7 +637,26 @@ def main():
         else:
             if not args.demo_dataset:
                 raise SystemExit("--demo-dataset is required for closed-loop mode")
-            result = {"closed_loop": run_closed_loop(policy, ds, args)}
+            eps = run_closed_loop(policy, ds, args)
+            result = {"closed_loop": eps}
+            if eps:
+                prog = np.array([e["progress_m"] for e in eps], dtype=float)
+                frac = np.array([e["progress_frac"] for e in eps], dtype=float)
+                demo = np.array([e["demo_progress_m"] for e in eps], dtype=float)
+                print(f"\n=== goal progress over {len(eps)} episode(s), policy="
+                      f"{args.policy} ===")
+                print(f"  mean progress   {np.nanmean(prog):+.2f} m "
+                      f"({100 * np.nanmean(frac):.0f}% of the initial distance)")
+                print(f"  demo ceiling    {np.nanmean(demo):+.2f} m")
+                print(f"  reached <= {args.success_distance:.1f} m: "
+                      f"{sum(e['reached_1m'] for e in eps)}/{len(eps)} episodes")
+                result["summary"] = {
+                    "mean_progress_m": float(np.nanmean(prog)),
+                    "mean_progress_frac": float(np.nanmean(frac)),
+                    "mean_demo_progress_m": float(np.nanmean(demo)),
+                    "reached": int(sum(e["reached_1m"] for e in eps)),
+                    "episodes": len(eps),
+                }
     finally:
         policy.close()
 
