@@ -1,4 +1,48 @@
 """
+######################################################################################
+#  DEPRECATED -- THIS HARNESS SILENTLY PRODUCES CONTAMINATED NUMBERS. DO NOT USE IT.
+#
+#  Use instead:
+#      /Projects/habitat_physical_nav/scripts/eval_objectnav_policy.py
+#                --fresh-sim-per-episode
+#
+#  Why: `HabitatRobotSim.reset()` does not fully restore the physics state between
+#  episodes, so an episode's result depends on which episodes ran before it in the
+#  same simulator process. This script predates that discovery and has no
+#  `--fresh-sim-per-episode` equivalent, so every number it has ever produced is
+#  order-dependent, and re-running the same split with different sharding can give
+#  a different answer.
+#
+#  It is not a rounding error. Same checkpoint (vector_sft/checkpoint-2500), same
+#  14 val_mini episodes, identical in every respect except the clean-slate flag:
+#
+#      metric           shared simulator      fresh simulator
+#      success                    0.214                0.357
+#      oracle_success             0.214                0.357
+#      spl                        0.095                0.166
+#      oracle_spl                 0.168                0.299
+#
+#  Two of fourteen episodes flip from failure to success -- roughly 40% relative
+#  understatement of the checkpoint. Measured with the *stateless* image-blind
+#  `forward` control (so the policy cannot be the cause), the same episode runs a
+#  1.4% different trajectory alone vs after another episode, and
+#  `--fresh-sim-per-episode` reproduces the run-alone path to 0.000000 m.
+#
+#  Full write-up: /Projects/spatial_training/dump/eval_system/FINDINGS.md section 5,
+#  and /Projects/habitat_physical_nav/docs/OBJECTNAV_EVAL.md.
+#
+#  The replacement is a superset: it reproduces this script's screening verdicts
+#  bit-identically (14/30 runnable, same uids) and its start geodesics to 0.000000 m
+#  on all 14 episodes, and it adds the clean-slate flag, a PolicyBackend extension
+#  point for new head types, behavioural diagnostics (frozen time, collisions,
+#  motion coherence) and paired run comparison.
+#
+#  This file is kept only so old runs remain readable (`--report` still works) and
+#  as the historical record. Running a rollout requires
+#  `--i-know-this-is-deprecated`, which exists to make the choice deliberate, not to
+#  make the numbers correct -- they will still be contaminated.
+######################################################################################
+
 Evaluate a trained turn-vector policy on *standard* Habitat ObjectNav episodes.
 
 This is the companion to `run_vector_policy_habitat.py`, which can only replay recorded
@@ -774,6 +818,16 @@ def print_summary(summary, results, skipped):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--i-know-this-is-deprecated", dest="deprecated_ok",
+                   action="store_true",
+                   help="DEPRECATED HARNESS. Required to run a rollout. This script "
+                        "predates the HabitatRobotSim.reset() state-leakage fix and has "
+                        "no --fresh-sim-per-episode, so its numbers are order-dependent "
+                        "and understated (checkpoint-2500 on val_mini: success 0.214 "
+                        "here vs 0.357 with a clean slate). Use "
+                        "/Projects/habitat_physical_nav/scripts/eval_objectnav_policy.py "
+                        "--fresh-sim-per-episode instead. --report and --dry-run do not "
+                        "need this flag")
     p.add_argument("--ckpt", help="trained checkpoint dir (from train_vector_sft)")
     p.add_argument("--episodes", required=True,
                    help="ObjectNav split dir (with content/*.json.gz) or a single .json.gz")
@@ -916,11 +970,37 @@ def report_only(path: Path):
     print(f"Per-episode -> {lines_path} (one line per episode)")
 
 
+DEPRECATION_BANNER = """
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  DEPRECATED HARNESS -- the numbers it produces are contaminated.
+
+  This script predates the discovery that HabitatRobotSim.reset() does not fully
+  restore the physics state between episodes, and it has no --fresh-sim-per-episode
+  equivalent. Episodes therefore affect each other's results depending on execution
+  order. Measured on checkpoint-2500 / val_mini, correcting for it moved success
+  from 0.214 to 0.357 -- roughly 40% relative understatement.
+
+  Use instead:
+      /Projects/habitat_physical_nav/scripts/eval_objectnav_policy.py \\
+          --fresh-sim-per-episode
+
+  See /Projects/spatial_training/dump/eval_system/FINDINGS.md section 5.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+"""
+
+
 def main():
     args = parse_args()
+    # Printed on every invocation, including --report and --dry-run: the point of
+    # the notice is that two similarly-named harnesses exist and one is quietly
+    # wrong, and someone reading a --report of an old run needs to know its numbers
+    # carry the defect too.
+    print(DEPRECATION_BANNER, file=sys.stderr, flush=True)
     if args.report:
         return report_only(Path(args.report))
     if args.worker_shard:
+        # A worker is only ever spawned by a parent that already cleared the gate
+        # below, so re-checking here would just break the parallel path.
         return worker_main(args)
 
     episodes = filter_episodes(load_episodes(Path(args.episodes)), args)
@@ -931,7 +1011,19 @@ def main():
     print(f"{len(episodes)} episode(s) from {args.episodes}")
 
     if args.dry_run:
+        # Screening only -- no rollout, so no contaminated numbers to produce.
         return dry_run(episodes, args)
+    if not args.deprecated_ok:
+        raise SystemExit(
+            "refusing to run: this harness is deprecated and its closed-loop numbers "
+            "are order-dependent (see the banner above and the module docstring).\n"
+            "  Use  /Projects/habitat_physical_nav/scripts/eval_objectnav_policy.py "
+            "--fresh-sim-per-episode\n"
+            "  If you genuinely need this one -- to reproduce a historical run, say -- "
+            "pass --i-know-this-is-deprecated.\n"
+            "  That flag does not make the numbers correct. It only records that you "
+            "chose them knowingly."
+        )
     if not args.ckpt and args.policy == "model":
         raise SystemExit("--ckpt is required unless --dry-run or --policy is a control")
 
