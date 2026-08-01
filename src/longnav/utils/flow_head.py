@@ -511,6 +511,28 @@ class FlowSFTTrainer(TurnVectorSFTTrainer):
             self._check_stability(outputs, model)
         return (loss, outputs) if return_outputs else loss
 
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None):
+        """Gate on the gradient norm, at the only threshold that means anything here.
+
+        A large gradient norm is not a fault on this model: the completed 20k-step
+        marginal fit oscillated between 30 and 990 throughout, with no trend, no
+        saturation and no NaN, because the loss surface near a 33%-weight atom is
+        genuinely steep. Clipping is on at `max_grad_norm = 1.0` (inherited from the
+        baseline's parser), and since Adam normalises per-parameter, a consistently large
+        norm rescales the step almost uniformly rather than distorting it. So there is no
+        principled finite threshold to gate on -- but a *non-finite* norm is unambiguous,
+        and it is the one gradient condition that always means the run is over.
+        """
+        g = logs.get("grad_norm")
+        if g is not None and not math.isfinite(float(g)):
+            self._violations += 1
+            print(f"[stability gate] step {self.state.global_step} "
+                  f"({self._violations}/{self.gate_patience}): non-finite grad_norm {g}",
+                  flush=True)
+            if self._violations >= self.gate_patience:
+                raise RuntimeError("sustained non-finite gradients; stopping the run")
+        super().log(logs, start_time)
+
     def _accumulate(self, outputs: Dict[str, torch.Tensor]):
         super()._accumulate(outputs)
         for key in FLOW_METRIC_KEYS:
