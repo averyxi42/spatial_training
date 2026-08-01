@@ -38,7 +38,7 @@ def run_name(a) -> str:
     ch = "_".join(f"{v:g}" for v in a.l1_channel)
     tau = "_".join(f"{v:g}" for v in a.tau_init)
     return (f"ae-z{a.latent_dim}-sig{a.noise_std:g}-tau{tau}"
-            f"-l1{a.l1_weight:g}x{ch}-{a.tag}")
+            f"-l1{a.l1_weight:g}x{ch}{'-nostrafe' if a.drop_strafe else ''}-{a.tag}")
 
 
 @torch.no_grad()

@@ -99,6 +99,7 @@ def run_gate(ckpt: Path, device="cuda", split="validation") -> dict:
         "aggregate_posterior": M.flat_region_volume(model, n=200_000, device=device,
                                                     source="posterior", latents=z),
         "data": M.data_atom_rates(diffs),
+        "atom_radius_latent_units": M.atom_radius(model, z, diffs, device=device),
     }
     return rep, clean, noisy, diffs, z
 
@@ -268,9 +269,12 @@ def main():
         print("  ->", distribution_figure(rep, clean, noisy, diffs, fig))
 
     (OUT / "gate_all.json").write_text(json.dumps(reports, indent=2))
-    same = [r for r in reports
-            if abs(r["config"]["noise_std"] - reports[0]["config"]["noise_std"]) < 1e-9
-            and not r["args"].get("drop_strafe")]
+    # Latent-dim sweep figure: hold every other knob fixed at the modal setting.
+    keys = [(r["config"]["noise_std"], r["args"].get("l1_weight")) for r in reports
+            if not r["args"].get("drop_strafe")]
+    modal = max(set(keys), key=keys.count) if keys else None
+    same = [r for r in reports if not r["args"].get("drop_strafe")
+            and (r["config"]["noise_std"], r["args"].get("l1_weight")) == modal]
     if len(same) > 1:
         print("->", sweep_figure(same, OUT / "gate_latent_sweep.png"))
     print("->", OUT / "gate_all.json")

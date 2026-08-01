@@ -116,6 +116,57 @@ def flat_region_volume(model, n: int = 200_000, device="cuda", seed: int = 0,
     }
 
 
+def atom_radius(model, latents: np.ndarray, diffs: np.ndarray, n: int = 4096,
+                n_dirs: int = 8, t_max: float = 4.0, steps: int = 80,
+                device="cuda", seed: int = 0) -> dict:
+    """How far can you walk from a stopped latent before the robot starts moving?
+
+    The base-measure volume answers "how much of latent space is the atom"; this
+    answers it in latent *units*, which is what the flow's and the RL policy's step
+    sizes are measured in. Walk from encoded fully-stopped chunks along random unit
+    directions and record the distance at which forward motion leaves the atom.
+
+    Read against two yardsticks: the injected `noise_std` (the flat region must be
+    wider than that or the gate's noisy round trip could not pass) and the latent's
+    own per-dimension scale of 1 (a radius approaching that would mean the
+    unidentifiable region is a large part of the space).
+    """
+    import torch
+
+    stopped = np.where((np.abs(diffs[:, :, 0]) < EXACT).all(axis=1))[0]
+    if len(stopped) == 0:
+        return {"n_stopped": 0}
+    rng = np.random.default_rng(seed)
+    pick = rng.choice(stopped, min(n, len(stopped)), replace=False)
+    z0 = torch.as_tensor(latents[pick], dtype=torch.float32, device=device)
+    model = model.to(device).eval()
+    ts = torch.linspace(0, t_max, steps, device=device)
+    out = []
+    with torch.no_grad():
+        for _ in range(n_dirs):
+            u = torch.randn(z0.shape, device=device)
+            u = u / u.norm(dim=1, keepdim=True)
+            alive = torch.ones(len(z0), dtype=torch.bool, device=device)
+            radius = torch.full((len(z0),), float("nan"), device=device)
+            for t in ts[1:]:
+                a = model.decode(z0 + t * u)[:, :, 0].abs()
+                moving = (a >= EXACT).any(dim=1) & alive
+                radius[moving] = t
+                alive &= ~moving
+                if not alive.any():
+                    break
+            radius[alive] = t_max
+            out.append(radius.cpu().numpy())
+    r = np.concatenate(out)
+    return {
+        "n_stopped_chunks": int(len(stopped)),
+        "median": float(np.median(r)), "p10": float(np.percentile(r, 10)),
+        "p90": float(np.percentile(r, 90)), "mean": float(r.mean()),
+        "noise_std": float(model.noise_std),
+        "median_over_noise_std": float(np.median(r) / max(1e-9, model.noise_std)),
+    }
+
+
 def data_atom_rates(diffs: np.ndarray) -> dict:
     """The same quantities measured on the data, so the volume has something to
     be 'too large' or 'too small' relative to."""
