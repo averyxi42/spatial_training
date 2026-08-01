@@ -116,13 +116,31 @@ class FlowActionDecoder(nn.Module):
     """
 
     def __init__(self, flow: ConditionalFlow, decode: str = "best_of_k",
-                 k: int = 16, seed: int = 0, temperature: float = 1.0):
+                 k: int = 16, seed: int = 0, temperature: float = 1.0,
+                 normalise_context: bool = True):
         super().__init__()
         self.flow = flow
         self.decode = decode
         self.k = int(k)
         self.seed = int(seed)
         self.temperature = float(temperature)
+        # The conditioner sees `cat([x_normalised, ctx])`. `x` is ActNorm'd to O(1); `ctx`
+        # is a fresh linear projection of a LayerNorm'd trunk and comes out at O(0.04).
+        # Concatenated, the context contributes a few parts in ten thousand of the
+        # pre-activation and the flow simply cannot hear it -- measured on the first run,
+        # the image was worth 0.000 nats/chunk at step 250 while the coupling's context
+        # columns sat 100x below its data columns. `flow.ContextEncoder` opens with a
+        # LayerNorm for exactly this reason; using the SFT trunk as the encoder instead
+        # dropped it, so it is restored here. Lives in this module so it is saved with the
+        # checkpoint and applied identically at training and at rollout.
+        self.ctx_norm = (nn.LayerNorm(flow.context_dim)
+                         if normalise_context and flow.context_dim else nn.Identity())
+
+    def prepare_ctx(self, ctx: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Trunk output -> the vector the flow is actually conditioned on."""
+        if ctx is None:
+            return None
+        return self.ctx_norm(ctx.float())
 
     # The slot's contract. Targets are never converted on the way in -- the flow's
     # objective is a density on the raw differentials, so there is nothing to normalize.
@@ -133,8 +151,7 @@ class FlowActionDecoder(nn.Module):
     def denormalize(self, ctx: torch.Tensor) -> torch.Tensor:
         """`ctx` (B, context_dim) -> anchor-relative chunk (B, T, 3) in metres/radians."""
         if self.decode == "context":
-            return ctx
-        ctx = ctx.float()
+            return ctx      # raw trunk output; `prepare_ctx` is applied at decode time
         with torch.autocast(device_type=ctx.device.type, enabled=False):
             diffs = self.decode_diffs(ctx, self.decode)
         return compose_chunk(diffs.double()).to(ctx.dtype)
@@ -143,12 +160,12 @@ class FlowActionDecoder(nn.Module):
     def decode_diffs(self, ctx: torch.Tensor, rule: Optional[str] = None,
                      k: Optional[int] = None, seed: Optional[int] = None,
                      temperature: Optional[float] = None) -> torch.Tensor:
-        """`ctx` -> per-tick differentials (B, T, 3), by the named rule."""
+        """Raw trunk output -> per-tick differentials (B, T, 3), by the named rule."""
         rule = rule or self.decode
         k = self.k if k is None else int(k)
         seed = self.seed if seed is None else int(seed)
         temp = self.temperature if temperature is None else float(temperature)
-        ctx = ctx.float()
+        ctx = self.prepare_ctx(ctx)
         if rule == "best_of_k":
             return self.flow.best_of_k(ctx, k=k, seed=seed, temperature=temp)
         if rule == "mode":
@@ -295,8 +312,8 @@ class TurnFlowPolicy(TurnVectorRegressor):
         if self.train_content_len is None and spans:
             self.train_content_len = int(len(spans[0]))
 
-        ctx = vectors.view(-1, self.target_shape[0]).float()
-        targets = targets.to(ctx.device)
+        ctx_raw = vectors.view(-1, self.target_shape[0]).float()
+        targets = targets.to(ctx_raw.device)
         # The flow lives on per-tick body-frame differentials, not the anchor-relative
         # poses the dataset stores: that is the only space where "the robot did not move"
         # is the origin in every coordinate. Composed in float64 -- the differences are
@@ -305,7 +322,8 @@ class TurnFlowPolicy(TurnVectorRegressor):
 
         # bf16 autocast is on for the backbone; a 12-layer log-determinant is not
         # meaningful in bf16, so the density is always computed in fp32.
-        with torch.autocast(device_type=ctx.device.type, enabled=False):
+        with torch.autocast(device_type=ctx_raw.device.type, enabled=False):
+            ctx = self.decoder.prepare_ctx(ctx_raw)
             per_turn, _ = flow_nll(self.flow, gt_diffs, ctx, sigma_mult=self.sigma_mult)
 
         total = per_turn.sum()
@@ -314,17 +332,17 @@ class TurnFlowPolicy(TurnVectorRegressor):
         loss = total / denom
 
         with torch.no_grad():
-            metrics = self._flow_metrics(ctx.detach(), gt_diffs)
+            metrics = self._flow_metrics(ctx_raw.detach(), gt_diffs)
             metrics["loss_sum"] = total.detach()
             metrics["nll_sum_raw"] = total.detach()
             metrics["nll_floor_sum"] = torch.tensor(
                 self.flow.min_nll_per_dim(self.sigma_mult) * per_turn.shape[0],
-                device=ctx.device, dtype=torch.float32)
-            metrics["n_turns"] = torch.tensor(ctx.shape[0], device=ctx.device)
+                device=ctx_raw.device, dtype=torch.float32)
+            metrics["n_turns"] = torch.tensor(ctx_raw.shape[0], device=ctx_raw.device)
             metrics["n_tokens"] = torch.tensor(
-                outputs["last_hidden_state"].shape[1], device=ctx.device)
-            metrics["n_dense_tokens"] = torch.tensor(input_ids.shape[1], device=ctx.device)
-            metrics["n_steps"] = torch.tensor(1, device=ctx.device)
+                outputs["last_hidden_state"].shape[1], device=ctx_raw.device)
+            metrics["n_dense_tokens"] = torch.tensor(input_ids.shape[1], device=ctx_raw.device)
+            metrics["n_steps"] = torch.tensor(1, device=ctx_raw.device)
         return {"loss": loss, **metrics}
 
     @torch.no_grad()
