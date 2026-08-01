@@ -141,6 +141,16 @@ def main():
                         "rotation has no gap at all, so the same pressure would snap "
                         "small genuine turns to zero and cost turn fidelity, which is "
                         "the one thing the current policy already does well.")
+    p.add_argument("--l1-mode", type=str, default="zero_target",
+                   choices=["all", "zero_target"],
+                   help="Where the L1 pull applies. 'all' shrinks every output by a "
+                        "constant lambda/2, which on this data is ~1.2 mm of forward "
+                        "motion -- invisible in MSE but not in Jensen-Shannon, because "
+                        "the targets are quantised into hard spikes and a 1.2 mm shift "
+                        "walks a spike out of its histogram bin. 'zero_target' applies "
+                        "the pull only where the data itself is inside the atom "
+                        "(|value| < 0.1 mm), which is exactly where squared error goes "
+                        "blind, and leaves decisive motion unbiased.")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch", type=int, default=8192)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -170,10 +180,12 @@ def main():
         idx = np.random.default_rng(a.seed).choice(
             len(train_diffs), min(a.max_train_chunks, len(train_diffs)), replace=False)
         train_diffs = train_diffs[np.sort(idx)]
+    scale = np.maximum(D.channel_scale(train_diffs, q=a.scale_percentile), 1e-6)
     if a.drop_strafe:
+        # Ablation: the model never sees strafe, on either side. Scored against the
+        # REAL validation strafe, so the number is the honest cost of dropping it.
         train_diffs = train_diffs.copy()
         train_diffs[:, :, 1] = 0.0
-    scale = np.maximum(D.channel_scale(train_diffs, q=a.scale_percentile), 1e-6)
     print(f"chunks train={len(train_diffs):,} val={len(val_diffs):,}  scale={scale}")
 
     device = a.device
@@ -190,7 +202,11 @@ def main():
     total_steps = steps_per_epoch * a.epochs
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=a.lr, total_steps=total_steps, pct_start=0.05)
-    val_raw = torch.from_numpy(val_diffs[:a.eval_chunks])
+    val_in = val_diffs[:a.eval_chunks]
+    if a.drop_strafe:
+        val_in = val_in.copy()
+        val_in[:, :, 1] = 0.0
+    val_raw = torch.from_numpy(val_in)
 
     cfg = {**vars(a), **model.config(), "train_chunks": int(n),
            "total_steps": int(total_steps)}
@@ -211,8 +227,9 @@ def main():
             target = model.normalise(x)
             recon_loss = torch.nn.functional.mse_loss(o["y_norm"], target)
             mom = moment_penalty(o["z"])
-            l1 = (o["y_norm"].reshape(-1, model.chunk_len, model.n_channels).abs()
-                  * l1_w).mean()
+            y = o["y_norm"].reshape(-1, model.chunk_len, model.n_channels).abs()
+            l1_mask = (x.abs() < D.EXACT).float() if a.l1_mode == "zero_target" else 1.0
+            l1 = (y * l1_w * l1_mask).mean()
             loss = recon_loss + a.moment_weight * mom + a.l1_weight * l1
             opt.zero_grad(set_to_none=True)
             loss.backward()
