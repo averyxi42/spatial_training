@@ -269,13 +269,36 @@ class ConditionalFlow(nn.Module):
     def min_nll_per_dim(self, sigma_mult: float = 1.0) -> float:
         """The likelihood floor the noise buys, in nats per dimension.
 
-        `log p <= -sum_i log(sqrt(2 pi) sigma_i)` in normalised units for a density that
-        is pure noise-smeared atom, so NLL can never legitimately go below this. Logged
-        every step: a run that crosses it is diverging, not learning, and that is worth
-        knowing within seconds rather than at the end.
+        A density smeared by `sigma` cannot exceed `prod_i 1/(sqrt(2 pi) sigma_i)`
+        anywhere, so `NLL >= mean_i log(sqrt(2 pi) sigma_i)` pointwise -- no model, however
+        overfitted, can go below this legitimately. Logged every step: a run that crosses
+        it is diverging, not learning, and that is worth knowing within seconds rather than
+        at the end.
+
+        **In raw units, matching `log_prob`.** This was wrong when the module was first
+        written: the bound was computed on `noise_std / unit_scale` while `log_prob` folds
+        `log_unit_det` in and reports the density in the target's own metres and radians.
+        The two differed by exactly `mean_i log(unit_scale_i)` = -2.79 nats/dim, so the
+        guard sat 2.79 nats too high and fired on a marginal fit that was in fact 2.7 nats
+        clear of the real floor (`dump/cnf_head/flow/FINDINGS.md`). A safety rail in the
+        wrong units is worse than none, because the sign of the error decides whether it
+        cries wolf or stays silent through an actual divergence.
+
+        `achievable_nll_per_dim` is the softer companion: the pointwise bound is 0.5 nats
+        below the *entropy* of a pure smeared atom, which is the best any model can do, so
+        a healthy run approaches that and not this.
         """
-        s = self.noise_std_raw * max(sigma_mult, 1e-12) / self.unit_scale
+        s = self.noise_std_raw * max(sigma_mult, 1e-12)
         return float(torch.log(math.sqrt(2 * math.pi) * s).sum() / self.dim)
+
+    def achievable_nll_per_dim(self, sigma_mult: float = 1.0) -> float:
+        """Entropy of a pure noise-smeared atom, nats per dimension, raw units.
+
+        `H = mean_i log(sqrt(2 pi e) sigma_i)`, i.e. `min_nll_per_dim() + 0.5`. The floor a
+        model can actually reach if the data were nothing but the atom; real data has mass
+        away from it, so a correct run sits above this and below it only by memorising.
+        """
+        return self.min_nll_per_dim(sigma_mult) + 0.5
 
     # -- the two directions -----------------------------------------------------------
     def _normalising(self, x_norm: torch.Tensor, ctx: Optional[torch.Tensor]):
