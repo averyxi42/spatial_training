@@ -164,6 +164,48 @@ class FlowActionDecoder(nn.Module):
         raise ValueError(f"unknown decode rule {rule!r}; expected one of {DECODE_RULES}")
 
 
+def warm_start_from_marginal(flow: ConditionalFlow, path: Union[str, Path]) -> dict:
+    """Initialise a conditional flow from an unconditional fit of the same architecture.
+
+    The conditional head sees ~250 action chunks per optimizer step (one conversation of
+    turns); the standalone marginal fit sees 4096 per step and converges in minutes. Asked
+    to learn the density *and* the conditioning from that throughput, the conditional flow
+    spends thousands of steps rediscovering a marginal that is already sitting on disk --
+    at step 250 it was still indistinguishable from its own image-blind null.
+
+    So the marginal is fitted offline and loaded here. This is the same move the bin-head
+    control makes when it fits its bin edges offline and passes them in: the output
+    parameterisation is estimated from the training data before any GPU time, and only the
+    mapping from observation to action is learned on the VLM.
+
+    Every parameter transfers unchanged except each coupling's first layer, whose input
+    grew by `context_dim`. The marginal's columns are copied and the context columns are
+    **zeroed**, so the flow starts as *exactly* the marginal density -- conditioning enters
+    as a perturbation from a known-good starting point rather than from noise.
+    """
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    src, dst = blob["state_dict"], flow.state_dict()
+    copied, padded, skipped = 0, 0, []
+    for k, v in dst.items():
+        if k not in src:
+            skipped.append(k)
+            continue
+        s = src[k]
+        if s.shape == v.shape:
+            v.copy_(s)
+            copied += 1
+        elif s.dim() == 2 and v.dim() == 2 and s.shape[0] == v.shape[0] \
+                and s.shape[1] < v.shape[1]:
+            v.zero_()
+            v[:, : s.shape[1]].copy_(s)
+            padded += 1
+        else:
+            skipped.append(f"{k} {tuple(s.shape)}->{tuple(v.shape)}")
+    flow.load_state_dict(dst)
+    return {"copied": copied, "context_padded": padded, "skipped": skipped,
+            "source": str(path), "source_config": blob.get("config", {})}
+
+
 class TurnFlowPolicy(TurnVectorRegressor):
     """`TurnVectorRegressor` whose trunk emits a conditioning vector and whose loss is NLL."""
 
@@ -388,18 +430,86 @@ class FlowSFTTrainer(TurnVectorSFTTrainer):
     """
 
     def __init__(self, *args, sigma_start: float = 100.0, sigma_anneal_steps: int = 1000,
-                 **kwargs):
+                 gate_saturation: float = 0.05, gate_logdet_slack: float = 1.5,
+                 gate_patience: int = 20, **kwargs):
         super().__init__(*args, **kwargs)
         self.sigma_start = float(sigma_start)
         self.sigma_anneal_steps = int(sigma_anneal_steps)
+        self.gate_saturation = float(gate_saturation)
+        self.gate_logdet_slack = float(gate_logdet_slack)
+        self.gate_patience = int(gate_patience)
+        self._violations = 0
+
+    # -- the automatic stability gate --------------------------------------------------
+    def logdet_budget(self) -> float:
+        """The log-determinant the noise floor *entitles* the flow to, in nats per chunk.
+
+        Placing mass on an atom of width `sigma` in a space normalised by `unit_scale`
+        requires contracting by `sum_i log(unit_scale_i / sigma_i)`, and the noise floor
+        makes that a ceiling as well as a requirement. So a growing `logdet_absmax` is not
+        by itself evidence of anything -- it is the flow doing the job -- and the useful
+        question is whether it is heading past the budget.
+
+        Measured on the standalone marginal fit at sigma=1e-5: budget 261.6, observed
+        plateau 254.7 after 20k steps with `scale_saturation` identically 0. The bound
+        works; it just is not zero.
+        """
+        flow = self.accelerator.unwrap_model(self.model).flow
+        return float(torch.log(flow.unit_scale / flow.noise_std_raw).sum())
+
+    def _check_stability(self, outputs: Dict[str, torch.Tensor], model) -> None:
+        """Fail loudly on the signatures of an actual runaway, not on a healthy logdet.
+
+        Three conditions, each measuring something the others cannot:
+          * NLL below the hard bound -- the flow is exploiting an atom, so the likelihood
+            has stopped meaning anything;
+          * coupling scales pinned at `s_max` -- the runaway signature the bound exists to
+            stop, and the one that shows up *before* the loss moves;
+          * log-determinant past its budget with slack -- concentration beyond anything
+            the noise floor can justify.
+        `gate_patience` consecutive violations are required, because any one step can be an
+        outlier and killing a multi-hour run on a single batch would be its own failure.
+        """
+        unwrapped = self.accelerator.unwrap_model(model)
+        loss = float(outputs["loss"].detach())
+        nll = float(outputs["nll_sum_raw"]) / max(1, int(outputs["n_turns"]))
+        floor = unwrapped.flow.min_nll_per_dim(unwrapped.sigma_mult)
+        sat = float(outputs.get("sat_sum", torch.zeros(())))
+        logdet = float(outputs.get("logdet_absmax", torch.zeros(())))
+        budget = self.logdet_budget() * self.gate_logdet_slack
+
+        why = []
+        if not math.isfinite(loss):
+            why.append(f"non-finite loss {loss}")
+        if nll < floor:
+            why.append(f"NLL/dim {nll:.3f} below the hard bound {floor:.3f}")
+        if sat > self.gate_saturation:
+            why.append(f"scale_saturation {sat:.3f} > {self.gate_saturation}")
+        if logdet > budget:
+            why.append(f"logdet_absmax {logdet:.1f} > {budget:.1f} "
+                       f"(noise-floor budget x{self.gate_logdet_slack})")
+        if not why:
+            self._violations = 0
+            return
+        self._violations += 1
+        msg = (f"[stability gate] step {self.state.global_step} "
+               f"({self._violations}/{self.gate_patience}): " + "; ".join(why))
+        print(msg, flush=True)
+        if self._violations >= self.gate_patience:
+            raise RuntimeError(
+                msg + " -- sustained. The flow is diverging rather than learning; every "
+                "checkpoint after this point is worthless, so the run is stopped here."
+            )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         sm = sigma_schedule(self.state.global_step, self.sigma_anneal_steps, self.sigma_start)
         self.accelerator.unwrap_model(model).set_sigma_mult(sm)
-        return super().compute_loss(
-            model, inputs, return_outputs=return_outputs,
-            num_items_in_batch=num_items_in_batch,
+        loss, outputs = super().compute_loss(
+            model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch,
         )
+        if model.training:
+            self._check_stability(outputs, model)
+        return (loss, outputs) if return_outputs else loss
 
     def _accumulate(self, outputs: Dict[str, torch.Tensor]):
         super()._accumulate(outputs)

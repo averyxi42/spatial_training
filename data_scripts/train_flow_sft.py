@@ -77,12 +77,23 @@ def parse_args():
     f.add_argument("--flow-lr", type=float, default=3e-4,
                    help="the flow is fresh and small, so it wants a larger step than the "
                         "adapters; it shares the head's group otherwise")
-    f.add_argument("--noise-std", type=float, default=1e-5,
+    f.add_argument("--noise-std", type=float, default=3e-5,
                    help="raw-unit noise floor per channel. See the module docstring "
                         "before changing this")
+    f.add_argument("--init-flow", default=None,
+                   help="warm-start the density from a standalone marginal fit "
+                        "(dump/cnf_head/flow/pretrain_*.pt), the way the bin control "
+                        "fits its edges offline")
+    f.add_argument("--gate-saturation", type=float, default=0.05)
+    f.add_argument("--gate-logdet-slack", type=float, default=1.5)
+    f.add_argument("--gate-patience", type=int, default=20)
     f.add_argument("--sigma-start", type=float, default=100.0,
                    help="noise-floor multiplier at step 0, annealed to 1")
-    f.add_argument("--sigma-anneal-steps", type=int, default=1000)
+    f.add_argument("--sigma-anneal-steps", type=int, default=None,
+                   help="default 1000 from a cold start, and 0 with --init-flow: the "
+                        "anneal exists to stabilise early optimisation, which a warm "
+                        "start has already done, and starting wide would only blur a "
+                        "density that is already at the right sharpness")
     f.add_argument("--decode-k", type=int, default=16,
                    help="samples per context for the best-of-k committed readout")
     mine, rest = pre.parse_known_args()
@@ -95,6 +106,8 @@ def parse_args():
 
     for k, v in vars(mine).items():
         setattr(args, k, v)
+    if args.sigma_anneal_steps is None:
+        args.sigma_anneal_steps = 0 if args.init_flow else 1000
     # The baseline's defaults point at the baseline's artifacts; inheriting them would
     # write flow checkpoints on top of the run this is measured against.
     if args.output_dir == "dump/vector_sft":
@@ -187,10 +200,25 @@ def main():
         },
         decode_k=args.decode_k,
     )
+    if args.init_flow:
+        from longnav.utils.flow_head import warm_start_from_marginal
+
+        rep = warm_start_from_marginal(model.flow, args.init_flow)
+        if is_main:
+            print(f"Warm start from {rep['source']}: {rep['copied']} tensors copied, "
+                  f"{rep['context_padded']} context-padded, "
+                  f"{len(rep['skipped'])} skipped {rep['skipped'][:3]}")
+            if rep["source_config"].get("noise_std", [None])[0] != args.noise_std:
+                print(f"  !! marginal was fitted at noise_std="
+                      f"{rep['source_config'].get('noise_std')} but this run uses "
+                      f"{args.noise_std}; the density starts at the wrong sharpness")
     if is_main:
         print("Model:", model.trainable_parameter_report())
         print(f"Flow: {sum(p.numel() for p in model.flow.parameters()):,} params, "
               f"{args.flow_layers} coupling layers, s_max {args.flow_s_max}")
+        print(f"Log-determinant budget from the noise floor: "
+              f"{float(torch.log(model.flow.unit_scale / model.flow.noise_std_raw).sum()):.1f} "
+              f"nats/chunk (gate fires above x{args.gate_logdet_slack})")
         print(f"Noise floor: sigma={args.noise_std:g} raw units, annealed from "
               f"{args.sigma_start}x over {args.sigma_anneal_steps} steps. "
               f"min NLL/dim at sigma: {model.flow.min_nll_per_dim(1.0):.3f} nats "
@@ -250,6 +278,9 @@ def main():
         eval_data_collator=eval_collator,
         sigma_start=args.sigma_start,
         sigma_anneal_steps=args.sigma_anneal_steps,
+        gate_saturation=args.gate_saturation,
+        gate_logdet_slack=args.gate_logdet_slack,
+        gate_patience=args.gate_patience,
     )
     optim_cls, optim_kwargs = trainer.get_optimizer_cls_and_kwargs(training_args)
     optim_kwargs.pop("lr", None)
