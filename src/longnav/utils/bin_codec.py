@@ -208,6 +208,15 @@ class BinCodec(torch.nn.Module):
         super().__init__()
         self.n_dims, self.n_bins = int(n_dims), int(n_bins)
         self.decode = decode
+        # Sticky fallback generator for `sample` decode, consulted by `decode_diffs`
+        # whenever a caller does not pass one explicitly -- in particular
+        # `denormalize()`, which is the path `VectorRolloutPolicy.step()` uses and has
+        # no generator parameter of its own. A closed-loop rollout can therefore
+        # reseed this once per episode (`codec.generator =
+        # torch.Generator(device=...).manual_seed(episode_seed)`) and get
+        # reproducible, per-episode-fixed sampling with no change to the rollout code.
+        # `None` (the default) means "use the global default RNG", the old behaviour.
+        self.generator: Optional[torch.Generator] = None
         self.register_buffer("cuts", torch.zeros(n_dims, n_bins - 2, dtype=torch.float64))
         self.register_buffer("centroids", torch.zeros(n_dims, n_bins, dtype=torch.float64))
         self.register_buffer("zero_tol", torch.tensor(float(zero_tol), dtype=torch.float64))
@@ -287,7 +296,8 @@ class BinCodec(torch.nn.Module):
         if mode == "mean":
             return self.decode_probs(probs)
         flat = probs.reshape(-1, self.n_bins)
-        draw = torch.multinomial(flat, 1, generator=generator).reshape(logits.shape[:-1])
+        gen = generator if generator is not None else self.generator
+        draw = torch.multinomial(flat, 1, generator=gen).reshape(logits.shape[:-1])
         return self.decode_labels(draw)
 
     # -- persistence -------------------------------------------------------------------
