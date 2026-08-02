@@ -106,17 +106,22 @@ class ChunkVQCodec(nn.Module):
 
     @torch.no_grad()
     def encode_diffs(self, diffs: torch.Tensor) -> torch.Tensor:
-        """(..., 3) differentials -> (...,) long codebook indices, nearest centroid."""
+        """(..., 3) differentials -> (...,) long codebook indices, nearest centroid.
+
+        Pure nearest-centroid, with no special case for the stop mode. The codebook is
+        learned end to end by k-means (`dump/autoregressive_head/fit_codebook.py`) rather
+        than having a (0,0,0) atom forced into index 0, so index 0 carries no special
+        meaning; an earlier revision overrode stopped ticks to index 0, which would now
+        misassign every one of them. The stop code is verified to emerge on its own
+        instead -- see that file's `zero_code_report`.
+        """
         self._require_fitted()
         v = diffs.double()
         flat = v.reshape(-1, self.n_dims)
-        joint_zero = (flat.abs() < self.zero_tol).all(dim=-1)
         # (n, n_codes) squared distance to every centroid; small enough (n_codes <= a few
         # thousand) that a dense cdist is simpler and fast enough than a KD-tree.
         d2 = torch.cdist(flat, self.centroids) ** 2
-        idx = d2.argmin(dim=-1)
-        idx = torch.where(joint_zero, torch.zeros_like(idx), idx)
-        return idx.reshape(v.shape[:-1])
+        return d2.argmin(dim=-1).reshape(v.shape[:-1])
 
     def decode_labels(self, idx: torch.Tensor) -> torch.Tensor:
         """(...,) long codebook indices -> (..., 3) differentials."""
