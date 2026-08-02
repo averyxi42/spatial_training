@@ -1,0 +1,245 @@
+"""
+Train the autoregressive-over-ticks action head -- the candidate hedged against the
+conditional normalizing flow, per `dump/overnight/PLAN.md` and
+`dump/autoregressive_head/FINDINGS.md`.
+
+Exactly the discrete-bin control's own pattern (`data_scripts/train_bin_sft.py`): every
+argument that is not the output parameterization is borrowed from `train_vector_sft.py`'s
+parser, dataset loader, optimizer param groups and preflight -- so this run differs from
+the regression baseline (and from the bin-head control) only in what the head predicts and
+how, not in data, backbone, LoRA config or optimizer.
+
+    python data_scripts/train_ar_action_sft.py \
+        --train-dataset data/continuous_sft_formatted \
+        --codebook dump/autoregressive_head/codebook_256.json \
+        --max-steps 6000 --grad-accum 1 --max-turns 400 \
+        --dataloader-workers 8 --output-dir dump/autoregressive_head/run1
+
+Codebook is fitted offline by `dump/autoregressive_head/fit_codebook.py` and passed in,
+not fitted here -- gated on its own (round trip must preserve the data's exact-stop mass)
+before any GPU time is spent, mirroring the bin head's `fit_bins.py` gate.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+for p in (str(_ROOT), str(_ROOT / "src"), str(_ROOT / "data_scripts")):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import torch  # noqa: E402
+from transformers import AutoProcessor, TrainingArguments  # noqa: E402
+
+import train_vector_sft as base  # noqa: E402
+from longnav.utils.ar_action_head import (  # noqa: E402
+    ARActionSFTTrainer, ChunkVQCodec, TurnARActionClassifier,
+)
+from longnav.utils.vector_sft import (  # noqa: E402
+    DataConfig, LossConfig, LoraSpec, ModelConfig, TurnVectorCollator,
+)
+
+
+def build_optimizer_param_groups(model, args):
+    """`base.build_optimizer_param_groups`, but with the fresh causal decoder grouped
+    with the fresh trunk head under `--head-lr` rather than under the adapters' `--lr`.
+    The decoder is exactly as randomly-initialized as `model.head` and exactly as small,
+    so it wants the same larger step a fresh head usually does -- only the LoRA adapters
+    on the pretrained backbone should move at the conservative rate. Reimplemented here
+    (not editing `train_vector_sft.py`) precisely because that grouping choice is specific
+    to this head having a second fresh module the base function does not know about.
+    """
+    fresh = list(model.head.parameters()) + list(model.decoder.parameters())
+    fresh = [p for p in fresh if p.requires_grad]
+    fresh_ids = {id(p) for p in fresh}
+    other = [p for p in model.parameters() if p.requires_grad and id(p) not in fresh_ids]
+    groups = [{"params": other, "lr": args.lr, "weight_decay": args.weight_decay}]
+    if fresh:
+        groups.append({
+            "params": fresh,
+            "lr": args.head_lr if args.head_lr is not None else args.lr,
+            "weight_decay": args.weight_decay,
+        })
+    return groups
+
+
+def parse_args():
+    pre = base.argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--codebook", default=None,
+                     help="JSON written by dump/autoregressive_head/fit_codebook.py")
+    pre.add_argument("--context-dim", type=int, default=256,
+                     help="width of the context vector the VLM trunk hands the decoder")
+    pre.add_argument("--decoder-d-model", type=int, default=128)
+    pre.add_argument("--decoder-layers", type=int, default=4)
+    pre.add_argument("--decoder-heads", type=int, default=4)
+    pre.add_argument("--decoder-ff", type=int, default=512)
+    pre.add_argument("--decoder-dropout", type=float, default=0.1)
+    mine, rest = pre.parse_known_args()
+
+    old_argv, sys.argv = sys.argv, [sys.argv[0], *rest]
+    try:
+        args = base.parse_args()
+    finally:
+        sys.argv = old_argv
+
+    if not mine.codebook:
+        raise SystemExit(
+            "--codebook is required (see dump/autoregressive_head/fit_codebook.py)"
+        )
+    args.codebook = mine.codebook
+    args.context_dim = mine.context_dim
+    args.decoder_kwargs = dict(
+        d_model=mine.decoder_d_model, n_layers=mine.decoder_layers,
+        n_heads=mine.decoder_heads, dim_ff=mine.decoder_ff, dropout=mine.decoder_dropout,
+    )
+    if args.output_dir == "dump/vector_sft":
+        raise SystemExit(
+            "--output-dir defaults to the regression baseline's directory; pass an "
+            "explicit one under dump/autoregressive_head/"
+        )
+    if args.wandb_project == "longnav-vector-sft":
+        args.wandb_project = "longnav-autoregressive-head-study"
+    if args.loss != "huber":
+        raise SystemExit("--loss does not apply: this head's objective is cross-entropy")
+    return args
+
+
+def main():
+    args = parse_args()
+    is_main = int(os.environ.get("RANK", "0")) == 0
+
+    report_to = [] if args.no_wandb else ["wandb"]
+    if report_to:
+        os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
+        os.environ.setdefault("WANDB_MODE", "online")
+
+    model_cfg = ModelConfig(
+        model_id=args.model_id,
+        attn_impl=args.attn_impl,
+        prefix=base._unescape(args.prefix),
+        postfix=base._unescape(args.postfix),
+        shift_left=not args.no_shift_left,
+        pool_mode=args.pool_mode,
+        head_hidden_dims=base._csv(args.head_hidden_dims, int),
+        head_dropout=args.head_dropout,
+        freeze_vision_tower=not args.train_vision_tower,
+    )
+    data_cfg = DataConfig(
+        target_column=args.target_column,
+        messages_column=args.messages_column,
+        images_column=args.images_column,
+        max_turns_per_sample=args.max_turns or None,
+        target_dim_names=("dx", "dtheta"),  # what _band_metrics/trainer report on
+    )
+    loss_cfg = LossConfig(kind="cross_entropy", normalize_targets=False)
+    lora = None if args.no_lora else LoraSpec(
+        r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout,
+        target_modules=base._csv(args.lora_target_modules),
+    )
+
+    # ---- data ----------------------------------------------------------------------
+    train_ds = base.load_split(args.train_dataset, args.train_split)
+    eval_ds = None
+    if args.eval_split:
+        eval_ds = base.load_split(
+            args.eval_dataset or args.train_dataset, args.eval_split, args.eval_max_samples
+        )
+    chunk_shape = base.infer_target_shape(train_ds, args.target_column)   # (T, 3)
+    if chunk_shape[-1] != 3:
+        raise ValueError(f"expected a 3-dim (dx,dy,dtheta) chunk, got shape {chunk_shape}")
+    n_ticks = chunk_shape[0]
+    codebook = ChunkVQCodec.from_json(args.codebook)
+    if is_main:
+        print(f"Train rows: {len(train_ds)}  chunk {chunk_shape}  "
+              f"n_ticks={n_ticks}  n_codes={codebook.n_codes}"
+              + (f"  eval rows: {len(eval_ds)}" if eval_ds is not None else ""))
+
+    # ---- model ---------------------------------------------------------------------
+    processor = AutoProcessor.from_pretrained(args.model_id)
+    model = TurnARActionClassifier.build(
+        model_cfg, loss_cfg, lora, n_ticks, processor,
+        n_codes=codebook.n_codes, context_dim=args.context_dim,
+        decoder_kwargs=args.decoder_kwargs, dtype=torch.bfloat16,
+    )
+    model.codec.load_state_dict(codebook.state_dict())
+    if is_main:
+        print("Model:", model.trainable_parameter_report())
+        decoder_params = sum(p.numel() for p in model.decoder.parameters())
+        print(f"Codebook: {args.codebook}  n_codes={model.n_codes}  "
+              f"decoder params: {decoder_params:,}")
+
+    train_collator = TurnVectorCollator(processor, data_cfg, train=True, seed=args.seed)
+    eval_collator = TurnVectorCollator(processor, data_cfg, train=False, seed=args.seed)
+
+    if not args.no_preflight and is_main:
+        model.to("cuda" if torch.cuda.is_available() else "cpu")
+        if args.resume_from:
+            model.load_trainable(args.resume_from)
+            print(f"[preflight] loaded trainable weights from {args.resume_from}")
+        base.preflight(model, train_collator, train_ds, processor, model_cfg)
+
+    # ---- trainer -------------------------------------------------------------------
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        run_name=args.run_name,
+        report_to=report_to,
+        seed=args.seed,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=args.grad_accum,
+        max_steps=args.max_steps,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type=args.lr_scheduler,
+        max_grad_norm=args.max_grad_norm,
+        bf16=True,
+        gradient_checkpointing=not args.no_grad_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        logging_steps=args.logging_steps,
+        save_strategy="steps",
+        save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
+        eval_strategy="steps" if eval_ds is not None else "no",
+        eval_steps=args.eval_steps,
+        dataloader_num_workers=args.dataloader_workers,
+        dataloader_pin_memory=False,
+        remove_unused_columns=False,
+        label_names=[],
+        ddp_find_unused_parameters=False,
+        average_tokens_across_devices=True,
+        optim="adamw_torch",
+    )
+
+    trainer = ARActionSFTTrainer(
+        model=model,
+        args=training_args,
+        data_collator=train_collator,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        processing_class=processor,
+        data_config=data_cfg,
+        eval_data_collator=eval_collator,
+    )
+    optim_cls, optim_kwargs = trainer.get_optimizer_cls_and_kwargs(training_args)
+    optim_kwargs.pop("lr", None)
+    trainer.optimizer = optim_cls(
+        build_optimizer_param_groups(model, args), lr=args.lr, **optim_kwargs
+    )
+
+    if is_main:
+        print(f"Effective batch: 1 x {args.grad_accum} accum x "
+              f"{training_args.world_size} rank(s) = "
+              f"{args.grad_accum * training_args.world_size} conversations/step")
+
+    trainer.train(resume_from_checkpoint=args.resume_from)
+    trainer.save_model(os.path.join(args.output_dir, "final"))
+    if torch.cuda.is_available() and is_main:
+        print(f"Peak GPU memory: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+
+
+if __name__ == "__main__":
+    main()
