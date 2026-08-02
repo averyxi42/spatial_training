@@ -139,11 +139,32 @@ class ChunkVQCodec(nn.Module):
 
     @classmethod
     def from_json(cls, path_or_obj) -> "ChunkVQCodec":
+        """Load a codebook, accepting either on-disk layout.
+
+        Two writers exist and both must load here: this track's
+        `dump/autoregressive_head/fit_codebook.py` (`n_clusters` / `centroids` /
+        `zero_tol`) and the shared `longnav.utils.action_codebook.ActionCodebook.save`
+        (`format` / `n_clusters` / `centroids` / `meta`, and no `zero_tol` at all).
+        `ActionCodebook.from_dict` already reads this track's format; this is the
+        reciprocal, so a codebook fitted by either component is usable by either consumer.
+
+        `zero_tol` is vestigial and defaults accordingly: it was only ever consulted by the
+        joint-zero encode override, which was removed when the codebook stopped reserving
+        an index for a forced (0,0,0) atom. It is still stored as a buffer so old
+        checkpoints load, but nothing reads it on the encode path.
+        """
         obj = (json.loads(Path(path_or_obj).read_text())
                if isinstance(path_or_obj, (str, Path)) else path_or_obj)
         cen = obj.get("centroids")
-        n_codes = obj.get("n_codes", obj.get("n_clusters"))
-        codec = cls(n_codes=n_codes, n_dims=len(cen[0]), zero_tol=obj["zero_tol"])
+        if cen is None:
+            raise ValueError(f"no 'centroids' in codebook {path_or_obj!r}")
+        n_codes = obj.get("n_codes", obj.get("n_clusters", len(cen)))
+        if int(n_codes) != len(cen):
+            raise ValueError(
+                f"codebook declares {n_codes} codes but carries {len(cen)} centroids"
+            )
+        codec = cls(n_codes=int(n_codes), n_dims=len(cen[0]),
+                    zero_tol=float(obj.get("zero_tol", 1e-5)))
         codec.centroids.copy_(torch.tensor(cen, dtype=torch.float64))
         codec.fitted.fill_(True)
         return codec
