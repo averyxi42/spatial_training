@@ -18,6 +18,21 @@ how, not in data, backbone, LoRA config or optimizer.
 Codebook is fitted offline by `dump/autoregressive_head/fit_codebook.py` and passed in,
 not fitted here -- gated on its own (round trip must preserve the data's exact-stop mass)
 before any GPU time is spent, mirroring the bin head's `fit_bins.py` gate.
+
+`--modality-specs` and the `--stop-head` group come from `train_vector_sft.py`'s parser
+like everything else, and now reach this head's `ModelConfig` and collators too; see
+`longnav/utils/ar_action_head.py`. Both are inert unless passed.
+
+`--init-from` vs `--resume-from`
+--------------------------------
+`--resume-from` continues a run: optimizer state, LR schedule, global step, RNG and
+dataloader position all come back, and the config must describe the same model.
+`--init-from` only borrows the *weights* -- train from step 0 with a fresh optimizer, and
+let modules this run declares that the source checkpoint predates start at their own init.
+That is the right tool for taking a trained no-pose run as the starting point for a
+pose-injection one: the objective composition changes (a second loss term, a new encoder),
+so continuing the old schedule and step counter would be describing a run that never
+happened.
 """
 
 import os
@@ -39,6 +54,7 @@ from longnav.utils.ar_action_head import (  # noqa: E402
     DEFAULT_DT_NATIVE, ARActionSFTTrainer, CausalActionDecoder, ChunkVQCodec,
     TurnARActionClassifier,
 )
+from longnav.utils.stop_head import StopHeadConfig  # noqa: E402
 from longnav.utils.vector_sft import (  # noqa: E402
     DataConfig, LossConfig, LoraSpec, ModelConfig, TurnVectorCollator,
 )
@@ -54,6 +70,12 @@ def build_optimizer_param_groups(model, args):
     to this head having a second fresh module the base function does not know about.
     """
     fresh = list(model.head.parameters()) + list(model.decoder.parameters())
+    # Same reason, and the same failure mode the base function documents: a module left
+    # out of the groups is silently frozen, and for the modality encoders that is
+    # indistinguishable from "the injection did not help" -- the experiment's conclusion.
+    fresh += list(model.modality_embedder.parameters())
+    if model.stop_head is not None:
+        fresh += list(model.stop_head.parameters())
     fresh = [p for p in fresh if p.requires_grad]
     fresh_ids = {id(p) for p in fresh}
     other = [p for p in model.parameters() if p.requires_grad and id(p) not in fresh_ids]
@@ -107,6 +129,14 @@ def parse_args():
                           "original single 0.1 constant, which left the accumulated-pose "
                           "features ~20x wider than the differential ones. Only 'legacy' "
                           "reproduces checkpoints trained before the split")
+    pre.add_argument("--init-from", default=None,
+                     help="WARM START from a checkpoint: load its trained weights into "
+                          "this model and then train from step 0 with a fresh optimizer, "
+                          "scheduler and dataloader order. Distinct from --resume-from, "
+                          "which continues that run's schedule and step counter. Modules "
+                          "this run declares that the checkpoint predates (a modality "
+                          "encoder, a stop head) start at their own init; every shared "
+                          "module loads strictly. --resume-from wins if both are given")
     pre.add_argument("--attn-mode", default="causal", choices=("causal", "markov"),
                      help="'markov' lets each tick attend only to the context slots and "
                           "itself, making the per-tick input a sufficient state. Requires "
@@ -124,6 +154,7 @@ def parse_args():
             "--codebook is required (see dump/autoregressive_head/fit_codebook.py)"
         )
     args.codebook = mine.codebook
+    args.init_from = mine.init_from
     # Under --direct-context the interface width is not a free choice: the readout MLP
     # must emit exactly one d_model-wide vector per prefix token. Derive it rather than
     # letting a stale --context-dim silently disagree.
@@ -190,6 +221,22 @@ def main():
         head_hidden_dims=base._csv(args.head_hidden_dims, int),
         head_dropout=args.head_dropout,
         freeze_vision_tower=not args.train_vision_tower,
+        # `--modality-specs` and the `--stop-head` group come from `base.parse_args()`
+        # already (this script only pre-parses the head-shape flags); what was missing was
+        # putting them on the ModelConfig. Both default to inert.
+        modality_specs=base._modality_specs(args.modality_specs),
+        stop_head=(
+            StopHeadConfig(
+                hidden_dims=base._csv(args.stop_hidden_dims, int),
+                stop_grad=not args.no_stop_grad,
+                loss_weight=args.stop_loss_weight,
+                pos_weight=args.stop_pos_weight,
+                temperature=args.stop_temperature,
+                inference=args.stop_inference,
+                threshold=args.stop_threshold,
+            )
+            if args.stop_head else None
+        ),
     )
     data_cfg = DataConfig(
         target_column=args.target_column,
@@ -238,6 +285,21 @@ def main():
     if not dt_native and row0.get("native_fps"):
         dt_native = 1.0 / float(row0["native_fps"])
     model.dt_native = float(dt_native or DEFAULT_DT_NATIVE)
+
+    # Warm start, on every rank and before the optimizer exists -- the whole point is that
+    # only the *weights* come across. `trainer.train()` below is NOT told about this
+    # directory, so the optimizer state, the LR schedule, the global step, the RNG and the
+    # dataloader position are all fresh, which is what makes it a new run rather than a
+    # continuation of one with a different objective composition.
+    if args.init_from and not args.resume_from:
+        fresh = model.warm_start(args.init_from)
+        if is_main:
+            print(f"[init-from] loaded trainable weights from {args.init_from}")
+            print(f"[init-from] left at fresh init: {fresh or 'nothing'}")
+    elif args.init_from and args.resume_from and is_main:
+        print(f"[init-from] ignored: --resume-from {args.resume_from} restores the full "
+              "training state, including these weights")
+
     if is_main:
         print("Model:", model.trainable_parameter_report())
         decoder_params = sum(p.numel() for p in model.decoder.parameters())
@@ -248,9 +310,21 @@ def main():
         print(f"Context: dim {args.context_dim} -{route}-> {dk['n_context_tokens']} "
               f"token(s) x {dk['d_model']}   prefix_pose={dk['use_prefix_pose']}  "
               f"attn={dk['attn_mode']}  pose_scales={tuple(dk['pose_scales'])}")
+        if model.modality_embedder:
+            print("Modality embeddings:\n" + model.modality_embedder.describe())
+        if model.stop_head is not None:
+            print(f"Stop head: {model_cfg.stop_head}")
 
-    train_collator = TurnVectorCollator(processor, data_cfg, train=True, seed=args.seed)
-    eval_collator = TurnVectorCollator(processor, data_cfg, train=False, seed=args.seed)
+    # The model's own spec list, not a second copy -- `build()` has already registered the
+    # marker tokens on this processor's tokenizer. Stop labels are driven off the model
+    # config rather than a second flag: the collator emits them exactly when the model has
+    # somewhere to put them.
+    specs = model_cfg.modality_specs
+    stop_labels = model_cfg.stop_head is not None
+    train_collator = TurnVectorCollator(processor, data_cfg, train=True, seed=args.seed,
+                                        modality_specs=specs, stop_labels=stop_labels)
+    eval_collator = TurnVectorCollator(processor, data_cfg, train=False, seed=args.seed,
+                                       modality_specs=specs, stop_labels=stop_labels)
 
     if not args.no_preflight and is_main:
         model.to("cuda" if torch.cuda.is_available() else "cpu")

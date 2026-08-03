@@ -1005,6 +1005,63 @@ class TurnVectorRegressor(nn.Module):
             self.load_adapter_state(checkpoint_dir)
         return self
 
+    def warm_start(self, checkpoint_dir: Union[str, Path],
+                   adapter: bool = True) -> List[str]:
+        """Initialize from a checkpoint that predates some of this model's modules.
+
+        Not a resume, and deliberately a separate entry point rather than a flag on
+        `load_trainable`. A **resume** must be exactly as strict as it is: the checkpoint
+        and the config describe the same run, so a declared module with no weights is a
+        mismatched checkpoint and the DESIGN.md 7.1 rule that makes that a hard error is
+        right. A **warm start** is the one case where it is legitimately not -- the new
+        modules did not exist when those weights were written, and starting them fresh is
+        the point.
+
+        So exactly one thing is forgiven: a module this model declares that the checkpoint
+        has *no entry for at all*. Everything else keeps full strictness --
+
+          * `head` and `normalizer` load with `strict=True`; shape drift raises, since a
+            shared module that only mostly matches is a config mismatch, not a warm start
+          * a modality blob that IS present goes through `load_state_blob`, which is strict
+            in both directions -- so weights for an undeclared spec, a declared spec missing
+            from a blob that has other specs, and shape drift all still raise
+          * stop-head weights for a model that declares no stop head raise, for the same
+            reason: that is an unexpected module, not a missing one
+
+        Returns the names of the modules left at their fresh initialization, so the caller
+        can print them. Silence about which modules were NOT loaded is how a warm start
+        turns into an accidental from-scratch run.
+        """
+        checkpoint_dir = Path(checkpoint_dir)
+        blob = torch.load(
+            checkpoint_dir / HEAD_WEIGHTS_FILE, map_location="cpu", weights_only=False
+        )
+        self.head.load_state_dict(blob["head"], strict=True)
+        self.normalizer.load_state_dict(blob["normalizer"], strict=True)
+
+        fresh: List[str] = []
+        modality = blob.get("modality")
+        if modality:
+            self.modality_embedder.load_state_blob(modality)
+        elif self.modality_embedder:
+            fresh.extend(f"modality_embedder.{k}" for k in self.modality_embedder.keys)
+
+        stop_blob = blob.get("stop_head")
+        if stop_blob:
+            if self.stop_head is None:
+                raise RuntimeError(
+                    "checkpoint carries stop-head weights but the config declares no stop "
+                    "head; loading it would give a model that behaves differently from "
+                    "what its config claims"
+                )
+            self.stop_head.load_state_dict(stop_blob, strict=True)
+        elif self.stop_head is not None:
+            fresh.append("stop_head")
+
+        if adapter:
+            self.load_adapter_state(checkpoint_dir)
+        return fresh
+
     @classmethod
     def from_pretrained(
         cls,

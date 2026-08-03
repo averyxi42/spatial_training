@@ -39,6 +39,14 @@ changes, plus one more this design needs):
     autoregressive LM is trained) instead of Huber over reals or T x 3 independent
     categoricals.
 
+What does NOT change: `forward` overrides the base one, so everything the base wires
+around the objective -- modality-embedding injection (`ModalityBatch.pop_from` +
+`ModalityEmbedder.pending`), the split extraction that lets the trunk head and the stop
+head read ONE pooled context, the stop head itself, and the `zero_touch` DDP keep-alive --
+is mirrored here line for line rather than reinvented. It was originally absent, which
+silently made the pose-injection and stop-head flags no-ops on this head; if the base
+forward gains another such piece, it has to be mirrored here too.
+
 `vector_sft.py`, `turn_vectors.py`, `vector_rollout.py`, `bin_codec.py` and `bin_head.py`
 are all untouched.
 
@@ -190,6 +198,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from longnav.utils.bin_codec import compose_chunk, decompose_chunk
+from longnav.utils.modality_embed import ModalityBatch
 from longnav.utils.turn_vectors import extract_turn_vectors
 from longnav.utils.vector_sft import (
     ADAPTER_SUBDIR,
@@ -733,25 +742,47 @@ class TurnARActionClassifier(TurnVectorRegressor):
         attention_mask: Optional[torch.Tensor] = None,
         num_turns: Optional[torch.Tensor] = None,
         num_items_in_batch: Optional[Union[int, torch.Tensor]] = None,
-        **multimodal,
+        stop_targets: Optional[torch.Tensor] = None,
+        **backbone_inputs,
     ) -> Dict[str, torch.Tensor]:
-        multimodal.pop("labels", None)
-        outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            logits_to_keep=1,
-            **multimodal,
+        """The same wiring as `TurnVectorRegressor.forward` -- modality injection, the
+        split extraction, the stop head -- around this head's own objective.
+
+        Only the objective differs: VQ labels and a per-tick cross-entropy where the base
+        has a regression loss. Everything around it is deliberately a mirror of the base
+        (see its docstring for why each piece is where it is), because this head is the
+        live research line and the pose-injection experiment has to run on it.
+        """
+        backbone_inputs.pop("labels", None)
+        # The backbone does not accept `modality_*` keys and `backbone_inputs` is forwarded
+        # wholesale, so they have to come out first and by name.
+        modality = ModalityBatch.pop_from(
+            backbone_inputs, known_keys=self.modality_embedder.keys
         )
-        context, spans = extract_turn_vectors(
+        # Wraps only the backbone call: a second embedding call under one context trips
+        # the consume-once assert instead of silently reusing the same values.
+        with self.modality_embedder.pending(modality):
+            outputs = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                logits_to_keep=1,
+                **backbone_inputs,
+            )
+        # `head=None` and pool explicitly, so the AR context and the stop head read the
+        # same pooled state from one extraction. `self.head(states, span_mask)` below is
+        # the exact call `extract_turn_vectors` would have made internally.
+        states, spans, span_mask = extract_turn_vectors(
             outputs,
             input_ids,
-            self.head,
+            None,
             prefix_ids=self.prefix_ids,
             postfix_ids=self.postfix_ids,
             shift_left=self.model_cfg.shift_left,
             strict=True,
+            return_mask=True,
         )
+        context = self.head(states, span_mask)
         if context.shape[0] != targets.shape[0]:
             tail = input_ids[0, -64:].tolist()
             raise RuntimeError(
@@ -778,6 +809,48 @@ class TurnARActionClassifier(TurnVectorRegressor):
         denom = torch.as_tensor(denom, dtype=total.dtype, device=total.device).clamp(min=1)
         loss = total / denom
 
+        # An example with no occurrences of a modality leaves its encoder out of the
+        # backward graph, which under `ddp_find_unused_parameters=False` hangs or errors.
+        # Identically zero -- no gradient and no metric changes -- and exists only so every
+        # encoder parameter is always reached.
+        touch = self.modality_embedder.zero_touch(loss.device, loss.dtype)
+        if touch is not None:
+            loss = loss + touch
+
+        motion_loss = loss
+        stop_extra: Dict[str, torch.Tensor] = {}
+        if self.stop_head is not None:
+            pooled = self.head.pooled_context(states, span_mask)
+            if self.stop_head.cfg.stop_grad:
+                # Detached, the stop gradient reaches the stop head's own parameters and
+                # stops: not the backbone, not the adapters, not the trunk head, and so not
+                # the causal decoder either. That is what makes `loss_weight` untuned.
+                pooled = pooled.detach()
+            stop_logits = self.stop_head(pooled)
+            if stop_targets is not None:
+                stop_targets = stop_targets.reshape(-1).to(stop_logits.device)
+                if stop_targets.shape[0] != stop_logits.shape[0]:
+                    raise RuntimeError(
+                        f"{stop_logits.shape[0]} turn(s) but {stop_targets.shape[0]} stop "
+                        "label(s); the stop labels were not sliced with the turn window"
+                    )
+                stop_loss = self.stop_head.loss(stop_logits, stop_targets)
+                loss = loss + float(self.stop_head.cfg.loss_weight) * stop_loss.to(loss.dtype)
+                stop_extra["stop_loss_sum"] = stop_loss.detach() * stop_logits.shape[0]
+                stop_extra["stop_labels"] = stop_targets.detach().float()
+            else:
+                # No labels (inference, or a probe harvesting logits). Keep the head in the
+                # backward graph anyway, for the same DDP reason as `zero_touch` above.
+                loss = loss + stop_logits.sum() * 0.0
+            stop_extra["stop_logits"] = stop_logits.detach().float()
+            stop_extra["stop_n"] = torch.tensor(
+                float(stop_logits.shape[0]), device=loss.device
+            )
+            # Only with a stop head, and deliberately: with one objective it would just be
+            # `turn_loss` under a second name, and emitting it unconditionally is what
+            # stops this forward being bit-identical to the pre-port one.
+            stop_extra["motion_loss_sum"] = motion_loss.detach() * context.shape[0]
+
         with torch.no_grad():
             metrics = self._band_metrics(logits.detach(), labels, gt_diffs)
             if not self.training:
@@ -791,7 +864,7 @@ class TurnARActionClassifier(TurnVectorRegressor):
             )
             metrics["n_dense_tokens"] = torch.tensor(input_ids.shape[1], device=logits.device)
             metrics["n_steps"] = torch.tensor(1, device=logits.device)
-        return {"loss": loss, **metrics}
+        return {"loss": loss, **metrics, **stop_extra}
 
     @torch.no_grad()
     def _band_metrics(self, logits, labels, gt_diffs) -> Dict[str, torch.Tensor]:
