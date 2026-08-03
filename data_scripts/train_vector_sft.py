@@ -76,7 +76,7 @@ def parse_args():
     d.add_argument("--train-split", default="train")
     d.add_argument("--eval-dataset", default=None,
                    help="defaults to --train-dataset if --eval-split is given")
-    d.add_argument("--eval-split", default=None)
+    d.add_argument("--eval-split", default="validation", help="if given, triggers evaluation")
     d.add_argument("--eval-max-samples", type=int, default=64)
     d.add_argument("--target-column", default="action_chunks")
     d.add_argument("--messages-column", default="messages")
@@ -101,7 +101,12 @@ def parse_args():
                         "it (only sensible when the content is real text, not a placeholder)")
     m.add_argument("--pool-mode", default="mean", choices=["mean", "last", "attn", "flat"])
     m.add_argument("--head-hidden-dims", default="1024,1024",
-                   help="comma-separated MLP trunk widths; empty for a linear head")
+                   help="comma-separated MLP trunk widths; empty for a linear head. NOT a "
+                        "free knob: the CNF head ran at 64 and its conditioning vector "
+                        "collapsed to a participation ratio of 2.2 out of 128 dimensions "
+                        "(dump/cnf_sigma_ablation/FINDINGS.md). Every current run passes "
+                        "1024 explicitly; the default is wide so that forgetting to pass "
+                        "it cannot silently reintroduce that bottleneck.")
     m.add_argument("--head-dropout", type=float, default=0.0)
     m.add_argument("--train-vision-tower", action="store_true",
                    help="leave the ViT trainable (frozen by default)")
@@ -156,21 +161,21 @@ def parse_args():
 
     t = p.add_argument_group("optimization")
     t.add_argument("--output-dir", default="dump/vector_sft")
-    t.add_argument("--lr", type=float, default=1e-4)
-    t.add_argument("--head-lr", type=float, default=None,
+    t.add_argument("--lr", type=float, default=1e-5)
+    t.add_argument("--head-lr", type=float, default=1e-4,
                    help="separate LR for the head (defaults to --lr). A fresh head "
                         "usually wants a larger step than the adapters")
-    t.add_argument("--weight-decay", type=float, default=0.001)
+    t.add_argument("--weight-decay", type=float, default=0.0001)
     t.add_argument("--grad-accum", type=int, default=8)
     t.add_argument("--max-steps", type=int, default=5000)
-    t.add_argument("--warmup-ratio", type=float, default=0.03)
+    t.add_argument("--warmup-ratio", type=float, default=0.01)
     t.add_argument("--lr-scheduler", default="cosine")
     t.add_argument("--max-grad-norm", type=float, default=1.0)
     t.add_argument("--no-grad-checkpointing", action="store_true")
     t.add_argument("--logging-steps", type=int, default=1)
     t.add_argument("--save-steps", type=int, default=250)
     t.add_argument("--eval-steps", type=int, default=250)
-    t.add_argument("--save-total-limit", type=int, default=3)
+    t.add_argument("--save-total-limit", type=int, default=None)
     t.add_argument("--dataloader-workers", type=int, default=4)
     t.add_argument("--seed", type=int, default=42)
     t.add_argument("--resume-from", default=None)
