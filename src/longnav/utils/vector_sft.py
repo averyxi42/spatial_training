@@ -93,6 +93,12 @@ from longnav.utils.modality_embed import (
     coerce_specs,
     resolve_token_ids,
 )
+from longnav.utils.stop_head import (
+    StopHead,
+    StopHeadConfig,
+    episode_stop_labels,
+    stop_metrics,
+)
 from longnav.utils.turn_vectors import (
     ACTION_POSTFIX,
     ACTION_PREFIX,
@@ -140,11 +146,17 @@ class ModelConfig:
     # `longnav.utils.modality_embed`. Empty (the default, and what every checkpoint
     # written before this existed says) leaves the whole mechanism inert.
     modality_specs: Tuple[ModalityEmbedSpec, ...] = ()
+    # Auxiliary binary "is this the episode end" readout on the pooled turn context; see
+    # `longnav.utils.stop_head`. None (the default, and what every checkpoint written
+    # before this existed says) means no head, no loss term and no metrics.
+    stop_head: Optional[StopHeadConfig] = None
 
     def __post_init__(self):
         # Round-tripping through JSON turns the specs into plain dicts; coerce them back
         # here so `ModelConfig(**meta["model"])` yields the same object either way.
         self.modality_specs = coerce_specs(self.modality_specs)
+        if self.stop_head is not None:
+            self.stop_head = StopHeadConfig.from_dict(self.stop_head)
 
 
 @dataclass
@@ -410,6 +422,9 @@ class TurnVectorCollator:
     train: bool = True
     seed: int = 0
     modality_specs: Tuple[ModalityEmbedSpec, ...] = ()
+    # Emit `stop_targets` -- the episode-end indicator, sliced with the window. Off unless
+    # the model declares a stop head, so nothing changes for a run that has none.
+    stop_labels: bool = False
     _rng: Any = field(default=None, repr=False)
     _token_ids: Any = field(default=None, repr=False)
 
@@ -442,13 +457,18 @@ class TurnVectorCollator:
                 f"{self.data.target_column!r} -- the dataset row is inconsistent"
             )
 
+        # Raw column width, which is not necessarily `n_features`: a spec may declare a
+        # transform that changes it. Without a transform `raw_width == n_features` and this
+        # is the reshape it always was.
         modality = {
             s.key: torch.as_tensor(ex[s.source_column], dtype=torch.float32).reshape(
-                -1, s.n_features
+                -1, s.raw_width
             )
             for s in self.modality_specs
         }
 
+        n_total_turns = len(turns)
+        start = 0
         cap = self.data.max_turns_per_sample
         if cap is not None and len(turns) > cap:
             start = int(self._rng.integers(0, len(turns) - cap + 1)) if self.train else 0
@@ -470,6 +490,15 @@ class TurnVectorCollator:
                 messages, images, targets, start, cap
             )
 
+        # After the window, never before. A transform sees one example's values as the
+        # model will see them, so for pose "relative to the first row" means the first row
+        # *in context* -- which is the window's first observation when windowing is on and
+        # the episode's first when it is off. Transforming before the slice would anchor to
+        # an origin the agent never observed, and the same number would then mean different
+        # things in training and in a rollout that always starts at its own first frame.
+        for s in self.modality_specs:
+            modality[s.key] = s.apply_transform(modality[s.key])
+
         pil_images = [load_image(im) for im in images]
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False
@@ -484,6 +513,13 @@ class TurnVectorCollator:
         out = dict(batch)
         out["targets"] = targets
         out["num_turns"] = torch.tensor(targets.shape[0], dtype=torch.long)
+        if self.stop_labels:
+            # Derived from the row's own turn count rather than read from a column: the
+            # episode end IS the definition of a stop here, so giving it a second
+            # representation in the dataset would only create something to disagree with.
+            out["stop_targets"] = episode_stop_labels(
+                targets.shape[0], start, n_total_turns
+            )
         out.update(self._modality_kwargs(modality, out["input_ids"]))
         return out
 
@@ -551,10 +587,14 @@ class TurnVectorRegressor(nn.Module):
         model_cfg: ModelConfig,
         loss_cfg: LossConfig,
         modality_embedder: Optional[ModalityEmbedder] = None,
+        stop_head: Optional[StopHead] = None,
     ):
         super().__init__()
         self.backbone = backbone
         self.head = head
+        # None unless `model_cfg.stop_head` declares one, so the module list, the parameter
+        # count, the loss and the saved blob are all unchanged without it.
+        self.stop_head = stop_head
         self.normalizer = normalizer
         self.target_shape = tuple(target_shape)
         self.prefix_ids = list(prefix_ids)
@@ -649,9 +689,15 @@ class TurnVectorRegressor(nn.Module):
         embedder = ModalityEmbedder(model_cfg.modality_specs, d_model=hidden_size)
         if embedder:
             embedder.register(processor.tokenizer)
+        # Sized off the head's own pooled width, so 'flat' pooling (which concatenates
+        # `content_len` positions) cannot silently hand the stop head the wrong input dim.
+        stop_head = (
+            None if model_cfg.stop_head is None
+            else StopHead(head.pooled_dim, model_cfg.stop_head)
+        )
         model = cls(
             backbone, head, normalizer, target_shape, prefix_ids, postfix_ids,
-            model_cfg, loss_cfg, modality_embedder=embedder,
+            model_cfg, loss_cfg, modality_embedder=embedder, stop_head=stop_head,
         )
         model.attach_modality_hooks()
         return model
@@ -688,10 +734,13 @@ class TurnVectorRegressor(nn.Module):
         total = sum(p.numel() for p in self.parameters())
         head = sum(p.numel() for p in self.head.parameters() if p.requires_grad)
         mod = sum(p.numel() for p in self.modality_embedder.parameters() if p.requires_grad)
+        stop = (0 if self.stop_head is None
+                else sum(p.numel() for p in self.stop_head.parameters() if p.requires_grad))
         return (
             f"{trainable:,} trainable / {total:,} total params "
             f"({100 * trainable / total:.2f}%); head {head:,}, "
-            f"modality encoders {mod:,}, adapters {trainable - head - mod:,}"
+            f"modality encoders {mod:,}, stop head {stop:,}, "
+            f"adapters {trainable - head - mod - stop:,}"
         )
 
     # -- the objective -----------------------------------------------------------------
@@ -712,6 +761,7 @@ class TurnVectorRegressor(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         num_turns: Optional[torch.Tensor] = None,
         num_items_in_batch: Optional[Union[int, torch.Tensor]] = None,
+        stop_targets: Optional[torch.Tensor] = None,
         **backbone_inputs,
     ) -> Dict[str, torch.Tensor]:
         """`backbone_inputs` is whatever else the collator produced -- `pixel_values`,
@@ -737,15 +787,20 @@ class TurnVectorRegressor(nn.Module):
                 **backbone_inputs,
             )
 
-        vectors, spans = extract_turn_vectors(
+        # `head=None` and pool explicitly, so the motion head and the stop head read the
+        # same pooled context from one extraction rather than two. `self.head(states,
+        # mask)` below is the exact call `extract_turn_vectors` would have made internally.
+        states, spans, span_mask = extract_turn_vectors(
             outputs,
             input_ids,
-            self.head,
+            None,
             prefix_ids=self.prefix_ids,
             postfix_ids=self.postfix_ids,
             shift_left=self.model_cfg.shift_left,
             strict=True,
+            return_mask=True,
         )
+        vectors = self.head(states, span_mask)
         # The alignment gate. Turn k's vector must line up with target k; a tokenizer or
         # windowing change that shifts the count would otherwise train silently against
         # mismatched pairs.
@@ -778,6 +833,43 @@ class TurnVectorRegressor(nn.Module):
         if touch is not None:
             loss = loss + touch
 
+        motion_loss = loss
+        stop_extra: Dict[str, torch.Tensor] = {}
+        if self.stop_head is not None:
+            pooled = self.head.pooled_context(states, span_mask)
+            if self.stop_head.cfg.stop_grad:
+                # The constraint that makes this head free. Detached, the stop gradient
+                # reaches the stop head's own parameters and stops: not the backbone, not
+                # the adapters, not the motion head. So no weight of this loss can damage
+                # the motion objective, and `loss_weight` needs no tuning.
+                pooled = pooled.detach()
+            stop_logits = self.stop_head(pooled)
+            if stop_targets is not None:
+                stop_targets = stop_targets.reshape(-1).to(stop_logits.device)
+                if stop_targets.shape[0] != stop_logits.shape[0]:
+                    raise RuntimeError(
+                        f"{stop_logits.shape[0]} turn(s) but {stop_targets.shape[0]} stop "
+                        "label(s); the stop labels were not sliced with the turn window"
+                    )
+                stop_loss = self.stop_head.loss(stop_logits, stop_targets)
+                loss = loss + float(self.stop_head.cfg.loss_weight) * stop_loss.to(loss.dtype)
+                stop_extra["stop_loss_sum"] = stop_loss.detach() * stop_logits.shape[0]
+                stop_extra["stop_labels"] = stop_targets.detach().float()
+            else:
+                # No labels (inference, or a probe harvesting logits). Keep the head in the
+                # backward graph anyway, for the same DDP reason as `zero_touch` above.
+                loss = loss + stop_logits.sum() * 0.0
+            stop_extra["stop_logits"] = stop_logits.detach().float()
+            stop_extra["stop_n"] = torch.tensor(
+                float(stop_logits.shape[0]), device=loss.device
+            )
+            # Only with a stop head, and deliberately: it exists to show how the total
+            # splits between two objectives, and with one objective it would just be
+            # `turn_loss` under a second name -- a new logged series on every existing run
+            # for no information. Emitting it unconditionally is also what stopped this
+            # tree being bit-identical to the base one; see `inertness_check.py`.
+            stop_extra["motion_loss_sum"] = motion_loss.detach() * vectors.shape[0]
+
         with torch.no_grad():
             pred_orig = self.normalizer.denormalize(pred.detach())
             err = (pred_orig - targets).reshape(-1, self.target_shape[-1])
@@ -793,7 +885,7 @@ class TurnVectorRegressor(nn.Module):
                 "n_dense_tokens": torch.tensor(input_ids.shape[1], device=err.device),
                 "n_steps": torch.tensor(1, device=err.device),
             }
-        return {"loss": loss, **metrics}
+        return {"loss": loss, **metrics, **stop_extra}
 
     # -- checkpointing -----------------------------------------------------------------
     def save_pretrained(self, output_dir: Union[str, Path]):
@@ -815,8 +907,15 @@ class TurnVectorRegressor(nn.Module):
         modality = self.modality_embedder.state_blob()
         if modality is not None:
             blob["modality"] = modality
+        if self.stop_head is not None:
+            blob["stop_head"] = self.stop_head.state_dict()
         torch.save(blob, output_dir / HEAD_WEIGHTS_FILE)
         model_meta = asdict(self.model_cfg)
+        if model_meta.get("stop_head") is None:
+            # Same reasoning as `modality_specs` below: omitted rather than written as
+            # `null`, so a checkpoint without a stop head stays byte-identical to one
+            # written before the field existed and still loads in an older reader.
+            model_meta.pop("stop_head", None)
         if not model_meta.get("modality_specs"):
             # Omitted rather than written as `[]`, so a checkpoint with no modalities is
             # byte-identical to one written before this field existed -- and, more to the
@@ -850,6 +949,24 @@ class TurnVectorRegressor(nn.Module):
         self.head.load_state_dict(blob["head"], strict=strict)
         self.normalizer.load_state_dict(blob["normalizer"], strict=strict)
         self.modality_embedder.load_state_blob(blob.get("modality"))
+        # Strict in both directions, for the same reason the modality encoders are: the
+        # config decides whether a stop head exists, and a model that quietly has one more
+        # or one fewer readout than its own config claims is worse than a load error.
+        stop_blob = blob.get("stop_head")
+        if self.stop_head is None:
+            if stop_blob:
+                raise RuntimeError(
+                    "checkpoint carries stop-head weights but the config declares no stop "
+                    "head; loading it would give a model that behaves differently from "
+                    "what its config claims"
+                )
+        else:
+            if not stop_blob:
+                raise RuntimeError(
+                    "config declares a stop head but the checkpoint has no stop-head "
+                    "weights -- mismatched checkpoint"
+                )
+            self.stop_head.load_state_dict(stop_blob, strict=True)
         return self
 
     def load_adapter_state(self, checkpoint_dir: Union[str, Path]) -> bool:
@@ -974,6 +1091,9 @@ class TurnVectorSFTTrainer(Trainer):
         # divide-by-accumulation-steps, which our normalization already accounts for.
         self.model_accepts_loss_kwargs = True
         self._sums: Dict[str, torch.Tensor] = {}
+        self._stop_logits: List[torch.Tensor] = []
+        self._stop_labels: List[torch.Tensor] = []
+        self._last_stop_scores: Optional[Tuple[Any, Any]] = None
 
     # -- turn counting -----------------------------------------------------------------
     def _get_num_items_in_batch(self, batch_samples: List[Dict[str, Any]], device):
@@ -988,17 +1108,53 @@ class TurnVectorSFTTrainer(Trainer):
     # -- metric bookkeeping ------------------------------------------------------------
     def _accumulate(self, outputs: Dict[str, torch.Tensor]):
         for key in ("loss_sum", "sum_sq_err", "sum_abs_err", "n_rows", "n_turns",
-                    "n_tokens", "n_dense_tokens", "n_steps"):
+                    "n_tokens", "n_dense_tokens", "n_steps", "motion_loss_sum",
+                    "stop_loss_sum", "stop_n"):
             if key not in outputs:
                 continue
             v = outputs[key].detach().float()
             self._sums[key] = v.clone() if key not in self._sums else self._sums[key] + v
+        # Ranking metrics are not sums: average precision and AUC depend on the whole
+        # ordering, so the scores have to be kept rather than reduced as they arrive.
+        if "stop_logits" in outputs:
+            self._stop_logits.append(outputs["stop_logits"].detach().float().cpu())
+            labels = outputs.get("stop_labels")
+            self._stop_labels.append(
+                torch.full_like(self._stop_logits[-1], float("nan")) if labels is None
+                else labels.detach().float().cpu()
+            )
+
+    def _drain_stop_scores(self) -> Tuple[Any, Any]:
+        """The concatenated logits/labels seen since the last drain, gathered over ranks."""
+        import numpy as np
+
+        logits = self._stop_logits
+        labels = self._stop_labels
+        self._stop_logits, self._stop_labels = [], []
+        if not logits:
+            return np.zeros(0), np.zeros(0)
+        s = torch.cat(logits).numpy()
+        y = torch.cat(labels).numpy()
+        if self.args.world_size > 1:
+            # `all_gather_object` rather than a tensor gather: each rank has seen a
+            # different number of turns, and padding to a common length then trimming would
+            # need a length exchange anyway. These arrays are one float per turn.
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                bucket: List[Any] = [None] * self.args.world_size
+                dist.all_gather_object(bucket, (s, y))
+                s = np.concatenate([b[0] for b in bucket])
+                y = np.concatenate([b[1] for b in bucket])
+        keep = ~np.isnan(y)
+        return s[keep], y[keep]
 
     def _dim_names(self, n: int) -> List[str]:
         names = self.data_config.target_dim_names
         return list(names) if names and len(names) == n else [str(i) for i in range(n)]
 
     def _drain_metrics(self, prefix: str = "") -> Dict[str, float]:
+        stop_scores, stop_labels = self._drain_stop_scores()
         if not self._sums or "n_rows" not in self._sums:
             self._sums = {}
             return {}
@@ -1021,6 +1177,18 @@ class TurnVectorSFTTrainer(Trainer):
             out[f"{prefix}rmse_{name}"] = r
             out[f"{prefix}mae_{name}"] = m
         out[f"{prefix}rmse_mean"] = float(rmse.mean())
+
+        # Two objectives, two scalars. `turn_loss` above is the total; these say how it
+        # splits, which is the only way an auxiliary that has gone flat is visible.
+        if "motion_loss_sum" in sums:
+            out[f"{prefix}motion_loss"] = float(sums["motion_loss_sum"] / turns)
+        if "stop_loss_sum" in sums and "stop_n" in sums:
+            out[f"{prefix}stop_loss"] = float(
+                sums["stop_loss_sum"] / sums["stop_n"].clamp(min=1)
+            )
+        for k, v in stop_metrics(stop_scores, stop_labels).items():
+            out[f"{prefix}{k}"] = v
+        self._last_stop_scores = (stop_scores, stop_labels)
         return out
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -1053,6 +1221,7 @@ class TurnVectorSFTTrainer(Trainer):
         was_training = model.training
         model.eval()
         self._sums = {}
+        self._stop_logits, self._stop_labels = [], []
         for inputs in dataloader:
             inputs = self._prepare_inputs(inputs)
             inputs.pop("num_items_in_batch", None)
@@ -1066,6 +1235,7 @@ class TurnVectorSFTTrainer(Trainer):
                 for k, v in self._sums.items()
             }
         metrics = self._drain_metrics(prefix=f"{metric_key_prefix}_")
+        self._save_stop_scores(metric_key_prefix)
         # `eval_loss` is the key `load_best_model_at_end` / early stopping look for.
         if f"{metric_key_prefix}_turn_loss" in metrics:
             metrics[f"{metric_key_prefix}_loss"] = metrics[f"{metric_key_prefix}_turn_loss"]
@@ -1081,6 +1251,26 @@ class TurnVectorSFTTrainer(Trainer):
         )
         model.train(was_training)
         return metrics
+
+    def _save_stop_scores(self, prefix: str):
+        """Write this eval's raw stop logits and labels next to the checkpoints.
+
+        The head is judged on ranking and its operating point is meant to be fitted after
+        the fact, which is only possible if the scores survive the run. Saving the logits
+        (not probabilities) keeps temperature a free parameter of that later fit.
+        """
+        scores = getattr(self, "_last_stop_scores", None)
+        self._last_stop_scores = None
+        if not scores or len(scores[0]) == 0 or self.args.local_rank not in (-1, 0):
+            return
+        import numpy as np
+
+        out_dir = Path(self.args.output_dir) / "stop_scores"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            out_dir / f"{prefix}_step{int(self.state.global_step)}.npz",
+            logits=scores[0], labels=scores[1],
+        )
 
     # -- checkpoints -------------------------------------------------------------------
     def _save(self, output_dir: Optional[str] = None, state_dict=None):

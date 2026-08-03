@@ -42,10 +42,26 @@ from datasets import DatasetDict, load_from_disk
 # string, and a silent divergence between the two would change the head's input
 # distribution at deployment without any error.
 from longnav.utils.vector_rollout import DEFAULT_SYSTEM_PROMPT as SYSTEM_PROMPT
+from longnav.utils.vector_rollout import RolloutConfig, user_block_content
 
 
-def build_messages(example, placeholder: str, goal_column: str, images_column: str):
+def build_messages(example, placeholder: str, goal_column: str, images_column: str,
+                   modality_marker=None):
+    """Write the conversation for one episode.
+
+    The per-turn user block comes from `vector_rollout.user_block_content`, not from a copy
+    of it here: the rollout renders its context from the same function, so the marker's
+    presence and its position relative to the image are decided once. A marker that trained
+    after the image and deployed before it would be a different context with no error
+    anywhere -- the count check would still pass, because the count is right.
+
+    The marker goes in the **user** block. It is therefore not inside the assistant turn,
+    which is what keeps the readout spans, `train_content_len` and the affix arithmetic
+    exactly as they were; `tests/test_pose_injection.py` asserts that rather than assuming
+    it.
+    """
     goal = example.get(goal_column) or "the goal object"
+    cfg = RolloutConfig(modality_marker=modality_marker)
     messages = [
         {
             "role": "user",
@@ -54,14 +70,7 @@ def build_messages(example, placeholder: str, goal_column: str, images_column: s
     ]
     for i in range(len(example[images_column])):
         messages += [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": f"Observation {i}:"},
-                    {"type": "image"},
-                    {"type": "text", "text": "Action:"},
-                ],
-            },
+            {"role": "user", "content": user_block_content(cfg, i)},
             {"role": "assistant", "content": [{"type": "text", "text": placeholder}]},
         ]
     example["messages"] = messages
@@ -88,27 +97,86 @@ def main():
                    help="drop episodes with more observations than this (0 = keep all). "
                         "The trainer windows long episodes anyway; this is for pruning "
                         "outliers up front")
+    p.add_argument("--modality-marker", default=None,
+                   help="write this marker into each turn's user block, after the image "
+                        "(e.g. '<pose>'). The values come from a dataset column named by "
+                        "the model's modality spec -- for pose that is `obs_poses`, which "
+                        "is already carried through untouched. Omit for the classic "
+                        "no-marker conversations")
+    p.add_argument("--modality-column", default=None,
+                   help="column that must be 1:1 with the observations when "
+                        "--modality-marker is set (e.g. 'obs_poses'). Rows that disagree "
+                        "are dropped, exactly as misaligned action chunks are")
+    p.add_argument("--map-cache-dir", default=None,
+                   help="write datasets' map/filter cache here instead of alongside the "
+                        "input. Set it when --in-dir is a dataset something else is "
+                        "reading: the default puts `cache-*.arrow` files in the input's "
+                        "own directory")
     p.add_argument("--num-proc", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
+    if args.modality_column and not args.modality_marker:
+        p.error("--modality-column without --modality-marker: the column would be carried "
+                "but never referenced, since nothing in the text would occur to bind it to")
 
     ds = load_from_disk(os.path.expanduser(args.in_dir))
-   
-    print(f"Loaded {len(ds)} episode(s) from {args.in_dir}")
+
+    cache_root = None
+    if args.map_cache_dir:
+        cache_root = Path(os.path.expanduser(args.map_cache_dir))
+        cache_root.mkdir(parents=True, exist_ok=True)
+
+    def cache_kw(step):
+        """`cache_file_name(s)` for one map/filter step, or nothing when unset.
+
+        `datasets` derives a map's cache path from the *input's* directory, so without
+        this a retabulation drops `cache-*.arrow` files into the dataset it is reading --
+        which is exactly the dataset another run is likely to be reading too.
+        """
+        if cache_root is None:
+            return {}
+        if hasattr(ds, "keys"):  # DatasetDict
+            return {"cache_file_names": {k: str(cache_root / f"{step}-{k}.arrow")
+                                         for k in ds.keys()}}
+        return {"cache_file_name": str(cache_root / f"{step}.arrow")}
+
+    def size(d):
+        """Row count, for a Dataset or a DatasetDict alike -- `len` on the latter is
+        the number of splits, which makes every "dropped N rows" line a lie."""
+        return sum(len(v) for v in d.values()) if hasattr(d, "keys") else len(d)
+
+    print(f"Loaded {size(ds)} episode(s) from {args.in_dir}")
 
     def consistent(ex):
         return len(ex[args.images_column]) == len(ex[args.target_column])
 
-    before = len(ds)
-    ds = ds.filter(consistent, num_proc=args.num_proc, desc="align check")
-    if len(ds) != before:
-        print(f"  dropped {before - len(ds)} row(s) whose image and chunk counts disagreed")
+    before = size(ds)
+    ds = ds.filter(consistent, num_proc=args.num_proc, desc="align check",
+                   **cache_kw("align"))
+    if size(ds) != before:
+        print(f"  dropped {before - size(ds)} row(s) whose image and chunk counts disagreed")
+
+    if args.modality_column:
+        # One marker is written per observation, and the binding is occurrence order, so a
+        # row with the wrong number of modality values would bind every later turn's value
+        # to the wrong turn. Checked here rather than at training time because here it is
+        # one dropped row instead of a crashed run.
+        before = size(ds)
+        ds = ds.filter(
+            lambda ex: len(ex[args.modality_column]) == len(ex[args.images_column]),
+            num_proc=args.num_proc, desc=f"{args.modality_column} align check",
+            **cache_kw("modality_align"),
+        )
+        if size(ds) != before:
+            print(f"  dropped {before - size(ds)} row(s) whose {args.modality_column} count "
+                  f"disagreed with the observation count")
 
     if args.max_turns:
-        before = len(ds)
+        before = size(ds)
         ds = ds.filter(lambda ex: len(ex[args.images_column]) <= args.max_turns,
-                       num_proc=args.num_proc, desc="length filter")
-        print(f"  dropped {before - len(ds)} row(s) over {args.max_turns} observations")
+                       num_proc=args.num_proc, desc="length filter",
+                       **cache_kw("length"))
+        print(f"  dropped {before - size(ds)} row(s) over {args.max_turns} observations")
 
     if args.image_root:
         root = os.path.expanduser(args.image_root)
@@ -121,6 +189,7 @@ def main():
             },
             num_proc=args.num_proc,
             desc="absolute paths",
+            **cache_kw("abspath"),
         )
 
     ds = ds.map(
@@ -129,9 +198,11 @@ def main():
             "placeholder": args.placeholder,
             "goal_column": args.goal_column,
             "images_column": args.images_column,
+            "modality_marker": args.modality_marker,
         },
         num_proc=args.num_proc,
         desc="messages",
+        **cache_kw("messages"),
     )
 
     if args.val_fraction > 0 and args.val_split is None:

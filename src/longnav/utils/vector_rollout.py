@@ -99,6 +99,13 @@ class RolloutConfig:
     shift_left: Optional[bool] = None
     user_text_before: str = "Observation {step}:"
     user_text_after: str = "Action:"
+    # Modality marker written into each turn's user block, after the image, exactly as
+    # `format_action_chunk_dataset.py --modality-marker` writes it into the training
+    # conversations. None -> no marker, which is what every run before this did. It is a
+    # separate content part rather than text glued onto `user_text_after` so the two
+    # writers build the *same message structure* and the chat template cannot join them
+    # differently.
+    modality_marker: Optional[str] = None
     use_sparse: bool = True
     merge_lora: bool = True  # fold adapters into the base weights for inference speed
     device: str = "cuda"
@@ -116,16 +123,30 @@ def render_prologue(processor, system_prompt: str) -> str:
     )
 
 
+def user_block_content(cfg: RolloutConfig, step: int) -> List[Dict[str, Any]]:
+    """The content parts of one turn's user message.
+
+    The single definition of a user turn's shape. `format_action_chunk_dataset.py` builds
+    the training conversations from this same function, so the marker cannot be present in
+    one path and absent (or differently placed) in the other -- a divergence that produces
+    a rollout context the head was never trained under and no error anywhere.
+    """
+    parts: List[Dict[str, Any]] = [
+        {"type": "text", "text": cfg.user_text_before.format(step=step)},
+        {"type": "image"},
+    ]
+    if cfg.modality_marker:
+        # After the image span, never immediately after `<|vision_start|>`:
+        # `get_rope_index` reads that one position to decide image-vs-video, and a marker
+        # there makes every downstream position silently wrong.
+        parts.append({"type": "text", "text": cfg.modality_marker})
+    parts.append({"type": "text", "text": cfg.user_text_after})
+    return parts
+
+
 def render_user_block(processor, cfg: RolloutConfig, step: int) -> str:
     """One turn's user block, ending with the chat template's assistant opening."""
-    user = {
-        "role": "user",
-        "content": [
-            {"type": "text", "text": cfg.user_text_before.format(step=step)},
-            {"type": "image"},
-            {"type": "text", "text": cfg.user_text_after},
-        ],
-    }
+    user = {"role": "user", "content": user_block_content(cfg, step)}
     return processor.apply_chat_template([user], tokenize=False, add_generation_prompt=True)
 
 
@@ -215,6 +236,7 @@ class VectorRolloutPolicy:
         # nothing, and the failure surfaces much later as a count mismatch.
         if self.model.modality_embedder:
             self.model.modality_embedder.bind_tokenizer(processor.tokenizer)
+        self._pose_spec = self._resolve_pose_spec()
 
         self.model.to(self.cfg.device).eval()
         backbone = self.model.backbone
@@ -229,7 +251,32 @@ class VectorRolloutPolicy:
         self.vl_for_cond_gen = getattr(base, "model", base)
         self.vl_model = self.vl_for_cond_gen.model
         self.language_model = self.vl_model.language_model
+        # None -> torch's global RNG. `seed_stop` makes a sampled stop decision
+        # reproducible without pinning every other source of randomness in the process.
+        self._stop_rng: Optional[torch.Generator] = None
         self.reset()
+
+    def seed_stop(self, seed: int) -> "VectorRolloutPolicy":
+        """Make the sampled stop decision reproducible for this policy."""
+        self._stop_rng = torch.Generator(device=self.cfg.device).manual_seed(int(seed))
+        return self
+
+    def _resolve_pose_spec(self):
+        """The single spec whose values are raw poses, or None.
+
+        Found by transform rather than by token string: the transform *is* the contract
+        `step(obs_pose=...)` implements, and a spec named `<pose>` that did not declare it
+        would need its values supplied some other way.
+        """
+        specs = [s for s in self.model.modality_embedder.specs
+                 if s.transform == "pose_relative_first"]
+        if len(specs) > 1:
+            raise ValueError(
+                f"{len(specs)} specs declare the pose transform "
+                f"({[s.token for s in specs]}); step(obs_pose=...) would not know which "
+                "one to fill. Pass them explicitly via modality={key: values}."
+            )
+        return specs[0] if specs else None
 
     def _assert_head_matches_readout(self):
         """The head pools a fixed number of positions; the affixes must produce that many.
@@ -265,9 +312,18 @@ class VectorRolloutPolicy:
             f"{[tok.decode([t]) for t in self.emit_ids[-self.n_readout:]]}\n"
             f"  owed to next turn: {[tok.decode([t]) for t in self.tail_ids]}"
         )
+        if self.cfg.modality_marker:
+            out += f"\n  marker in user block, after the image: {self.cfg.modality_marker!r}"
         if self.model.modality_embedder:
             out += ("\n  modality (pass step(..., modality={key: (N, F)})):\n"
                     + self.model.modality_embedder.describe())
+        if self._pose_spec is not None:
+            out += (f"\n  pose: step(..., obs_pose=(x, y, theta)) fills "
+                    f"{self._pose_spec.token}, relative to this episode's first pose")
+        if self.model.stop_head is not None:
+            c = self.model.stop_head.cfg
+            out += (f"\n  stop head: inference={c.inference} temperature={c.temperature} "
+                    f"threshold={c.threshold} -> last_stats['stop_prob'], ['stop']")
         return out
 
     # ---------------------------------------------------------------------------------
@@ -331,8 +387,32 @@ class VectorRolloutPolicy:
         self._pending_modality: Optional[ModalityBatch] = (
             single_example_batch(modality) if modality else None
         )
+        # Every raw scene-frame pose this episode has produced, oldest first. Kept in full
+        # because the value the model is shown is relative to the *first* observation, so
+        # the origin has to survive the whole episode; `reset` is what makes a new episode
+        # a new origin, which is exactly what a training window does.
+        self._raw_poses: List[Any] = []
         self.last_stats: Dict[str, Any] = {}
         return self
+
+    def pose_values(self, obs_pose: Any) -> torch.Tensor:
+        """Record a raw scene-frame `(x, y, theta)` and return its `(1, 3)` injected value.
+
+        Routed through `relative_se2` over every pose seen so far -- the same function the
+        collator applies to a whole window -- rather than a cheaper incremental update. The
+        cost is three floats times the episode length; what it buys is that there is no
+        second implementation of the frame convention to drift from, which is the failure
+        this experiment could least afford to have and least easily notice.
+        """
+        from longnav.utils.pose_frame import POSE_DIM, relative_se2_last
+
+        pose = torch.as_tensor(obs_pose, dtype=torch.float64).reshape(-1)
+        if pose.numel() != POSE_DIM:
+            raise ValueError(
+                f"obs_pose must be {POSE_DIM} numbers (x, y, theta), got {tuple(pose.shape)}"
+            )
+        self._raw_poses.append(pose)
+        return relative_se2_last(torch.stack(self._raw_poses))
 
     def _render_prologue(self, system_prompt: str) -> str:
         return render_prologue(self.processor, system_prompt)
@@ -340,7 +420,8 @@ class VectorRolloutPolicy:
     # ---------------------------------------------------------------------------------
     @torch.inference_mode()
     def step(self, image, user_text: Optional[str] = None,
-             modality: Optional[Dict[str, Any]] = None) -> torch.Tensor:
+             modality: Optional[Dict[str, Any]] = None,
+             obs_pose: Optional[Any] = None) -> torch.Tensor:
         """Encode one observation and return its action chunk, shaped `target_shape`.
 
         Composition is done in *token ids*, not text: the user block comes from the
@@ -354,7 +435,29 @@ class VectorRolloutPolicy:
         training -- one scatter implementation for both paths, which is what makes a
         parity check meaningful rather than decorative. Where the values come from is the
         caller's problem.
+
+        `obs_pose` is the convenience for the one modality that has a frame convention:
+        pass the **raw scene-frame** `(x, y, theta)` straight from the simulator or the
+        dataset column and the policy converts it exactly as training did. Passing an
+        already-relative pose through `modality=` instead is possible and is how you would
+        get it wrong.
         """
+        pose_value = None
+        if obs_pose is not None:
+            if self._pose_spec is None:
+                raise ValueError(
+                    "step(obs_pose=...) but no modality spec declares the "
+                    "'pose_relative_first' transform, so there is nowhere to put it"
+                )
+            modality = dict(modality or {})
+            if self._pose_spec.key in modality:
+                raise ValueError(
+                    f"both obs_pose= and modality[{self._pose_spec.key!r}] were given; "
+                    "they would write the same slot with differently-framed values"
+                )
+            pose_value = self.pose_values(obs_pose)
+            modality[self._pose_spec.key] = pose_value
+
         block = self._render_user_block(image, user_text)
         ids = torch.tensor(
             [self._pending + block["input_ids"][0].tolist() + self.emit_ids],
@@ -387,10 +490,22 @@ class VectorRolloutPolicy:
         n = self.n_readout
         hidden = outputs["last_hidden_state"][:, -n:, :]
         head_dtype = next(self.model.head.parameters()).dtype
-        vector = self.model.head(hidden.to(head_dtype))
+        states = hidden.to(head_dtype)
+        vector = self.model.head(states)
         chunk = self.model.normalizer.denormalize(
             vector.view(-1, *self.model.target_shape)
         )[0].float().cpu()
+
+        # The stop readout, on the same pooled context the motion head just used. Reported
+        # rather than acted on: whether an episode ends is the caller's decision, and a
+        # policy that silently truncated its own rollout would be indistinguishable from
+        # one that crashed.
+        stop_prob = stop = None
+        if self.model.stop_head is not None:
+            pooled = self.model.head.pooled_context(states)
+            logit = self.model.stop_head(pooled)
+            stop_prob = float(self.model.stop_head.probability(logit)[0])
+            stop = bool(self.model.stop_head.decide(logit, generator=self._stop_rng)[0])
 
         self._pending = list(self.tail_ids)
         self.step_index += 1
@@ -402,6 +517,13 @@ class VectorRolloutPolicy:
             "cached_tokens": self.cached_tokens,
             "dense_tokens": self.dense_tokens,
             "latency_s": time.perf_counter() - t0,
+            "stop_prob": stop_prob,
+            "stop": stop,
+            # The value that was actually injected, not the raw pose that was passed in.
+            # A decodability probe has to correlate the pooled state against what the
+            # encoder saw; re-deriving it at the call site would be a second
+            # implementation of the frame convention, which is the thing to avoid.
+            "pose_value": None if pose_value is None else pose_value[0].clone(),
         }
         return chunk
 
