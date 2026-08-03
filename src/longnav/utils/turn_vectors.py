@@ -445,13 +445,18 @@ class TurnVectorHead(nn.Module):
             raise ValueError("mode='flat' requires equal-length turns (no padding)")
         return states.flatten(1)
 
-    def forward(self, states: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """(N_turns, L, H) -> (N_turns, out_dim)."""
+    def pooled_context(self, states: torch.Tensor,
+                       mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """(N_turns, L, H) -> the pooled vector the MLP consumes, `(N_turns, pooled_dim)`.
+
+        Split out of `forward` so an auxiliary readout (the stop head) can be trained on
+        *the same* context this head regresses from, rather than on a second pooling that
+        would only mostly agree with it. `forward` is the sole caller besides those, so
+        there is still one definition of the cast, the standardization and the pooling.
+        """
         states = states.to(self._dtype)
         if mask is None:
             mask = torch.ones(states.shape[:2], dtype=torch.bool, device=states.device)
-        if states.shape[0] == 0:
-            return states.new_zeros((0, self.out_dim))
         if self.standardize:
             if not bool(self.stats_fitted):
                 raise RuntimeError(
@@ -460,7 +465,18 @@ class TurnVectorHead(nn.Module):
                     "(the stats are then saved with the state dict)."
                 )
             states = (states - self.input_mean) / self.input_std
-        out = self.mlp(self.pre_norm(self.pool(states, mask)))
+        return self.pool(states, mask)
+
+    @property
+    def pooled_dim(self) -> int:
+        """Width of `pooled_context`'s output -- what an auxiliary head must accept."""
+        return self.hidden_size * self.content_len if self.mode == "flat" else self.hidden_size
+
+    def forward(self, states: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """(N_turns, L, H) -> (N_turns, out_dim)."""
+        if states.shape[0] == 0:
+            return states.to(self._dtype).new_zeros((0, self.out_dim))
+        out = self.mlp(self.pre_norm(self.pooled_context(states, mask)))
         return F.normalize(out, dim=-1) if self.normalize_output else out
 
 
@@ -475,6 +491,7 @@ def extract_turn_vectors(
     seq_keep_mask: Optional[torch.Tensor] = None,
     valid_mask: Optional[torch.Tensor] = None,
     strict: bool = True,
+    return_mask: bool = False,
 ) -> Tuple[torch.Tensor, List[TurnSpan]]:
     """One vector per assistant turn, end to end.
 
@@ -491,12 +508,18 @@ def extract_turn_vectors(
             per-turn masks when replaying an incremental rollout.
         valid_mask: optional (B, S) non-pad mask for `input_ids`.
         strict: error out if a content token was dropped by sparsification.
+        return_mask: also return the (N_turns, L_max) validity mask. Off by default
+            so the arity of the common call is unchanged; a caller that wants the
+            padded states *and* intends to pool them itself needs the mask, and
+            reconstructing it from the spans downstream would be a second definition
+            of the same thing.
 
     Returns:
         vectors: (N_turns, out_dim) -- or (N_turns, L_max, H) if `head` is None.
         flat_turns: the `TurnSpan`s in row order. `.start`/`.end` stay in dense
             coordinates (decode them against `input_ids` to verify alignment),
             `.indices` are the sparse positions actually gathered.
+        mask: only when `return_mask`; (N_turns, L_max) bool, True on real content.
     """
     if isinstance(outputs, torch.Tensor):
         hidden = outputs
@@ -516,9 +539,8 @@ def extract_turn_vectors(
     )
     turns = to_sparse_indices(turns, seq_keep_mask, strict=strict)
     states, mask, flat_turns = gather_turn_states(hidden, turns)
-    if head is None:
-        return states, flat_turns
-    return head(states, mask), flat_turns
+    out = states if head is None else head(states, mask)
+    return (out, flat_turns, mask) if return_mask else (out, flat_turns)
 
 
 def patch_flash_attention_packing():

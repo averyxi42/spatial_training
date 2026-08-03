@@ -61,6 +61,7 @@ from longnav.utils.vector_sft import (
     TurnVectorSFTTrainer,
     fit_target_normalizer,
 )
+from longnav.utils.stop_head import STOP_INFERENCE_MODES, StopHeadConfig
 
 
 def parse_args():
@@ -110,6 +111,30 @@ def parse_args():
                         "\"encoder\": \"mlp\", \"encoder_kwargs\": {}, \"column\": \"x\"}. "
                         "Omitted -> the mechanism is inert. See "
                         "longnav.utils.modality_embed")
+
+    s = p.add_argument_group("stop head")
+    s.add_argument("--stop-head", action="store_true",
+                   help="train a binary 'is this the episode end' readout on the pooled "
+                        "turn context. Off by default; without it nothing about the run "
+                        "changes")
+    s.add_argument("--stop-hidden-dims", default="256",
+                   help="comma-separated hidden widths for the stop head")
+    s.add_argument("--stop-loss-weight", type=float, default=1.0,
+                   help="scale on the stop loss. Needs no tuning while --stop-grad is on, "
+                        "since the loss then reaches only the stop head's parameters")
+    s.add_argument("--stop-pos-weight", type=float, default=None,
+                   help="BCE pos_weight. Roughly the negative:positive ratio (~90 here) "
+                        "so the one positive turn per episode is not drowned by the "
+                        "gradient of its ninety negatives")
+    s.add_argument("--no-stop-grad", action="store_true",
+                   help="let the stop loss reach the backbone and the motion head. This "
+                        "gives up the guarantee that the auxiliary cannot hurt the motion "
+                        "objective, and makes --stop-loss-weight a real hyperparameter")
+    s.add_argument("--stop-temperature", type=float, default=1.0,
+                   help="inference-time logit scale; tune post hoc on the saved logits")
+    s.add_argument("--stop-inference", default="sample",
+                   choices=list(STOP_INFERENCE_MODES))
+    s.add_argument("--stop-threshold", type=float, default=0.5)
 
     l = p.add_argument_group("lora")
     l.add_argument("--lora-r", type=int, default=64)
@@ -221,6 +246,8 @@ def build_optimizer_param_groups(model, args):
     """
     fresh = [p for p in model.head.parameters() if p.requires_grad]
     fresh += [p for p in model.modality_embedder.parameters() if p.requires_grad]
+    if model.stop_head is not None:
+        fresh += [p for p in model.stop_head.parameters() if p.requires_grad]
     fresh_ids = {id(p) for p in fresh}
     other = [p for p in model.parameters() if p.requires_grad and id(p) not in fresh_ids]
     groups = [{"params": other, "lr": args.lr, "weight_decay": args.weight_decay}]
@@ -297,6 +324,18 @@ def main():
         head_dropout=args.head_dropout,
         freeze_vision_tower=not args.train_vision_tower,
         modality_specs=_modality_specs(args.modality_specs),
+        stop_head=(
+            StopHeadConfig(
+                hidden_dims=_csv(args.stop_hidden_dims, int),
+                stop_grad=not args.no_stop_grad,
+                loss_weight=args.stop_loss_weight,
+                pos_weight=args.stop_pos_weight,
+                temperature=args.stop_temperature,
+                inference=args.stop_inference,
+                threshold=args.stop_threshold,
+            )
+            if args.stop_head else None
+        ),
     )
     data_cfg = DataConfig(
         target_column=args.target_column,
@@ -352,10 +391,13 @@ def main():
     # exactly one definition, and `build()` has already registered the tokens on this
     # processor's tokenizer.
     specs = model_cfg.modality_specs
+    # Driven off the model config, not a second flag: the collator emits stop labels
+    # exactly when the model has somewhere to put them.
+    stop_labels = model_cfg.stop_head is not None
     train_collator = TurnVectorCollator(processor, data_cfg, train=True, seed=args.seed,
-                                        modality_specs=specs)
+                                        modality_specs=specs, stop_labels=stop_labels)
     eval_collator = TurnVectorCollator(processor, data_cfg, train=False, seed=args.seed,
-                                       modality_specs=specs)
+                                       modality_specs=specs, stop_labels=stop_labels)
 
     if not args.no_preflight and is_main:
         model.to("cuda" if torch.cuda.is_available() else "cpu")

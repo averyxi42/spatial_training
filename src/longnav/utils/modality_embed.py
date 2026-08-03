@@ -56,6 +56,18 @@ an image nor a video token, and the whole span would be scored as text -- silent
 positions, no error. `ModalityEmbedder.check_placement` asserts against it. Anywhere else
 in the text is fine.
 
+Transforms
+----------
+A spec may name a `transform`: a registry-keyed pure function applied to one example's raw
+column *after* windowing, `(N, raw) -> (N, F)`. It sees the whole example rather than one
+row at a time, because a frame change is defined against some other row -- pose is relative
+to the first visible one -- and a per-row signature could not express that. It must be
+row-preserving, which is asserted: the k-th occurrence still receives the k-th row.
+
+Doing it here rather than at dataset build time is what lets one rule cover the windowed
+and non-windowed cases: the origin is whatever the agent can actually see. `None` is the
+default and means identity, so a spec written before this existed is unaffected.
+
 Inertness
 ---------
 With no specs registered, nothing is constructed, no hooks are attached, and every entry
@@ -65,6 +77,7 @@ point returns immediately. Existing checkpoints and configs are unaffected.
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -81,6 +94,46 @@ COUNTS_SUFFIX = "_counts"
 # The id the marker is rewritten to before `embed_tokens` sees it. Its embedding is
 # overwritten by the scatter, so the choice is arbitrary -- it only has to be a valid row.
 SAFE_EMBED_ID = 0
+
+
+# ======================================================================================
+# Transform registry
+# ======================================================================================
+# `(N, raw) -> (N, F)` over ONE example's values, keyed by name so the checkpoint stores a
+# string and never code. Identity is the default and is spelled `None`, so a spec written
+# before this existed means exactly what it always did.
+#
+# Whole-example, not per-row, and that is a deliberate widening: a frame change is defined
+# against some other row (for pose, the first visible one), so a per-row signature could not
+# express it at all. The cost is that a transform must be row-preserving, which is asserted
+# rather than assumed -- the k-th occurrence still has to receive the k-th row.
+TRANSFORM_REGISTRY: Dict[str, Any] = {}
+
+
+def register_transform(name: str):
+    """Decorator adding a value transform to the registry under `name`."""
+
+    def deco(fn):
+        if name in TRANSFORM_REGISTRY and TRANSFORM_REGISTRY[name] is not fn:
+            raise ValueError(f"transform key {name!r} is already registered")
+        TRANSFORM_REGISTRY[name] = fn
+        return fn
+
+    return deco
+
+
+@register_transform("pose_relative_first")
+def _pose_relative_first(values: torch.Tensor) -> torch.Tensor:
+    """Scene-frame `(x, y, theta)` -> relative to the first visible observation.
+
+    A thin binding from the registry key to `pose_frame.relative_se2`, which is where the
+    convention is actually defined and which the rollout calls directly. Keeping the maths
+    in its own module means the rollout does not have to reach through the modality
+    mechanism to get at it, and there is still exactly one implementation.
+    """
+    from longnav.utils.pose_frame import relative_se2
+
+    return relative_se2(values)
 
 
 # ======================================================================================
@@ -105,6 +158,17 @@ class ModalityEmbedSpec:
     # Dataset column feeding this spec. None -> `key`. This is the data source, not a
     # second identity: it never participates in matching a spec to weights or to a token.
     column: Optional[str] = None
+    # Registry key of a pure function applied to one example's raw column *after*
+    # windowing and before the values reach the wire. None -> identity, which is what
+    # every spec written before this existed means and what keeps them unaffected.
+    #
+    # It takes the whole example, `(N, raw) -> (N, n_features)`, and not one row at a time.
+    # That is the entire reason it exists: the pose transform is relative to the *first
+    # visible* row, so a per-row map could not express it, and doing it at dataset build
+    # time would bake in an origin that windowing then moves. See `pose_frame.py`.
+    transform: Optional[str] = None
+    # Width of one raw column row, when the transform changes it. None -> `n_features`.
+    n_raw_features: Optional[int] = None
 
     def __post_init__(self):
         if not (self.token.startswith("<") and self.token.endswith(">") and len(self.token) > 2):
@@ -116,6 +180,25 @@ class ModalityEmbedSpec:
             raise ValueError(f"{self.token}: n_features must be >= 1, got {self.n_features}")
         self.n_features = int(self.n_features)
         self.encoder_kwargs = dict(self.encoder_kwargs or {})
+        if self.n_raw_features is not None:
+            if int(self.n_raw_features) < 1:
+                raise ValueError(
+                    f"{self.token}: n_raw_features must be >= 1, got {self.n_raw_features}"
+                )
+            self.n_raw_features = int(self.n_raw_features)
+            if self.transform is None and self.n_raw_features != self.n_features:
+                raise ValueError(
+                    f"{self.token}: n_raw_features={self.n_raw_features} differs from "
+                    f"n_features={self.n_features} but no transform is declared, so nothing "
+                    "would change the width"
+                )
+        # Resolved here rather than at first use: an unknown key is a config typo, and the
+        # useful moment to say so is when the config is read, not mid-epoch.
+        if self.transform is not None and self.transform not in TRANSFORM_REGISTRY:
+            raise KeyError(
+                f"unknown modality transform {self.transform!r} for {self.token}; "
+                f"known: {sorted(TRANSFORM_REGISTRY)}"
+            )
 
     @property
     def key(self) -> str:
@@ -126,12 +209,43 @@ class ModalityEmbedSpec:
     def source_column(self) -> str:
         return self.column if self.column else self.key
 
+    @property
+    def raw_width(self) -> int:
+        """Width of one row as it comes out of the dataset column."""
+        return self.n_features if self.n_raw_features is None else self.n_raw_features
+
+    def apply_transform(self, values: torch.Tensor) -> torch.Tensor:
+        """Run this spec's transform over one example's `(N, raw_width)` values.
+
+        Called once per example, after windowing, by whoever assembles the batch -- the
+        collator in training, the policy in rollout. Both go through here so there is one
+        definition of what a value *means*, rather than two that agree until they do not.
+        """
+        if self.transform is None:
+            out = values
+        else:
+            out = TRANSFORM_REGISTRY[self.transform](values)
+            out = torch.as_tensor(out, dtype=torch.float32)
+        if out.dim() != 2 or out.shape[1] != self.n_features:
+            raise ValueError(
+                f"{self.token}: transform {self.transform!r} returned "
+                f"{tuple(out.shape)}, expected (N, {self.n_features})"
+            )
+        if out.shape[0] != values.shape[0]:
+            raise ValueError(
+                f"{self.token}: transform {self.transform!r} returned {out.shape[0]} row(s) "
+                f"for {values.shape[0]} occurrence(s); the binding is occurrence order, so "
+                "a transform must be row-preserving"
+            )
+        return out
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "ModalityEmbedSpec":
-        known = {"token", "n_features", "encoder", "encoder_kwargs", "column"}
+        known = {"token", "n_features", "encoder", "encoder_kwargs", "column",
+                 "transform", "n_raw_features"}
         unknown = set(d) - known
         if unknown:
             raise ValueError(
@@ -223,7 +337,15 @@ class ModalityEncoder(nn.Module):
 
 
 def _zero_init(linear: nn.Linear) -> nn.Linear:
-    """Zero a module's *output* layer, so step 0 is bit-identical to no injection.
+    """Zero a module's *output* layer, so at step 0 the output does not depend on the input.
+
+    Precisely that, and not "bit-identical to no injection" -- the post-hook *replaces* the
+    marker position's embedding via `masked_scatter`, so a zero-init encoder puts a zero
+    vector there rather than leaving the embedding the marker id would have had. A model
+    with a zero-init encoder is therefore NOT the same function as one with no marker in
+    its text, and does not need to be. What the zero buys is that no value-dependent signal
+    is read before the encoder has learned anything, so a run cannot be poisoned at step 0
+    by an arbitrary random projection of the injected quantity.
 
     Safe specifically because it is the last layer: the gradient with respect to its own
     weights is proportional to its (nonzero) input, so it moves off zero immediately.
@@ -263,7 +385,8 @@ class MLPEncoder(ModalityEncoder):
     after it, which gets both properties at once: the pre-activations stay bounded as
     training grows the output (nothing constrains an injected vector's norm relative to
     ordinary token embeddings otherwise, and it can drown them out or vanish against
-    them), and the output is still exactly zero at step 0.
+    them), and the output is still exactly zero at step 0 -- see `_zero_init` for what that
+    does and does not mean.
     """
 
     def __init__(self, n_features: int, d_model: int,
@@ -285,6 +408,106 @@ class MLPEncoder(ModalityEncoder):
 
     def encode(self, values: torch.Tensor) -> torch.Tensor:
         return self.net(values)
+
+
+@register_encoder("fourier_se2")
+class FourierSE2Encoder(ModalityEncoder):
+    """A planar pose `(x, y, theta)` -> one `d_model` vector. `F == 3`.
+
+    Two representation choices, both about giving the network a basis it can *compare* in
+    rather than one it would have to build first.
+
+    **Heading as `(cos, sin)`, never raw theta.** Raw theta has a discontinuity at the wrap
+    point: `+3.14` and `-3.14` are the same heading and the furthest apart of any two
+    numbers in the range. Any smooth function of raw theta is forced to be wrong somewhere,
+    and it will be wrong exactly at "facing backwards along the start heading", which is not
+    a rare pose for an agent that is searching.
+
+    **Position as Fourier features.** A linear map on raw metres gives the first layer one
+    direction per axis, so "how far apart are these two positions" has to be reconstructed
+    from a difference of large numbers -- and positions late in an episode are large numbers.
+    Sines and cosines at geometrically spaced periods make locality explicit: the short
+    periods separate nearby positions, the long ones stay monotone across the whole
+    workspace. This is the same device as the flow-matching head's
+    `sinusoidal_time_embedding`, for the same reason, and the identity channel is kept
+    alongside so a genuinely linear readout is still one weight away.
+
+    The periods are **buffers**, not constructor arguments re-supplied at eval: they define
+    what a metre means to this encoder, so training and rollout cannot disagree about the
+    scale. Same reasoning as `BucketEncoder`'s edges and the flow head's `ACTION_SCALES`.
+
+    Zero-init on the final projection, and it is worth being exact about what that buys.
+    The scatter *replaces* the marker position's embedding, so a zero output is a zero
+    vector at that position -- **not** the embedding the marker id would otherwise have had.
+    The model is therefore not bit-identical to one with no marker in the text, and does not
+    need to be: the property that matters is that at step 0 the output does not *depend on*
+    the injected pose, so nothing is read from it before the encoder has learned anything,
+    while the gradient to the final layer's weights is proportional to its nonzero input and
+    so moves off zero on the first step.
+    """
+
+    def __init__(self, n_features: int, d_model: int, n_freqs: int = 8,
+                 min_period: float = 0.25, max_period: float = 64.0,
+                 pos_scale: float = 1.0, hidden_dims: Sequence[int] = (256, 256),
+                 dropout: float = 0.0, zero_init: bool = True):
+        super().__init__(n_features, d_model)
+        if self.n_features != 3:
+            raise ValueError(
+                f"FourierSE2Encoder is a planar pose encoder: n_features must be 3 "
+                f"(x, y, theta), got {self.n_features}"
+            )
+        if int(n_freqs) < 1:
+            raise ValueError(f"n_freqs must be >= 1, got {n_freqs}")
+        if not (0 < float(min_period) <= float(max_period)):
+            raise ValueError(
+                f"need 0 < min_period <= max_period, got {min_period}..{max_period}"
+            )
+        if float(pos_scale) <= 0:
+            raise ValueError(f"pos_scale must be > 0, got {pos_scale}")
+        self.n_freqs = int(n_freqs)
+
+        # Periods in metres, geometrically spaced -- `sinusoidal_time_embedding`'s schedule,
+        # not the transformer's `10000 ** (2i/d)`, because the periods are meant to be read
+        # in the units of the quantity itself.
+        fraction = torch.linspace(0.0, 1.0, self.n_freqs, dtype=torch.float64)
+        period = float(min_period) * (float(max_period) / float(min_period)) ** fraction
+        self.register_buffer("pos_scale", torch.tensor(float(pos_scale), dtype=torch.float32))
+        self.register_buffer(
+            "freqs", (2.0 * math.pi / period).to(torch.float32)
+        )  # (n_freqs,), rad per scaled unit
+
+        # (cos, sin) heading + (x, y) identity + sin/cos of both axes at every period.
+        self.feature_dim = 2 + 2 + 2 * 2 * self.n_freqs
+        dims = [self.feature_dim, *[int(h) for h in hidden_dims]]
+        layers: List[nn.Module] = []
+        for a, b in zip(dims[:-1], dims[1:]):
+            layers += [nn.Linear(a, b), nn.GELU()]
+            if dropout:
+                layers.append(nn.Dropout(dropout))
+        # LayerNorm before the output projection, not after: the pre-activations stay
+        # bounded as training grows the output (nothing else constrains an injected
+        # vector's norm against ordinary token embeddings, and it can drown them out or
+        # vanish against them), and the output is still exactly zero at step 0.
+        layers.append(nn.LayerNorm(dims[-1]))
+        out = nn.Linear(dims[-1], d_model)
+        layers.append(_zero_init(out) if zero_init else out)
+        self.net = nn.Sequential(*layers)
+
+    def features(self, values: torch.Tensor) -> torch.Tensor:
+        """`(N, 3) -> (N, feature_dim)`. Split out so a probe can look at the basis."""
+        xy = values[:, :2] / self.pos_scale
+        theta = values[:, 2]
+        heading = torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)   # (N, 2)
+        arg = xy.unsqueeze(-1) * self.freqs                                   # (N, 2, K)
+        fourier = torch.cat([torch.sin(arg), torch.cos(arg)], dim=-1).flatten(1)
+        return torch.cat([heading, xy, fourier], dim=1)
+
+    def encode(self, values: torch.Tensor) -> torch.Tensor:
+        # The base class already disabled autocast and handed us fp32, and casts the result
+        # to the embedding dtype at the end. That matters here more than for the other
+        # encoders: bf16 has 8 mantissa bits, so positions a few centimetres apart collapse
+        # onto one representation, and `sin(2*pi*x/0.25)` on a bf16 `x` is noise.
+        return self.net(self.features(values))
 
 
 @register_encoder("bucket")
@@ -562,7 +785,8 @@ class ModalityEmbedder(nn.Module):
             return "no modality specs (mechanism inert)"
         return "\n".join(
             f"  {s.token} key={s.key} F={s.n_features} encoder={s.encoder} "
-            f"column={s.source_column} id={self.token_ids.get(s.key, '?')}"
+            f"column={s.source_column} transform={s.transform or 'identity'} "
+            f"id={self.token_ids.get(s.key, '?')}"
             for s in self.specs
         )
 
