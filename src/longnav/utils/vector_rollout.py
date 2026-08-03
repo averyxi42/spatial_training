@@ -59,6 +59,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
+from longnav.utils.modality_embed import ModalityBatch, single_example_batch
 from longnav.utils.vector_sft import TurnVectorRegressor
 
 # The assistant turn's closing text, appended to the *next* forward pass because with a
@@ -209,6 +210,11 @@ class VectorRolloutPolicy:
             processor.tokenizer, self.cfg, self.prefix_ids, self.postfix_ids, self.shift_left
         )
         self._assert_head_matches_readout()
+        # The processor may not be the one the model was built with. If its tokenizer is
+        # missing a marker the literal BPEs back into ordinary tokens, the scatter finds
+        # nothing, and the failure surfaces much later as a count mismatch.
+        if self.model.modality_embedder:
+            self.model.modality_embedder.bind_tokenizer(processor.tokenizer)
 
         self.model.to(self.cfg.device).eval()
         backbone = self.model.backbone
@@ -251,7 +257,7 @@ class VectorRolloutPolicy:
 
     def describe(self) -> str:
         tok = self.processor.tokenizer
-        return (
+        out = (
             f"prefix={self.prefix!r} postfix={self.postfix!r} "
             f"placeholder={self.cfg.placeholder!r} shift_left={self.shift_left}\n"
             f"  emitted per turn: {[tok.decode([t]) for t in self.emit_ids]}\n"
@@ -259,6 +265,10 @@ class VectorRolloutPolicy:
             f"{[tok.decode([t]) for t in self.emit_ids[-self.n_readout:]]}\n"
             f"  owed to next turn: {[tok.decode([t]) for t in self.tail_ids]}"
         )
+        if self.model.modality_embedder:
+            out += ("\n  modality (pass step(..., modality={key: (N, F)})):\n"
+                    + self.model.modality_embedder.describe())
+        return out
 
     # ---------------------------------------------------------------------------------
     @classmethod
@@ -289,8 +299,18 @@ class VectorRolloutPolicy:
         return cls(model, processor, cfg)
 
     # ---------------------------------------------------------------------------------
-    def reset(self, goal_text: Optional[str] = None, system_prompt: Optional[str] = None):
-        """Start a fresh episode. The prologue is prepended to the first turn's tokens."""
+    def reset(self, goal_text: Optional[str] = None, system_prompt: Optional[str] = None,
+              modality: Optional[Dict[str, Any]] = None):
+        """Start a fresh episode. The prologue is prepended to the first turn's tokens.
+
+        `modality` carries values for any markers in the **prologue** -- an episode-level
+        slot such as a goal location, a scene descriptor, an origin declaration. Training
+        gets this for free (the window always keeps the prologue), so without it the
+        failure is eval-only and confusing to debug.
+
+        The prologue's tokens are owed to the first `step()`, so its occurrences come
+        first in the sequence and its value rows are prepended to that step's.
+        """
         self.past_key_values = None
         self.past_image_embeds = None
         self.rope_offset = 0
@@ -308,6 +328,9 @@ class VectorRolloutPolicy:
             if system_prompt
             else []
         )
+        self._pending_modality: Optional[ModalityBatch] = (
+            single_example_batch(modality) if modality else None
+        )
         self.last_stats: Dict[str, Any] = {}
         return self
 
@@ -316,7 +339,8 @@ class VectorRolloutPolicy:
 
     # ---------------------------------------------------------------------------------
     @torch.inference_mode()
-    def step(self, image, user_text: Optional[str] = None) -> torch.Tensor:
+    def step(self, image, user_text: Optional[str] = None,
+             modality: Optional[Dict[str, Any]] = None) -> torch.Tensor:
         """Encode one observation and return its action chunk, shaped `target_shape`.
 
         Composition is done in *token ids*, not text: the user block comes from the
@@ -324,6 +348,12 @@ class VectorRolloutPolicy:
         constant `tail`/`emit` id lists derived once in `__init__`. Concatenating ids
         removes any chance of BPE merging differently at a chunk boundary than it did in
         the training-time single-shot tokenization.
+
+        `modality` is `{key: (N, F)}` for the markers in *this* chunk, in occurrence
+        order. B == 1, the same `ModalityBatch`, the same hooks and the same assertions as
+        training -- one scatter implementation for both paths, which is what makes a
+        parity check meaningful rather than decorative. Where the values come from is the
+        caller's problem.
         """
         block = self._render_user_block(image, user_text)
         ids = torch.tensor(
@@ -340,8 +370,16 @@ class VectorRolloutPolicy:
         inputs["input_ids"] = ids
         inputs["attention_mask"] = torch.ones_like(ids)
 
+        # The prologue's occurrences precede this turn's in `ids`, so its rows precede
+        # this turn's too -- occurrence order is the only binding.
+        step_modality = single_example_batch(modality) if modality else None
+        pending = self._pending_modality
+        self._pending_modality = None
+        if pending is not None:
+            step_modality = pending.concat(step_modality or ModalityBatch())
+
         t0 = time.perf_counter()
-        outputs = self._forward(inputs)
+        outputs = self._forward(inputs, step_modality)
 
         # The emitted block ends exactly at the last readout position, so the states the
         # head wants are the final `n_readout` of the sequence -- no span search needed, and
@@ -383,7 +421,7 @@ class VectorRolloutPolicy:
             text=text, images=[image], videos=None, padding=False, return_tensors="pt"
         )
 
-    def _forward(self, inputs):
+    def _forward(self, inputs, modality: Optional[ModalityBatch] = None):
         device = self.cfg.device
         turn = {k: v.to(device) for k, v in inputs.items() if v is not None}
         n_new = turn["input_ids"].shape[1]
@@ -407,9 +445,16 @@ class VectorRolloutPolicy:
             turn["past_image_embeds"] = self.past_image_embeds
             turn["save_image_db"] = True
 
-        outputs = self.model.backbone(
-            **turn, past_key_values=self.past_key_values, use_cache=True, logits_to_keep=1
-        )
+        embedder = self.model.modality_embedder
+        if embedder:
+            embedder.check_placement(
+                turn["input_ids"], self.vl_model.config.vision_start_token_id
+            )
+        with embedder.pending(modality.to(device) if modality is not None else None):
+            outputs = self.model.backbone(
+                **turn, past_key_values=self.past_key_values, use_cache=True,
+                logits_to_keep=1,
+            )
         self.past_key_values = outputs["past_key_values"]
         self.dense_tokens += n_new
         self.cached_tokens = int(

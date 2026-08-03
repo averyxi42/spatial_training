@@ -86,6 +86,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Trainer
 
+from longnav.utils.modality_embed import (
+    ModalityBatch,
+    ModalityEmbedder,
+    ModalityEmbedSpec,
+    coerce_specs,
+    resolve_token_ids,
+)
 from longnav.utils.turn_vectors import (
     ACTION_POSTFIX,
     ACTION_PREFIX,
@@ -129,6 +136,15 @@ class ModelConfig:
     head_layer_norm: bool = True
     standardize_head_inputs: bool = False
     freeze_vision_tower: bool = True
+    # Learned per-occurrence embeddings injected at marker tokens; see
+    # `longnav.utils.modality_embed`. Empty (the default, and what every checkpoint
+    # written before this existed says) leaves the whole mechanism inert.
+    modality_specs: Tuple[ModalityEmbedSpec, ...] = ()
+
+    def __post_init__(self):
+        # Round-tripping through JSON turns the specs into plain dicts; coerce them back
+        # here so `ModelConfig(**meta["model"])` yields the same object either way.
+        self.modality_specs = coerce_specs(self.modality_specs)
 
 
 @dataclass
@@ -262,6 +278,65 @@ def assistant_turn_indices(messages: Sequence[Dict[str, Any]]) -> List[int]:
     return [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
 
 
+def n_markers_in_message(message: Dict[str, Any], token: str) -> int:
+    """Count occurrences of a modality marker literal in a message's text parts.
+
+    The modality analogue of `n_images_in_message`, and it has to be: windowing selects
+    images by counting placeholders in the kept messages, and the modality column is bound
+    by the same occurrence order, so it must be selected by counting the same way.
+    """
+    return sum(
+        p.get("text", "").count(token)
+        for p in _content_parts(message)
+        if p.get("type") == "text"
+    )
+
+
+def conversation_window_indices(
+    messages: Sequence[Dict[str, Any]], start_turn: int, n_turns: int
+) -> List[int]:
+    """Message indices kept by a window of `n_turns` assistant turns from `start_turn`.
+
+    Everything before the first image-bearing message is the prologue (the
+    system/instruction block) and is always kept, so windowing away turn 0 does not throw
+    away the task description. Turn `t`'s block is every message after turn `t-1` up to
+    and including turn `t`, which keeps whatever user messages introduce it.
+    """
+    turns = assistant_turn_indices(messages)
+    if not turns:
+        raise ValueError("conversation has no assistant turns")
+    end_turn = start_turn + n_turns
+    prologue_end = next(
+        (i for i, m in enumerate(messages) if n_images_in_message(m) > 0), 0
+    )
+    block_start = prologue_end if start_turn == 0 else turns[start_turn - 1] + 1
+    return list(range(prologue_end)) + list(range(block_start, turns[end_turn - 1] + 1))
+
+
+def select_by_occurrence(
+    items: Sequence[Any],
+    per_message: Sequence[int],
+    keep_idx: Sequence[int],
+    noun: str = "image",
+) -> List[Any]:
+    """Take the entries of `items` belonging to the kept messages.
+
+    `items` is a flat list in occurrence order and `per_message[i]` is how many of them
+    message `i` accounts for; prefix sums map one to the other. This is the single idiom
+    that keeps images and modality values in lockstep with the text, no matter how the
+    placeholders are arranged within a message.
+    """
+    offsets = [0]
+    for n in per_message:
+        offsets.append(offsets[-1] + n)
+    if offsets[-1] != len(items):
+        raise ValueError(
+            f"conversation has {offsets[-1]} {noun} placeholder(s) but {len(items)} "
+            f"{noun}(s) were provided"
+        )
+    return [items[j] for i in keep_idx for j in range(offsets[i], offsets[i + 1])]
+
+
 def slice_conversation(
     messages: Sequence[Dict[str, Any]],
     images: Sequence[Any],
@@ -284,27 +359,11 @@ def slice_conversation(
     if n_turns >= len(turns) and start_turn == 0:
         return list(messages), list(images), targets
 
-    end_turn = start_turn + n_turns
-    prologue_end = next(
-        (i for i, m in enumerate(messages) if n_images_in_message(m) > 0), 0
+    keep_idx = conversation_window_indices(messages, start_turn, n_turns)
+    kept_images = select_by_occurrence(
+        images, [n_images_in_message(m) for m in messages], keep_idx, noun="image"
     )
-    block_start = prologue_end if start_turn == 0 else turns[start_turn - 1] + 1
-    keep_idx = list(range(prologue_end)) + list(range(block_start, turns[end_turn - 1] + 1))
-
-    # Prefix sums over image placeholders -> which images belong to the kept messages.
-    per_msg = [n_images_in_message(m) for m in messages]
-    offsets = [0]
-    for n in per_msg:
-        offsets.append(offsets[-1] + n)
-    if offsets[-1] != len(images):
-        raise ValueError(
-            f"conversation has {offsets[-1]} image placeholder(s) but {len(images)} "
-            "image(s) were provided"
-        )
-    kept_images = [
-        images[j] for i in keep_idx for j in range(offsets[i], offsets[i + 1])
-    ]
-    return [messages[i] for i in keep_idx], kept_images, targets[start_turn:end_turn]
+    return [messages[i] for i in keep_idx], kept_images, targets[start_turn:start_turn + n_turns]
 
 
 def load_image(entry: Any):
@@ -335,18 +394,30 @@ class TurnVectorCollator:
     so every worker draws the same sequence of window offsets. Harmless (they see
     different rows) but it makes `seed` less of a global control than it looks with
     `dataloader_num_workers > 0`.
+
+    Modality columns
+    ----------------
+    `modality_specs` is the model's own spec list, so which column feeds which marker has
+    exactly one definition. This is the right place for the count check: it is the single
+    seam that templates, processes and validates, and it counts **marker ids in
+    `input_ids`** -- which catches a chat template mangling the literal, something a
+    message-level check on the raw text would miss. Per example, before batching, so a
+    mismatch is attributable to one conversation.
     """
 
     processor: Any
     data: DataConfig
     train: bool = True
     seed: int = 0
+    modality_specs: Tuple[ModalityEmbedSpec, ...] = ()
     _rng: Any = field(default=None, repr=False)
+    _token_ids: Any = field(default=None, repr=False)
 
     def __post_init__(self):
         import numpy as np
 
         self._rng = np.random.default_rng(self.seed)
+        self.modality_specs = coerce_specs(self.modality_specs)
 
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         if len(examples) != 1:
@@ -371,9 +442,30 @@ class TurnVectorCollator:
                 f"{self.data.target_column!r} -- the dataset row is inconsistent"
             )
 
+        modality = {
+            s.key: torch.as_tensor(ex[s.source_column], dtype=torch.float32).reshape(
+                -1, s.n_features
+            )
+            for s in self.modality_specs
+        }
+
         cap = self.data.max_turns_per_sample
         if cap is not None and len(turns) > cap:
             start = int(self._rng.integers(0, len(turns) - cap + 1)) if self.train else 0
+            # The modality column must slice with the window, through the same
+            # count-the-placeholders idiom images use. It is bound by occurrence order,
+            # so counting marker literals in the kept messages is the only correct rule --
+            # anything keyed on turn index would break the moment a message carries two
+            # markers or none.
+            keep_idx = conversation_window_indices(messages, start, cap)
+            for s in self.modality_specs:
+                rows = select_by_occurrence(
+                    list(range(modality[s.key].shape[0])),
+                    [n_markers_in_message(m, s.token) for m in messages],
+                    keep_idx,
+                    noun=f"{s.token} marker",
+                )
+                modality[s.key] = modality[s.key][torch.tensor(rows, dtype=torch.long)]
             messages, images, targets = slice_conversation(
                 messages, images, targets, start, cap
             )
@@ -392,7 +484,49 @@ class TurnVectorCollator:
         out = dict(batch)
         out["targets"] = targets
         out["num_turns"] = torch.tensor(targets.shape[0], dtype=torch.long)
+        out.update(self._modality_kwargs(modality, out["input_ids"]))
         return out
+
+    def _modality_token_ids(self) -> Dict[str, int]:
+        """Marker ids, resolved once and cached. Raises if the tokenizer lacks one."""
+        if getattr(self, "_token_ids", None) is None:
+            self._token_ids = resolve_token_ids(self.processor.tokenizer, self.modality_specs)
+        return self._token_ids
+
+    def _modality_kwargs(self, modality: Dict[str, torch.Tensor],
+                         input_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Flat wire-format keys, after checking each spec's count against `input_ids`."""
+        if not self.modality_specs:
+            return {}
+        token_ids = self._modality_token_ids()
+        # `get_rope_index` derives the image/video count from the token right after
+        # `<|vision_start|>`; a marker there gives silently wrong positions, not an error.
+        # Checked here, per example, so a bad dataset format fails on the first batch.
+        vision_start = self.processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        if isinstance(vision_start, int) and vision_start >= 0:
+            starts = (input_ids == vision_start).nonzero(as_tuple=False)
+            marker_ids = set(token_ids.values())
+            for b, s in starts.tolist():
+                if s + 1 < input_ids.shape[1] and int(input_ids[b, s + 1]) in marker_ids:
+                    raise ValueError(
+                        f"a modality marker sits immediately after <|vision_start|> at "
+                        f"position {s + 1}. get_rope_index derives the image/video count "
+                        "from that position; put the marker anywhere else."
+                    )
+        batch = ModalityBatch()
+        for s in self.modality_specs:
+            n_found = int((input_ids == token_ids[s.key]).sum())
+            values = modality[s.key]
+            if values.shape[0] != n_found:
+                raise ValueError(
+                    f"modality {s.token} : column {s.source_column!r} has "
+                    f"{values.shape[0]} row(s) but the tokenized conversation contains "
+                    f"{n_found} occurrence(s) of the marker. The dataset row and the "
+                    "rendered text disagree."
+                )
+            batch.values[s.key] = values
+            batch.counts[s.key] = torch.tensor([n_found], dtype=torch.long)
+        return batch.to_kwargs()
 
 
 # ======================================================================================
@@ -416,6 +550,7 @@ class TurnVectorRegressor(nn.Module):
         postfix_ids: Sequence[int],
         model_cfg: ModelConfig,
         loss_cfg: LossConfig,
+        modality_embedder: Optional[ModalityEmbedder] = None,
     ):
         super().__init__()
         self.backbone = backbone
@@ -426,6 +561,10 @@ class TurnVectorRegressor(nn.Module):
         self.postfix_ids = list(postfix_ids)
         self.model_cfg = model_cfg
         self.loss_cfg = loss_cfg
+        # A submodule, so its parameters are this model's parameters -- which is what puts
+        # them in the optimizer's groups and makes DDP see them. Empty and inert unless
+        # `model_cfg.modality_specs` declares something.
+        self.modality_embedder = modality_embedder or ModalityEmbedder()
         # How many positions per turn the head pools. Observed on the first forward and
         # saved with the checkpoint, so inference can assert its affixes reproduce it --
         # a pooled head silently accepts the wrong count.
@@ -504,10 +643,28 @@ class TurnVectorRegressor(nn.Module):
             processor.tokenizer, model_cfg.prefix, model_cfg.postfix
         )
         normalizer = TargetNormalizer(target_shape[-1], enabled=loss_cfg.normalize_targets)
-        return cls(
+        # Registered on the processor's tokenizer here, not by the caller: the markers must
+        # be present before anything tokenizes, and this is the one place that sees both
+        # the spec list and the tokenizer.
+        embedder = ModalityEmbedder(model_cfg.modality_specs, d_model=hidden_size)
+        if embedder:
+            embedder.register(processor.tokenizer)
+        model = cls(
             backbone, head, normalizer, target_shape, prefix_ids, postfix_ids,
-            model_cfg, loss_cfg,
+            model_cfg, loss_cfg, modality_embedder=embedder,
         )
+        model.attach_modality_hooks()
+        return model
+
+    def attach_modality_hooks(self) -> "TurnVectorRegressor":
+        """(Re)install the embedding hooks. Idempotent, and a no-op with no specs.
+
+        Called again whenever the backbone is re-wrapped (peft), because the hooks live on
+        a module reached through the wrapper.
+        """
+        if self.modality_embedder:
+            self.modality_embedder.attach(self.backbone.get_input_embeddings())
+        return self
 
     # -- plumbing HF Trainer expects ---------------------------------------------------
     def gradient_checkpointing_enable(self, **kwargs):
@@ -530,10 +687,11 @@ class TurnVectorRegressor(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.parameters())
         head = sum(p.numel() for p in self.head.parameters() if p.requires_grad)
+        mod = sum(p.numel() for p in self.modality_embedder.parameters() if p.requires_grad)
         return (
             f"{trainable:,} trainable / {total:,} total params "
             f"({100 * trainable / total:.2f}%); head {head:,}, "
-            f"adapters {trainable - head:,}"
+            f"modality encoders {mod:,}, adapters {trainable - head - mod:,}"
         )
 
     # -- the objective -----------------------------------------------------------------
@@ -554,16 +712,30 @@ class TurnVectorRegressor(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         num_turns: Optional[torch.Tensor] = None,
         num_items_in_batch: Optional[Union[int, torch.Tensor]] = None,
-        **multimodal,
+        **backbone_inputs,
     ) -> Dict[str, torch.Tensor]:
-        multimodal.pop("labels", None)
-        outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            logits_to_keep=1,  # never materialize (B, S, vocab); the LM head is unused
-            **multimodal,
+        """`backbone_inputs` is whatever else the collator produced -- `pixel_values`,
+        `image_grid_thw` and friends -- and it is forwarded to the backbone **wholesale**.
+
+        That is why the modality keys have to come out first and by name. The backbone
+        does not accept them, so anything left in here is a `TypeError` from deep inside
+        the model; `pop_from` owns the entire `modality_*` prefix and raises on a key it
+        does not recognise rather than letting one through.
+        """
+        backbone_inputs.pop("labels", None)
+        modality = ModalityBatch.pop_from(
+            backbone_inputs, known_keys=self.modality_embedder.keys
         )
+        # The context wraps only the backbone call: entering it twice under one context
+        # trips the consume-once assert instead of silently reusing the same values.
+        with self.modality_embedder.pending(modality):
+            outputs = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                logits_to_keep=1,  # never materialize (B, S, vocab); the LM head is unused
+                **backbone_inputs,
+            )
 
         vectors, spans = extract_turn_vectors(
             outputs,
@@ -598,6 +770,14 @@ class TurnVectorRegressor(nn.Module):
         denom = torch.as_tensor(denom, dtype=total.dtype, device=total.device).clamp(min=1)
         loss = total / denom
 
+        # An example with no occurrences of a modality leaves its encoder out of the
+        # backward graph, which under `ddp_find_unused_parameters=False` hangs or errors.
+        # This term is identically zero -- it changes no gradient and no metric -- and
+        # exists only so every encoder parameter is always reached.
+        touch = self.modality_embedder.zero_touch(loss.device, loss.dtype)
+        if touch is not None:
+            loss = loss + touch
+
         with torch.no_grad():
             pred_orig = self.normalizer.denormalize(pred.detach())
             err = (pred_orig - targets).reshape(-1, self.target_shape[-1])
@@ -625,17 +805,28 @@ class TurnVectorRegressor(nn.Module):
         output_dir.mkdir(parents=True, exist_ok=True)
         if hasattr(self.backbone, "save_pretrained") and hasattr(self.backbone, "peft_config"):
             self.backbone.save_pretrained(str(output_dir / ADAPTER_SUBDIR))
-        torch.save(
-            {
-                "head": self.head.state_dict(),
-                "normalizer": self.normalizer.state_dict(),
-            },
-            output_dir / HEAD_WEIGHTS_FILE,
-        )
+        blob = {
+            "head": self.head.state_dict(),
+            "normalizer": self.normalizer.state_dict(),
+        }
+        # A third top-level entry alongside "head" and "normalizer", written only when
+        # something is declared -- so a no-spec checkpoint is byte-identical to one from
+        # before this existed.
+        modality = self.modality_embedder.state_blob()
+        if modality is not None:
+            blob["modality"] = modality
+        torch.save(blob, output_dir / HEAD_WEIGHTS_FILE)
+        model_meta = asdict(self.model_cfg)
+        if not model_meta.get("modality_specs"):
+            # Omitted rather than written as `[]`, so a checkpoint with no modalities is
+            # byte-identical to one written before this field existed -- and, more to the
+            # point, still loadable by an older reader that would choke on an unexpected
+            # `ModelConfig` keyword.
+            model_meta.pop("modality_specs", None)
         (output_dir / HEAD_CONFIG_FILE).write_text(
             json.dumps(
                 {
-                    "model": asdict(self.model_cfg),
+                    "model": model_meta,
                     "loss": asdict(self.loss_cfg),
                     "target_shape": list(self.target_shape),
                     "train_content_len": self.train_content_len,
@@ -647,12 +838,18 @@ class TurnVectorRegressor(nn.Module):
         )
 
     def load_head_state(self, checkpoint_dir: Union[str, Path], strict: bool = True):
-        """Load the head weights and the normalizer buffers."""
+        """Load the head weights, the normalizer buffers and the modality encoders.
+
+        Modality loading is strict *regardless of* `strict`. That flag exists to tolerate
+        head-shape evolution; letting it also silently drop encoders would give a model
+        that behaves differently from what its own config claims.
+        """
         blob = torch.load(
             Path(checkpoint_dir) / HEAD_WEIGHTS_FILE, map_location="cpu", weights_only=False
         )
         self.head.load_state_dict(blob["head"], strict=strict)
         self.normalizer.load_state_dict(blob["normalizer"], strict=strict)
+        self.modality_embedder.load_state_blob(blob.get("modality"))
         return self
 
     def load_adapter_state(self, checkpoint_dir: Union[str, Path]) -> bool:
@@ -717,6 +914,8 @@ class TurnVectorRegressor(nn.Module):
             # This already loads the adapter weights, so `load_trainable` must not do it
             # again -- hence adapter=False below.
             model.backbone = PeftModel.from_pretrained(model.backbone, str(adapter_dir))
+            # The backbone was re-wrapped; re-point the hooks through the new wrapper.
+            model.attach_modality_hooks()
         model.load_trainable(checkpoint_dir, adapter=False)
         if device:
             model.to(device)

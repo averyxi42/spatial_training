@@ -104,6 +104,12 @@ def parse_args():
     m.add_argument("--head-dropout", type=float, default=0.0)
     m.add_argument("--train-vision-tower", action="store_true",
                    help="leave the ViT trainable (frozen by default)")
+    m.add_argument("--modality-specs", default=None,
+                   help="JSON list of modality embedding specs, or a path to a .json file "
+                        "holding one. Each entry: {\"token\": \"<x>\", \"n_features\": 3, "
+                        "\"encoder\": \"mlp\", \"encoder_kwargs\": {}, \"column\": \"x\"}. "
+                        "Omitted -> the mechanism is inert. See "
+                        "longnav.utils.modality_embed")
 
     l = p.add_argument_group("lora")
     l.add_argument("--lora-r", type=int, default=64)
@@ -162,6 +168,19 @@ def _unescape(text):
     return text.encode("latin-1", "backslashreplace").decode("unicode_escape")
 
 
+def _modality_specs(text):
+    """A JSON list of specs, or a path to a file holding one. None -> no modalities."""
+    if not text:
+        return ()
+    import json
+
+    raw = Path(os.path.expanduser(text))
+    payload = json.loads(raw.read_text()) if raw.is_file() else json.loads(text)
+    if not isinstance(payload, list):
+        raise ValueError("--modality-specs must be a JSON *list* of spec objects")
+    return tuple(payload)
+
+
 def _csv(text, cast=str):
     if text is None or text == "":
         return ()
@@ -192,18 +211,37 @@ def infer_target_shape(dataset, column):
 
 
 def build_optimizer_param_groups(model, args):
-    """Head and adapters as separate groups so the fresh head can take a larger step."""
-    head_params = [p for p in model.head.parameters() if p.requires_grad]
-    head_ids = {id(p) for p in head_params}
-    other = [p for p in model.parameters() if p.requires_grad and id(p) not in head_ids]
+    """Head (and modality encoders) apart from the adapters, so the fresh modules can take
+    a larger step.
+
+    Then assert every trainable parameter landed in some group. A module left out of the
+    groups is **silently frozen** -- no error, no warning, just a parameter that never
+    moves. For the modality encoders that failure is indistinguishable from "the injection
+    did not help", which is the conclusion the experiment is trying to draw.
+    """
+    fresh = [p for p in model.head.parameters() if p.requires_grad]
+    fresh += [p for p in model.modality_embedder.parameters() if p.requires_grad]
+    fresh_ids = {id(p) for p in fresh}
+    other = [p for p in model.parameters() if p.requires_grad and id(p) not in fresh_ids]
     groups = [{"params": other, "lr": args.lr, "weight_decay": args.weight_decay}]
-    if head_params:
+    if fresh:
         groups.append(
             {
-                "params": head_params,
+                "params": fresh,
                 "lr": args.head_lr if args.head_lr is not None else args.lr,
                 "weight_decay": args.weight_decay,
             }
+        )
+
+    grouped = {id(p) for g in groups for p in g["params"]}
+    missing = [
+        n for n, p in model.named_parameters()
+        if p.requires_grad and id(p) not in grouped
+    ]
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} trainable parameter(s) are in no optimizer group and would "
+            f"be silently frozen: {missing[:8]}"
         )
     return groups
 
@@ -258,6 +296,7 @@ def main():
         head_hidden_dims=_csv(args.head_hidden_dims, int),
         head_dropout=args.head_dropout,
         freeze_vision_tower=not args.train_vision_tower,
+        modality_specs=_modality_specs(args.modality_specs),
     )
     data_cfg = DataConfig(
         target_column=args.target_column,
@@ -306,9 +345,17 @@ def main():
                   f"{model.normalizer.mean.tolist()} std={model.normalizer.std.tolist()}")
     if is_main:
         print("Model:", model.trainable_parameter_report())
+        if model.modality_embedder:
+            print("Modality embeddings:\n" + model.modality_embedder.describe())
 
-    train_collator = TurnVectorCollator(processor, data_cfg, train=True, seed=args.seed)
-    eval_collator = TurnVectorCollator(processor, data_cfg, train=False, seed=args.seed)
+    # The model's own spec list, not a second copy: which column feeds which marker has
+    # exactly one definition, and `build()` has already registered the tokens on this
+    # processor's tokenizer.
+    specs = model_cfg.modality_specs
+    train_collator = TurnVectorCollator(processor, data_cfg, train=True, seed=args.seed,
+                                        modality_specs=specs)
+    eval_collator = TurnVectorCollator(processor, data_cfg, train=False, seed=args.seed,
+                                       modality_specs=specs)
 
     if not args.no_preflight and is_main:
         model.to("cuda" if torch.cuda.is_available() else "cpu")
