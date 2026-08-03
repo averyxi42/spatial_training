@@ -1,7 +1,14 @@
 """
-Train the autoregressive-over-ticks action head -- the candidate hedged against the
-conditional normalizing flow, per `dump/overnight/PLAN.md` and
-`dump/autoregressive_head/FINDINGS.md`.
+Train the AR action head, VERSION 2 (`longnav.utils.ar_action_head_v2`).
+
+Same objective, data, optimizer grouping and metrics as `train_ar_action_sft.py`; the only
+difference is which decoder is built. See `ar_action_head_v2`'s docstring for what v2
+changes and why each change is traceable to a measurement. v1 and its script stay frozen
+so `run_v2_lloyd_ddp4` / `run_v3_ctx8_pose` remain reproducible.
+
+v2 removes knobs rather than adding them: there is no --context-dim (derived), no
+--direct-context (always), no --prefix-pose (the pose state is intrinsic) and no
+--pose-scales legacy path.
 
 Exactly the discrete-bin control's own pattern (`data_scripts/train_bin_sft.py`): every
 argument that is not the output parameterization is borrowed from `train_vector_sft.py`'s
@@ -35,9 +42,8 @@ import torch  # noqa: E402
 from transformers import AutoProcessor, TrainingArguments  # noqa: E402
 
 import train_vector_sft as base  # noqa: E402
-from longnav.utils.ar_action_head import (  # noqa: E402
-    DEFAULT_DT_NATIVE, ARActionSFTTrainer, CausalActionDecoder, ChunkVQCodec,
-    TurnARActionClassifier,
+from longnav.utils.ar_action_head_v2 import (  # noqa: E402
+    DEFAULT_DT_NATIVE, ARActionSFTTrainer, ChunkVQCodec, TurnARActionClassifierV2,
 )
 from longnav.utils.vector_sft import (  # noqa: E402
     DataConfig, LossConfig, LoraSpec, ModelConfig, TurnVectorCollator,
@@ -71,46 +77,25 @@ def parse_args():
     pre = base.argparse.ArgumentParser(add_help=False)
     pre.add_argument("--codebook", default=None,
                      help="JSON written by dump/autoregressive_head/fit_codebook.py")
-    pre.add_argument("--context-dim", type=int, default=None,
-                     help="OUTPUT width of the readout MLP -- the MLP/decoder interface "
-                          "(default 256). Distinct from --head-hidden-dims, which sizes "
-                          "that MLP's INTERNAL layers and is where the only nonlinearity "
-                          "lives. Ignored (and derived) under --direct-context. See the "
-                          "'context pathway' section of ar_action_head.py")
-    pre.add_argument("--direct-context", action="store_true",
-                     help="drop the decoder's context_proj: the readout MLP emits "
-                          "n_context_tokens * d_model directly and the decoder only "
-                          "reshapes. Removes a redundant linear factor (~1M params at "
-                          "8x128) and makes the width agreement structural instead of a "
-                          "warning. --context-dim is derived, not accepted")
     pre.add_argument("--decoder-d-model", type=int, default=128)
     pre.add_argument("--decoder-layers", type=int, default=4)
     pre.add_argument("--decoder-heads", type=int, default=4)
     pre.add_argument("--decoder-ff", type=int, default=512)
     pre.add_argument("--decoder-dropout", type=float, default=0.1)
-    pre.add_argument("--context-tokens", type=int, default=1,
-                     help="split the trunk's context vector into this many decoder prefix "
-                          "tokens. A single token caps the context at d_model dimensions "
-                          "no matter how wide the trunk head is, so widening the head only "
-                          "helps in combination with this. Set --context-dim to "
-                          "context-tokens * decoder-d-model to make the split exactly "
-                          "rank-preserving (e.g. 8 tokens x 128 -> --context-dim 1024)")
-    pre.add_argument("--prefix-pose", action="store_true",
-                     help="feed each tick the pose accumulated so far plus the previous "
-                          "tick's differential. Adds no information (both are functions of "
-                          "the prefix) but removes the SE(2) composition the decoder would "
-                          "otherwise have to learn to do internally")
-    pre.add_argument("--pose-scales", default="calibrated",
-                     choices=("calibrated", "legacy"),
-                     help="feature normalisation for --prefix-pose. 'calibrated' gives "
-                          "each state feature ~unit variance on v2_25hz; 'legacy' is the "
-                          "original single 0.1 constant, which left the accumulated-pose "
-                          "features ~20x wider than the differential ones. Only 'legacy' "
-                          "reproduces checkpoints trained before the split")
+    pre.add_argument("--context-tokens", type=int, default=8,
+                     help="prefix tokens the readout MLP emits. A token is d_model wide, "
+                          "so this -- not the MLP width -- sets how many dimensions of "
+                          "context the decoder can receive. context_dim is DERIVED as "
+                          "context-tokens * decoder-d-model; v2 has no projection to "
+                          "reconcile a mismatch")
     pre.add_argument("--attn-mode", default="causal", choices=("causal", "markov"),
-                     help="'markov' lets each tick attend only to the context slots and "
-                          "itself, making the per-tick input a sufficient state. Requires "
-                          "--prefix-pose, which is what makes that state sufficient")
+                     help="'markov': each tick attends to the context slots and itself "
+                          "only. Legitimate in v2 because the pose state is always "
+                          "present, so a tick's own input is a sufficient conditioning set")
+    pre.add_argument("--incoming-motion", action="store_true",
+                     help="reserve the tick-0 incoming-velocity slot + validity bit. The "
+                          "dataset does not yet supply the value, so this currently only "
+                          "changes the architecture; see ar_action_head_v2's docstring")
     mine, rest = pre.parse_known_args()
 
     old_argv, sys.argv = sys.argv, [sys.argv[0], *rest]
@@ -124,48 +109,22 @@ def parse_args():
             "--codebook is required (see dump/autoregressive_head/fit_codebook.py)"
         )
     args.codebook = mine.codebook
-    # Under --direct-context the interface width is not a free choice: the readout MLP
-    # must emit exactly one d_model-wide vector per prefix token. Derive it rather than
-    # letting a stale --context-dim silently disagree.
-    derived = mine.context_tokens * mine.decoder_d_model
-    if mine.direct_context:
-        if mine.context_dim is not None and mine.context_dim != derived:
-            raise SystemExit(
-                f"--direct-context derives --context-dim as --context-tokens x "
-                f"--decoder-d-model = {mine.context_tokens} x {mine.decoder_d_model} = "
-                f"{derived}; drop the explicit --context-dim {mine.context_dim}"
-            )
-        args.context_dim = derived
-    else:
-        args.context_dim = mine.context_dim if mine.context_dim is not None else 256
+    # Derived, never accepted: v2 has no context_proj, so the readout MLP must emit
+    # exactly one d_model-wide vector per prefix token.
+    args.context_dim = mine.context_tokens * mine.decoder_d_model
     args.decoder_kwargs = dict(
         d_model=mine.decoder_d_model, n_layers=mine.decoder_layers,
         n_heads=mine.decoder_heads, dim_ff=mine.decoder_ff, dropout=mine.decoder_dropout,
-        n_context_tokens=mine.context_tokens, use_prefix_pose=mine.prefix_pose,
-        attn_mode=mine.attn_mode, direct_context=mine.direct_context,
-        pose_scales=(CausalActionDecoder.POSE_SCALES_CALIBRATED
-                     if mine.pose_scales == "calibrated"
-                     else CausalActionDecoder.POSE_SCALES_LEGACY),
+        n_context_tokens=mine.context_tokens, attn_mode=mine.attn_mode,
+        use_incoming_motion=mine.incoming_motion,
     )
-    if mine.attn_mode == "markov" and not mine.prefix_pose:
-        raise SystemExit(
-            "--attn-mode markov without --prefix-pose: masking the token history leaves "
-            "each tick with only its own code embedding and tick index, which is NOT a "
-            "sufficient state (no accumulated pose). Pass --prefix-pose too."
-        )
-    if (not mine.direct_context and mine.context_tokens > 1
-            and args.context_dim != derived):
-        print(f"[warn] --context-dim {args.context_dim} != --context-tokens "
-              f"{mine.context_tokens} x --decoder-d-model {mine.decoder_d_model}; the "
-              f"context projection will not be rank-preserving across the split. "
-              f"--direct-context makes this structural instead of advisory")
     if args.output_dir == "dump/vector_sft":
         raise SystemExit(
             "--output-dir defaults to the regression baseline's directory; pass an "
             "explicit one under dump/autoregressive_head/"
         )
     if args.wandb_project == "longnav-vector-sft":
-        args.wandb_project = "longnav-autoregressive-head-study"
+        args.wandb_project = "longnav-autoregressive-head-v2"
     if args.loss != "huber":
         raise SystemExit("--loss does not apply: this head's objective is cross-entropy")
     return args
@@ -223,7 +182,7 @@ def main():
 
     # ---- model ---------------------------------------------------------------------
     processor = AutoProcessor.from_pretrained(args.model_id)
-    model = TurnARActionClassifier.build(
+    model = TurnARActionClassifierV2.build(
         model_cfg, loss_cfg, lora, n_ticks, processor,
         n_codes=codebook.n_codes, context_dim=args.context_dim,
         decoder_kwargs=args.decoder_kwargs, dtype=torch.bfloat16,
@@ -244,10 +203,10 @@ def main():
         dk = args.decoder_kwargs
         print(f"Codebook: {args.codebook}  n_codes={model.n_codes}  "
               f"decoder params: {decoder_params:,}  dt_native={model.dt_native}")
-        route = "reshape (direct)" if dk["direct_context"] else "context_proj"
-        print(f"Context: dim {args.context_dim} -{route}-> {dk['n_context_tokens']} "
-              f"token(s) x {dk['d_model']}   prefix_pose={dk['use_prefix_pose']}  "
-              f"attn={dk['attn_mode']}  pose_scales={tuple(dk['pose_scales'])}")
+        print(f"Context: dim {args.context_dim} -reshape-> {dk['n_context_tokens']} "
+              f"token(s) x {dk['d_model']}   attn={dk['attn_mode']}  "
+              f"incoming_motion={dk['use_incoming_motion']}  "
+              f"scales={tuple(dk['scales'])}")
 
     train_collator = TurnVectorCollator(processor, data_cfg, train=True, seed=args.seed)
     eval_collator = TurnVectorCollator(processor, data_cfg, train=False, seed=args.seed)

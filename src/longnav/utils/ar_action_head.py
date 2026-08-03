@@ -41,6 +41,141 @@ changes, plus one more this design needs):
 
 `vector_sft.py`, `turn_vectors.py`, `vector_rollout.py`, `bin_codec.py` and `bin_head.py`
 are all untouched.
+
+--------------------------------------------------------------------------------------
+The context pathway (and a known wart in it)
+--------------------------------------------------------------------------------------
+Naming, because "head" is ambiguous once there are two networks: BACKBONE is the VLM,
+READOUT MLP is `TurnVectorHead` (pool -> LayerNorm -> MLP -> context vector), ACTION
+DECODER is `CausalActionDecoder` below. The code calls the readout MLP the "trunk head".
+
+    backbone hidden (2048)
+      -> readout MLP: [Linear(-> h) -> Mish -> Dropout] per entry of head_hidden_dims,
+                      then a final Linear(last_hidden -> context_dim)
+      -> context vector (context_dim)
+      -> decoder context_proj: Linear(context_dim -> n_context_tokens * d_model)
+      -> .view(n_context_tokens, d_model) + start_embed
+      -> transformer positions 0 .. n_context_tokens-1
+
+Only two things in that chain constrain what reaches the decoder:
+
+  * `head_hidden_dims`   where the ONLY nonlinearity lives, and how wide it is. This is
+                         the real capacity knob.
+  * `n_context_tokens * d_model`   a HARD ceiling: a token is d_model wide by definition,
+                         so one prefix token caps the context at d_model dimensions no
+                         matter how wide the readout MLP is. More tokens is the only way
+                         past it.
+
+`context_dim` is NOT a third independent width. The readout MLP's final Linear and
+`context_proj` are adjacent linear maps with no activation between them, so their
+composition has rank <= min(context_dim, n_context_tokens * d_model) and `context_dim`
+functions purely as a rank bound. Set it >= n_context_tokens * d_model (as the current
+runs do) and it constrains nothing -- it is then a redundant ~1M-parameter linear factor.
+
+KNOWN WART, kept deliberately rather than silently: `context_proj` is an interface adapter
+("accept any context width, project to my d_model") that decouples nothing real, since the
+training script must coordinate context_dim / n_context_tokens / d_model in one place
+anyway -- which is why `train_ar_action_sft.py` has to WARN when they disagree. The clean
+shape is for the readout MLP to emit `n_context_tokens * d_model` directly and for the
+decoder to only reshape; then every parameter does work and the constraint is structural
+instead of advisory. The one thing that would lose is a LINEAR (activation-free) low-rank
+bottleneck, which is a parameter-saving factorization nothing here wants -- a narrow entry
+in `head_hidden_dims` gives a better bottleneck, with a nonlinearity at the narrow point.
+
+Historical note: `--head-hidden-dims 128 --context-dim 256` with one token meant the only
+nonlinearity ran at width 128 and the decoder could receive 128 dimensions, so the nominal
+"256-d context" was never more than 128 dimensions of anything.
+
+--------------------------------------------------------------------------------------
+KNOWN GAP: tick 0 is told the robot is at rest, and it is not
+--------------------------------------------------------------------------------------
+With `use_prefix_pose` on there are THREE input channels per tick:
+
+  1. `token_embed(label_{t-1})`            previous motion, CATEGORICAL  (pre-existing)
+  2. state feats 4..6 (dx,dy,dtheta)_prev  previous motion, CONTINUOUS
+  3. state feats 0..3 (x, y, cos, sin)     accumulated pose
+
+Channel 3 is the information `use_prefix_pose` was added to supply. Channel 2 is a
+continuous restatement of channel 1 -- these features are literally the centroid that
+channel 1 looks up, before scaling -- and it is also correlated 0.83/0.77 with channel 3's
+xy on real data (identical to it at tick 1 by construction, since one prior differential
+IS the accumulated pose there). So the previous motion reaches the model three ways.
+
+Tick 0 receives NONE of the three: its previous-token slot holds the learned `BOS`
+placeholder, and `_prefix_state` emits `[0, 0, 1, 0, 0, 0, 0]` -- zero pose AND zero
+velocity. It is not one redundant copy that is missing, it is every copy.
+
+MEASURED DEFECTS in the feature layout (validation corpus, 120 episodes):
+
+    feature        std      p99    |max|
+    x/XY         1.822    7.004    7.204     <- scale constant undershoots badly
+    y/XY         0.538    2.024    7.031
+    cos          0.058    1.000    1.000     <- near-constant, ~no information
+    sin          0.259    0.642    0.660
+    dx_prev/XY   0.319    0.800    0.800
+    dy_prev/XY   0.087    0.299    0.794
+    dth_prev/TH  0.510    0.801    1.261
+
+  * ONE `POSE_XY_SCALE` normalises two quantities whose ranges differ ~9x: the accumulated
+    pose (grows to ~0.7 m over a chunk) and a per-tick differential (~0.05 m). Tuned for
+    the latter, it leaves `x/XY` with std 1.8 and a max of 7.2 while `dy_prev/XY` sits at
+    std 0.087 -- a ~20x spread in feature scale feeding one un-normalised `Linear`.
+  * `cos` is near-degenerate. Accumulated heading inside a chunk never approaches +-pi, so
+    cos stays in [0.75, 1.0]. The (cos, sin) pair was chosen to avoid wraparound, but there
+    is no wraparound to avoid at this horizon -- raw theta or sin alone carries the same
+    information in one feature.
+  * there is no normalisation before `pose_proj`, unlike the readout MLP which has its own
+    `pre_norm` LayerNorm over the backbone states.
+
+A pose-only variant (`POSE_FEAT_DIM = 4`, dropping feats 4..6) is the minimal form of this
+channel and isolates "does accumulated pose help" from "does more previous-motion signal
+help". Separate scales for pose and differential, or a LayerNorm on the state vector, would
+address the scale defect independently of that choice.
+
+That is wrong about the robot. The chunks overlap 50% (`obs_interval` 0.2 s,
+`chunk_duration` 0.4 s), so the executor runs `stride` ticks of chunk i-1 and then
+re-observes; at the moment chunk i is predicted the base is MID-MOTION, carrying the
+velocity of the last tick it executed. Tick 0 is the only tick denied that.
+
+How much it costs, from the probes in `dump/pose_alignment_probe/`:
+
+  * teacher-forced accuracy is 0.4254 at tick 0 against ~0.73 at every other tick -- a
+    ~30 pp gap, and the ONLY structural difference is the missing previous differential
+  * lag-1 R^2 of the per-tick differentials is 0.9566, i.e. the previous tick explains 96%
+    of the next one's variance. Tick 0 is denied exactly that signal
+  * tick 0 is simultaneously the only strongly context-driven tick (47.5% of the gradient
+    reaching the context, KL(real||zero-context) 3.33 against <=0.21 everywhere else), and
+    free-running decode coasts off whatever it produces
+
+So the weakest-conditioned tick is the one the whole chunk is anchored on.
+
+FUTURE EXPANSION -- the data already contains what is missing:
+  * training: the differential of the last executed tick before observation i is
+    `decompose_chunk(action_chunks[i-1])[stride - 1]` (stride 5, so index 4). It would ride
+    into the collator as a per-turn column and into `_prefix_state` as tick 0's `d_prev`
+  * rollout: the policy knows what it just executed, so nothing simulator-side is needed --
+    the same value `VectorRolloutPolicy` already emitted on the previous step
+  * the first observation of an episode genuinely IS at rest, so keep zeros there -- but
+    add an 8th feature, a validity bit, because the current all-zero vector conflates
+    "genuinely stationary" with "start of chunk, unknown". Without that bit the model
+    cannot tell the two apart, and they imply opposite continuations
+
+OTHER KNOWN REDUNDANCIES AND ODDITIES, collected so they are not rediscovered:
+
+  * `start_embed` duplicates `context_proj.bias` (or the readout MLP's final bias under
+    `direct_context`), which is already per-slot after the reshape. Retained for
+    checkpoint compatibility; see its definition.
+  * `context_proj` is a redundant linear factor whenever `context_dim >=
+    n_context_tokens * d_model`. `--direct-context` removes it.
+  * under `attn_mode="causal"` the context slots are causally masked among THEMSELVES --
+    slot 3 cannot attend to slots 4..7. Harmless (they are carriers, and every tick still
+    sees all of them) but arbitrary; `markov` makes them mutually visible.
+  * `_prefix_state` recomposes the whole chunk on every one of the T sequential decode
+    steps, so the pose channel costs O(T^2) composition work per rollout step. Negligible
+    at T=10; it would want a running pose at a larger horizon.
+  * `decode(mode="mean")` is not an executable policy and is rejected by the eval backend;
+    with `use_prefix_pose` it is a double approximation (its state features are composed
+    from greedy codes while its output corresponds to no code sequence).
 """
 
 from __future__ import annotations
@@ -73,6 +208,15 @@ from longnav.utils.vector_sft import (
 EXACT = 1e-4
 CREEP = (0.01, 0.01, 0.02)  # dx, dy, dtheta
 DIM_NAMES = ("dx", "dy", "dtheta")
+
+# Rotation-flip deadband, as a SPEED, matching `objectnav_eval.probes` (the closed-loop
+# suite) and `dump/autoregressive_head/analyze_ar.py` (the offline one) so the number
+# logged during training is the same statistic those two report and cannot drift from
+# them. 0.25 * 0.40 rad/s = 0.10 rad/s; scaled by dt to get a per-tick threshold, because
+# the corpora run at different tick rates (v1 dt=0.05, v2 dt=0.04) and a fixed per-tick
+# radian value would silently mean different speeds on each.
+FLIP_DEADBAND_RADPS = 0.25 * 0.40
+DEFAULT_DT_NATIVE = 0.04  # v2 (25 Hz); overridden from the dataset by the train script
 
 
 # ======================================================================================
@@ -201,16 +345,85 @@ class CausalActionDecoder(nn.Module):
     future.
     """
 
+    #: pose/velocity feature layout, documented once so the probes can reproduce it:
+    #: [x/S0, y/S0, cos(theta), sin(theta), dx_prev/S1, dy_prev/S1, dtheta_prev/S2]
+    POSE_FEAT_DIM = 7
+
+    #: (pose_xy, diff_xy, theta). The first normalises the ACCUMULATED pose, which grows
+    #: over a chunk; the second a single tick's differential. They must be separate --
+    #: their ranges differ ~9x -- and pose_xy/diff_xy must each apply to BOTH x and y, or
+    #: the scaling would be anisotropic and distort the geometry the decoder reasons over.
+    #:
+    #: LEGACY is the original single-constant layout. It is the CONSTRUCTOR DEFAULT so that
+    #: every checkpoint written before this split -- including run_v3_ctx8_pose, which is
+    #: training as this is written -- reloads with exactly the feature scaling it was
+    #: trained under. Changing the default would silently mis-scale those inputs at eval.
+    POSE_SCALES_LEGACY = (0.1, 0.1, 0.1)
+    #: Calibrated so each feature lands near unit variance on the v2_25hz corpus:
+    #: measured stds were x 0.182 m, y 0.054 m, dx_prev 0.032 m, dy_prev 0.009 m,
+    #: dtheta_prev 0.051 rad. New runs should pass this.
+    POSE_SCALES_CALIBRATED = (0.15, 0.03, 0.05)
+
     def __init__(self, context_dim: int, n_codes: int, n_ticks: int, d_model: int = 128,
-                 n_layers: int = 4, n_heads: int = 4, dim_ff: int = 512, dropout: float = 0.1):
+                 n_layers: int = 4, n_heads: int = 4, dim_ff: int = 512, dropout: float = 0.1,
+                 n_context_tokens: int = 1, use_prefix_pose: bool = False,
+                 attn_mode: str = "causal", direct_context: bool = False,
+                 pose_scales: Optional[Sequence[float]] = None):
         super().__init__()
+        if attn_mode not in ("causal", "markov"):
+            raise ValueError(f"attn_mode must be causal|markov, got {attn_mode!r}")
         self.n_codes, self.n_ticks, self.d_model = n_codes, n_ticks, d_model
+        self.n_context_tokens = int(n_context_tokens)
+        self.use_prefix_pose = bool(use_prefix_pose)
+        self.attn_mode = attn_mode
+        self.direct_context = bool(direct_context)
+        self.context_dim = int(context_dim)
+        scales = tuple(float(x) for x in (pose_scales or self.POSE_SCALES_LEGACY))
+        if len(scales) != 3 or any(x <= 0 for x in scales):
+            raise ValueError(
+                f"pose_scales must be 3 positive floats (pose_xy, diff_xy, theta), "
+                f"got {pose_scales!r}"
+            )
+        self.pose_scales = scales
         self.BOS = n_codes  # one extra id: "no previous tick" (used only at position 1)
 
-        self.context_proj = nn.Linear(context_dim, d_model)
-        self.start_embed = nn.Parameter(torch.zeros(d_model))
+        if self.direct_context:
+            # The readout MLP emits token space directly; the decoder only reshapes. This
+            # is the clean separation: the redundant linear factor is gone, and the width
+            # agreement is a structural requirement rather than the advisory warning the
+            # projecting path needs. See the module docstring's context-pathway section.
+            want = self.n_context_tokens * d_model
+            if self.context_dim != want:
+                raise ValueError(
+                    f"direct_context requires context_dim == n_context_tokens * d_model "
+                    f"({self.n_context_tokens} * {d_model} = {want}), got {context_dim}"
+                )
+            self.context_proj = None
+        else:
+            # Legacy path: an interface adapter accepting any context width. Kept as the
+            # default so every checkpoint written before `direct_context` still loads.
+            self.context_proj = nn.Linear(context_dim, self.n_context_tokens * d_model)
+        # A learned per-slot bias on the context tokens. Honest note: this is REDUNDANT
+        # with `context_proj.bias`, which already has n_ctx * d_model entries and is
+        # therefore per-slot once reshaped -- (Wx + b).view(C,d) + s is the same function
+        # as (Wx).view(C,d) + (b.view(C,d) + s). The slots are distinguishable without it
+        # anyway, since each reads its own block of rows of W. It survives because it
+        # predates the multi-token split and dropping it would break every existing
+        # checkpoint; it costs C*d parameters and buys initialization (zeros, so the
+        # effective slot bias starts as the Linear's bias alone), not expressive power.
+        # It WOULD be load-bearing in a variant that shared one projection across slots.
+        self.start_embed = nn.Parameter(torch.zeros(self.n_context_tokens, d_model))
+        # Discrete lookup rather than a projection of the centroid: the table can place
+        # geometrically adjacent codes arbitrarily far apart, so nothing forces near-zero
+        # motions to share an embedding. (A weak argument behaviourally -- a stop and a
+        # 1 mm tick are near-identical to act on -- but the table is standard, costs
+        # 131k parameters, and removes the question.) Row `n_codes` is BOS.
         self.token_embed = nn.Embedding(n_codes + 1, d_model)
+        # The ONLY positional signal for tick positions -- there is no sinusoidal encoding
+        # anywhere in this decoder. Also carries "how much of the chunk is left".
         self.tick_embed = nn.Embedding(n_ticks, d_model)
+        self.pose_proj = (nn.Linear(self.POSE_FEAT_DIM, d_model)
+                          if self.use_prefix_pose else None)
         layer = nn.TransformerEncoderLayer(
             d_model, n_heads, dim_ff, dropout, activation="gelu",
             batch_first=True, norm_first=True,
@@ -220,7 +433,23 @@ class CausalActionDecoder(nn.Module):
         self.out_proj = nn.Linear(d_model, n_codes)
         # kept for checkpoint round-tripping (TurnARActionClassifier.save_pretrained)
         self._init_kwargs = dict(d_model=d_model, n_layers=n_layers, n_heads=n_heads,
-                                 dim_ff=dim_ff, dropout=dropout)
+                                 dim_ff=dim_ff, dropout=dropout,
+                                 n_context_tokens=self.n_context_tokens,
+                                 use_prefix_pose=self.use_prefix_pose,
+                                 attn_mode=self.attn_mode,
+                                 direct_context=self.direct_context,
+                                 pose_scales=list(self.pose_scales))
+        self._register_load_state_dict_pre_hook(self._upgrade_start_embed, with_module=False)
+
+    @staticmethod
+    def _upgrade_start_embed(state_dict, prefix, *args, **kwargs):
+        """Checkpoints written before multi-token context stored `start_embed` as
+        `(d_model,)`; it is now `(n_context_tokens, d_model)`. Unsqueeze on load so the
+        existing run's checkpoints (and the offline tooling that reads them) keep working
+        without a migration script."""
+        key = prefix + "start_embed"
+        if key in state_dict and state_dict[key].dim() == 1:
+            state_dict[key] = state_dict[key].unsqueeze(0)
 
     def to_config(self) -> Dict:
         return dict(self._init_kwargs)
@@ -228,29 +457,117 @@ class CausalActionDecoder(nn.Module):
     def _tick_embeds(self, device) -> torch.Tensor:
         return self.tick_embed(torch.arange(self.n_ticks, device=device))  # (T, d_model)
 
-    def forward(self, context: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def _attn_mask(self, device, dtype) -> Tuple[torch.Tensor, bool]:
+        """Returns (additive float mask over C+T positions, is_causal_hint).
+
+        `causal`  the original lower-triangular mask. Tick t sees every context slot and
+                  every earlier tick.
+
+        `markov`  tick t sees every context slot and ITSELF, and no other tick. Only a
+                  sensible TRAINING config together with `use_prefix_pose`, because that is
+                  what makes each tick's own input a sufficient state (accumulated pose +
+                  previous differential + tick index): with the state supplied, the token
+                  history is redundant, and
+                  masking it turns the decoder into a state-conditioned policy unrolled
+                  over ticks rather than a sequence model over codes. That makes
+                  history-based heuristics structurally impossible instead of merely
+                  unattractive, so it is a direct test of whether the context carries the
+                  chunk's global shape. Context slots stay mutually visible -- they are
+                  carriers, and letting them mix costs nothing.
+
+                  The CONSTRUCTOR deliberately permits `markov` without `use_prefix_pose`:
+                  that combination is the ablation which isolates the attention path (with
+                  the state channel off, severing attention must sever ALL cross-tick
+                  information), and `tests/test_ar_head_variants.py` relies on it. The
+                  guard that matters is in `train_ar_action_sft.py`, which refuses to
+                  LAUNCH A RUN in that configuration.
+
+        NOTE: `is_causal=True` is only a HINT to the fast path and permits it to apply pure
+        causal masking, which would silently discard a custom mask. It is therefore
+        returned as False for any non-triangular mode.
+        """
+        C, T = self.n_context_tokens, self.n_ticks
+        L = C + T
+        if self.attn_mode == "causal":
+            return nn.Transformer.generate_square_subsequent_mask(L, device=device,
+                                                                  dtype=dtype), True
+        allow = torch.zeros(L, L, dtype=torch.bool, device=device)
+        allow[:, :C] = True                       # everyone may read every context slot
+        idx = torch.arange(C, L, device=device)
+        allow[idx, idx] = True                    # each tick may read itself
+        allow[:C, :C] = True                      # context slots see each other
+        mask = torch.zeros(L, L, dtype=dtype, device=device)
+        return mask.masked_fill(~allow, float("-inf")), False
+
+    def _prefix_state(self, labels: torch.Tensor, centroids: torch.Tensor) -> torch.Tensor:
+        """Pose/velocity features describing the state BEFORE each tick. (N, T, 7).
+
+        Position `t` gets the pose accumulated over ticks `< t` and the differential of
+        tick `t-1`; both are zero at `t == 0` -- see the module docstring's "KNOWN GAP"
+        section, because that zero is a claim the robot is at rest and it is false under a
+        receding horizon. This adds NO information -- it is a
+        deterministic function of the same prefix the model already conditions on -- it
+        only removes a computation the architecture is bad at: composing SE(2) is a
+        nonlinear recurrence (products of rotation matrices), not the weighted sum
+        attention natively computes.
+
+        Placeholder safety, the same invariant `decode` relies on for tokens: during
+        sequential decode positions `>= t` are zero-filled, so `poses[:, >= t]` is
+        garbage -- but position `t`'s features depend only on `labels[:, :t]`, which are
+        decided. Garbage at later positions is never read for the logits actually used.
+        """
+        N, T = labels.shape
+        diffs = centroids.to(labels.device).index_select(0, labels.reshape(-1))
+        diffs = diffs.reshape(N, T, 3).float()
+        poses = compose_chunk(diffs.double()).float()            # pose AFTER each tick
+        z = poses.new_zeros(N, 1, 3)
+        p_prev = torch.cat([z, poses[:, :-1, :]], dim=1)         # pose BEFORE tick t
+        d_prev = torch.cat([z, diffs[:, :-1, :]], dim=1)         # differential of tick t-1
+        s_pose, s_diff, s_th = self.pose_scales
+        return torch.stack([
+            p_prev[..., 0] / s_pose, p_prev[..., 1] / s_pose,
+            torch.cos(p_prev[..., 2]), torch.sin(p_prev[..., 2]),
+            d_prev[..., 0] / s_diff, d_prev[..., 1] / s_diff, d_prev[..., 2] / s_th,
+        ], dim=-1)
+
+    def forward(self, context: torch.Tensor, labels: torch.Tensor,
+                centroids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Teacher-forced. `context`: (N, context_dim) float. `labels`: (N, T) long, the
-        TRUE code at every tick. Returns (N, T, n_codes) logits, position t predicting
+        TRUE code at every tick. `centroids`: (K, 3), required only when the decoder was
+        built with `use_prefix_pose` (it turns codes into the differentials the pose
+        features are composed from). Returns (N, T, n_codes) logits, position t predicting
         `labels[:, t]`."""
         N, T = labels.shape
         device = context.device
-        ctx_tok = (self.context_proj(context) + self.start_embed).unsqueeze(1)  # (N,1,d)
+        C = self.n_context_tokens
+        proj = context if self.direct_context else self.context_proj(context)
+        ctx_tok = proj.view(N, C, self.d_model) + self.start_embed
 
         bos = torch.full((N, 1), self.BOS, dtype=torch.long, device=device)
         prev = torch.cat([bos, labels[:, :-1]], dim=1)               # (N, T)
         tok_e = self.token_embed(prev)                               # (N, T, d)
         slot_e = self._tick_embeds(device).unsqueeze(0)               # (1, T, d)
-        x = torch.cat([ctx_tok, tok_e + slot_e], dim=1)               # (N, T+1, d)
+        tick_x = tok_e + slot_e
+        if self.use_prefix_pose:
+            if centroids is None:
+                raise ValueError(
+                    "use_prefix_pose=True requires `centroids`; pass the codec's centroid "
+                    "table (ARActionCodec does this for you)"
+                )
+            tick_x = tick_x + self.pose_proj(
+                self._prefix_state(labels, centroids).to(tick_x.dtype)
+            )
+        x = torch.cat([ctx_tok, tick_x], dim=1)                       # (N, C+T, d)
 
-        mask = nn.Transformer.generate_square_subsequent_mask(T + 1, device=device,
-                                                               dtype=x.dtype)
-        h = self.blocks(x, mask=mask, is_causal=True)
-        return self.out_proj(self.ln_f(h[:, 1:, :]))                  # (N, T, n_codes)
+        mask, is_causal = self._attn_mask(device, x.dtype)
+        h = self.blocks(x, mask=mask, is_causal=is_causal)
+        return self.out_proj(self.ln_f(h[:, C:, :]))                  # (N, T, n_codes)
 
     @torch.no_grad()
     def decode(self, context: torch.Tensor, mode: str = "sample",
               generator: Optional[torch.Generator] = None,
-              temperature: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
+              temperature: float = 1.0,
+              centroids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sequential decode, T forward passes. Correct WITHOUT a KV cache: at step `t`
         the input tensor is `labels` with positions `>= t` still zero-filled placeholders,
         but the causal mask means position `t`'s output depends only on positions `<= t`
@@ -260,6 +577,12 @@ class CausalActionDecoder(nn.Module):
         caching -- exactly the "genuinely tiny" brief this component is held to; a real
         deployment-scale version would want a cache, this prototype does not need one to
         be correct or fast enough to evaluate.
+
+        The same placeholder argument covers the pose/velocity channel when
+        `use_prefix_pose` is on: position `t`'s features are composed from `labels[:, :t]`
+        only, so they are correct at the step they are read, and the garbage composed at
+        later positions is discarded by the mask. `test_ar_head_variants.py` asserts this
+        rather than leaving it to the argument.
         """
         if mode not in ("argmax", "sample", "mean"):
             raise ValueError(f"decode mode must be argmax/sample/mean, got {mode!r}")
@@ -268,7 +591,7 @@ class CausalActionDecoder(nn.Module):
         labels = torch.zeros(N, T, dtype=torch.long, device=device)
         logits_all = torch.zeros(N, T, self.n_codes, device=device, dtype=torch.float32)
         for t in range(T):
-            logits = self.forward(context, labels)          # (N, T, n_codes)
+            logits = self.forward(context, labels, centroids=centroids)   # (N,T,n_codes)
             lt = logits[:, t, :]
             logits_all[:, t, :] = lt
             if mode == "argmax":
@@ -338,15 +661,16 @@ class ARActionCodec(nn.Module):
             raise ValueError(f"decode must be one of {self.DECODES}, got {self.decode!r}")
         if self.decode == "context":
             return context
+        cen = self.codec.centroids
         if self.decode == "mean":
-            tokens, _ = self.decoder.decode(context, mode="argmax")
-            logits = self.decoder.forward(context, tokens)
+            tokens, _ = self.decoder.decode(context, mode="argmax", centroids=cen)
+            logits = self.decoder.forward(context, tokens, centroids=cen)
             probs = logits.float().softmax(-1)
             diffs = self.codec.decode_probs(probs)
         else:
             tokens, _ = self.decoder.decode(
                 context, mode=self.decode, generator=self.generator,
-                temperature=self.temperature,
+                temperature=self.temperature, centroids=cen,
             )
             diffs = self.codec.decode_labels(tokens)
         return compose_chunk(diffs)
@@ -359,6 +683,9 @@ class TurnARActionClassifier(TurnVectorRegressor):
     """`TurnVectorRegressor` whose head emits a context vector consumed by a
     `CausalActionDecoder` over per-tick VQ codes, instead of a direct regression or a
     per-(tick,dim) categorical output."""
+
+    #: swapped by `ar_action_head_v2.TurnARActionClassifierV2`; see `build`.
+    DECODER_CLS = CausalActionDecoder
 
     @classmethod
     def build(
@@ -377,8 +704,11 @@ class TurnARActionClassifier(TurnVectorRegressor):
         target_shape = (context_dim,)   # sizes the trunk head's projection only
         model = super().build(model_cfg, loss_cfg, lora, target_shape, processor, dtype)
         codec = ChunkVQCodec(n_codes=n_codes, n_dims=3)
-        decoder = CausalActionDecoder(context_dim=context_dim, n_codes=n_codes,
-                                      n_ticks=n_ticks, **(decoder_kwargs or {}))
+        # Indirection, not a behaviour change: `ar_action_head_v2` subclasses this and
+        # swaps in its own decoder by overriding DECODER_CLS, so `from_pretrained` (which
+        # routes through here) rebuilds the right one without a forked loader.
+        decoder = cls.DECODER_CLS(context_dim=context_dim, n_codes=n_codes,
+                                  n_ticks=n_ticks, **(decoder_kwargs or {}))
         model.normalizer = ARActionCodec(codec, decoder)
         model.n_ticks = int(n_ticks)
         return model
@@ -437,7 +767,8 @@ class TurnARActionClassifier(TurnVectorRegressor):
         gt_diffs = decompose_chunk(targets.double())            # (N, T, 3)
         labels = self.codec.encode_diffs(gt_diffs)               # (N, T) long
 
-        logits = self.decoder(context.float(), labels)           # (N, T, n_codes)
+        logits = self.decoder(context.float(), labels,
+                              centroids=self.codec.centroids)   # (N, T, n_codes)
         ce = F.cross_entropy(
             logits.reshape(-1, self.n_codes), labels.reshape(-1), reduction="none"
         ).view(-1, self.n_ticks)
@@ -449,6 +780,10 @@ class TurnARActionClassifier(TurnVectorRegressor):
 
         with torch.no_grad():
             metrics = self._band_metrics(logits.detach(), labels, gt_diffs)
+            if not self.training:
+                metrics.update(
+                    self._free_running_metrics(context.float(), labels, gt_diffs, targets)
+                )
             metrics["loss_sum"] = total.detach()
             metrics["n_turns"] = torch.tensor(logits.shape[0], device=logits.device)
             metrics["n_tokens"] = torch.tensor(
@@ -471,7 +806,7 @@ class TurnARActionClassifier(TurnVectorRegressor):
         pred = logits.argmax(-1)                                # (N, T) teacher-forced
         pred_diffs = self.codec.decode_labels(pred)              # (N, T, 3)
 
-        used = [0, 2]  # dx, dtheta -- forward/rotation, matching every other head's table
+        used = [0, 1, 2]  # dx, dy, dtheta -- the full table, as bin_head/flow_head report
         D = len(used)
         creep = torch.tensor([CREEP[d] for d in used], dtype=torch.float64, device=dev)
 
@@ -486,10 +821,10 @@ class TurnARActionClassifier(TurnVectorRegressor):
         stop_g, creep_g = bands(gt_sel)
         err = (pred_sel - gt_sel).reshape(-1, D)
 
-        # Joint per-tick token correctness/top-5, reported once and duplicated across both
+        # Joint per-tick token correctness/top-5, reported once and duplicated across ALL
         # "dims" for interface symmetry with the bin head's table -- there is only one
-        # categorical draw per tick, so both channels' correctness rise and fall together
-        # by construction (documented, not a bug: see the module docstring).
+        # categorical draw per tick, so every channel's correctness rises and falls
+        # together by construction (documented, not a bug: see the module docstring).
         correct = (pred == labels).double().mean() * gt_diffs.shape[0] * gt_diffs.shape[1]
         topk = (logits.topk(min(5, logits.shape[-1]), dim=-1).indices
                 == labels.unsqueeze(-1)).any(-1).double().sum()
@@ -499,12 +834,56 @@ class TurnARActionClassifier(TurnVectorRegressor):
             "sum_sq_err": err.pow(2).sum(0).float(),
             "sum_abs_err": err.abs().sum(0).float(),
             "n_rows": rows,
-            "sum_correct": torch.stack([correct, correct]).float(),
-            "sum_topk": torch.stack([topk, topk]).float(),
+            "sum_correct": correct.repeat(D).float(),
+            "sum_topk": topk.repeat(D).float(),
             "sum_stop_pred": stop_p.float(),
             "sum_stop_gt": stop_g.float(),
             "sum_creep_pred": creep_p.float(),
             "sum_creep_gt": creep_g.float(),
+        }
+
+    @torch.no_grad()
+    def _free_running_metrics(self, context, labels, gt_diffs, targets) -> Dict[str, torch.Tensor]:
+        """GREEDY FREE-RUNNING decode: the deploying path, with no true prefix anywhere.
+
+        This is the metric the teacher-forced table cannot substitute for. Zeroing the
+        context costs teacher-forced accuracy ~5pp but costs free-running accuracy ~25pp,
+        because teacher forcing lets the decoder predict tick t from the TRUE tick t-1 and
+        never have to read the scene. Only this number moves when conditioning improves,
+        so any change aimed at context reliance has to be judged here.
+
+        Eval-only: it costs T sequential decoder passes. Trivial next to the VLM backbone
+        but not free, and it is not needed every training step.
+        """
+        dev = context.device
+        tokens, _ = self.decoder.decode(context, mode="argmax",
+                                        centroids=self.codec.centroids)  # (N,T)
+        diffs = self.codec.decode_labels(tokens)                    # (N, T, 3)
+        chunk = compose_chunk(diffs)                                # (N, T, 3)
+
+        rows = torch.tensor(labels.shape[0] * labels.shape[1], device=dev)
+        correct = (tokens == labels).double().sum()
+
+        # Composed-pose error against the true chunk, in the target's own units. Composed
+        # (not per-tick) because that is what the controller actually tracks.
+        err = (chunk - targets.double()).reshape(-1, 3)
+
+        # Rotation flips: adjacent WITHIN-CHUNK tick pairs where both ticks rotate past
+        # the deadband and the commanded direction reverses. Same definition as the
+        # offline/closed-loop probes; see FLIP_DEADBAND_RADPS.
+        band = FLIP_DEADBAND_RADPS * float(getattr(self, "dt_native", DEFAULT_DT_NATIVE))
+        dth = diffs[..., 2]
+        active = dth.abs() > band
+        both = active[:, :-1] & active[:, 1:]
+        flips = ((torch.sign(dth[:, :-1]) * torch.sign(dth[:, 1:])) < 0) & both
+
+        return {
+            "sum_free_correct": correct.repeat(3).float(),
+            "sum_free_sq_err": err.pow(2).sum(0).float(),
+            "sum_free_abs_err": err.abs().sum(0).float(),
+            "n_free_rows": rows,
+            "sum_free_flips": flips.double().sum().float(),
+            "n_free_flip_pairs": both.double().sum().float(),
         }
 
     # -- checkpointing: add the decoder's architecture + n_ticks/n_codes/context_dim ----
@@ -549,10 +928,13 @@ class TurnARActionClassifier(TurnVectorRegressor):
 
 
 # ======================================================================================
-# Trainer: same band-statistic bookkeeping pattern as BinSFTTrainer, D=2 (dx, dtheta)
+# Trainer: same band-statistic bookkeeping pattern as BinSFTTrainer, D=3 (dx, dy, dtheta)
 # ======================================================================================
 AR_METRIC_KEYS = ("sum_correct", "sum_stop_pred", "sum_stop_gt", "sum_creep_pred",
-                  "sum_creep_gt", "sum_topk")
+                  "sum_creep_gt", "sum_topk",
+                  # free-running (eval only; absent from training-step outputs)
+                  "sum_free_correct", "sum_free_sq_err", "sum_free_abs_err",
+                  "n_free_rows", "sum_free_flips", "n_free_flip_pairs")
 
 
 class ARActionSFTTrainer(TurnVectorSFTTrainer):
@@ -576,7 +958,7 @@ class ARActionSFTTrainer(TurnVectorSFTTrainer):
         if not out or "n_rows" not in sums:
             return out
         rows = float(sums["n_rows"].clamp(min=1))
-        names = ("dx", "dtheta")
+        names = DIM_NAMES
         for key, label in (("sum_correct", "acc"), ("sum_topk", "top5"),
                            ("sum_stop_pred", "stop_pred"), ("sum_stop_gt", "stop_gt"),
                            ("sum_creep_pred", "creep_pred"), ("sum_creep_gt", "creep_gt")):
@@ -588,4 +970,21 @@ class ARActionSFTTrainer(TurnVectorSFTTrainer):
             out[f"{prefix}stop_ratio_dx"] = float(
                 sums["sum_stop_pred"][0] / sums["sum_stop_gt"][0]
             )
+
+        # -- free-running (eval only) ---------------------------------------------------
+        # Deliberately NOT folded into the loop above: these divide by their own row
+        # counter, and the flip rate divides by active PAIRS rather than rows.
+        if "n_free_rows" in sums:
+            frows = float(sums["n_free_rows"].clamp(min=1))
+            for name, v in zip(names, sums["sum_free_correct"].tolist()):
+                out[f"{prefix}free_acc_{name}"] = v / frows
+            rmse = (sums["sum_free_sq_err"] / frows).sqrt()
+            mae = sums["sum_free_abs_err"] / frows
+            for name, r, m in zip(names, rmse.tolist(), mae.tolist()):
+                out[f"{prefix}free_rmse_{name}"] = r
+                out[f"{prefix}free_mae_{name}"] = m
+            out[f"{prefix}free_rmse_mean"] = float(rmse.mean())
+            pairs = float(sums["n_free_flip_pairs"])
+            if pairs > 0:
+                out[f"{prefix}free_rotation_flip"] = float(sums["sum_free_flips"]) / pairs
         return out
