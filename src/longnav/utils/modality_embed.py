@@ -449,7 +449,8 @@ class FourierSE2Encoder(ModalityEncoder):
     def __init__(self, n_features: int, d_model: int, n_freqs: int = 8,
                  min_period: float = 0.25, max_period: float = 64.0,
                  pos_scale: float = 1.0, hidden_dims: Sequence[int] = (256, 256),
-                 dropout: float = 0.0, zero_init: bool = True):
+                 dropout: float = 0.0, zero_init: bool = True,
+                 max_norm: Optional[float] = None):
         super().__init__(n_features, d_model)
         if self.n_features != 3:
             raise ValueError(
@@ -493,6 +494,33 @@ class FourierSE2Encoder(ModalityEncoder):
         layers.append(_zero_init(out) if zero_init else out)
         self.net = nn.Sequential(*layers)
 
+        # `max_norm` soft-caps the norm of the *emitted* vector. The LayerNorm above does
+        # NOT do this -- it bounds the output projection's input, while the output norm
+        # grows with that projection's weights, which is exactly what happened: measured on
+        # run_v5_ar_pose, `net.5.weight` went 0 -> 0.798 and the injected vector reached
+        # norm ~7.05 against a sequence-embedding median of 0.36 and p95 of 1.43, roughly
+        # 20x an ordinary token and still climbing.
+        #
+        # That is not cosmetic. Grad-norm across runs (wandb, train/grad_norm):
+        #     v2 no pose   late median  1.77   p90  2.48   max    4.6
+        #     v3 no pose   late median  1.88   p90  2.64   max    9.4
+        #     v5 pose      late median 10.69   p90 31.91   max  394.1  (start spike 57112)
+        # Same architecture, same sequence lengths, same loss normalisation in all three.
+        # With `max_grad_norm=1.0` clipping globally, v5 trained at roughly 1/5.7 the
+        # effective step size of its own control for its whole run -- a confound in the
+        # v3-vs-v5 comparison with nothing to do with whether pose is useful.
+        #
+        # The cap is a smooth radial squash, `x -> x * max_norm * tanh(|x|/max_norm)/|x|`:
+        # the identity for small norms, saturating at `max_norm`, differentiable
+        # everywhere, and still exactly zero at zero -- so the zero-init property above is
+        # untouched.
+        #
+        # Default None (off) so every checkpoint written before 2026-08-04 reloads with the
+        # behaviour it trained under. Set it explicitly in the spec to enable.
+        if max_norm is not None and float(max_norm) <= 0:
+            raise ValueError(f"max_norm must be > 0 or None, got {max_norm}")
+        self.max_norm = None if max_norm is None else float(max_norm)
+
     def features(self, values: torch.Tensor) -> torch.Tensor:
         """`(N, 3) -> (N, feature_dim)`. Split out so a probe can look at the basis."""
         xy = values[:, :2] / self.pos_scale
@@ -507,7 +535,156 @@ class FourierSE2Encoder(ModalityEncoder):
         # to the embedding dtype at the end. That matters here more than for the other
         # encoders: bf16 has 8 mantissa bits, so positions a few centimetres apart collapse
         # onto one representation, and `sin(2*pi*x/0.25)` on a bf16 `x` is noise.
-        return self.net(self.features(values))
+        out = self.net(self.features(values))
+        if self.max_norm is not None:
+            norm = out.norm(dim=-1, keepdim=True)
+            # tanh(u)/u -> 1 as u -> 0, so the eps only guards the 0/0 at exact zero and
+            # never shifts the small-norm regime, where this must stay the identity.
+            out = out * torch.tanh(norm / self.max_norm) * self.max_norm / (norm + 1e-12)
+        return out
+
+
+@register_encoder("planar_se2")
+class PlanarSE2Encoder(ModalityEncoder):
+    """A planar pose `(x, y, theta)` -> one `d_model` vector. The plain one.
+
+    `FourierSE2Encoder` is kept and unchanged; this exists because an audit of it,
+    plus a survey of what published navigation policies actually do, said its two
+    elaborations were the problem rather than the point. Every departure below is
+    a measurement, not a preference.
+
+    **Position is fed raw, not Fourier-expanded.** Every navigation system checked
+    -- habitat-lab's PointNav/ObjectNav DD-PPO GPS+Compass, PIRLNav, VLN-DUET's
+    node distances, ACT, pi0, diffusion_policy -- feeds position through a plain
+    linear layer. None expands it. Measured reason to follow them here: this
+    corpus's modal inter-observation step is **0.4004 m**, which is 1.6 periods of
+    `FourierSE2Encoder`'s shortest (0.25 m) basis and past Nyquist for two more.
+    39.6% of consecutive observations alias. The consequence was measurable --
+    beyond ~1 m from the window origin, a 1 m move left the embedding *no less
+    similar* than a random unrelated pose at the same radius, and the varying part
+    of the output had an effective rank of 2.02 out of 2048.
+
+    **The inputs are scale-balanced, which is the defect that mattered most.**
+    Heading is intrinsically bounded: `(cos, sin)` have std ~0.71. Raw `x`/`y`
+    have std ~3.0 m and reach 13.7 m. Concatenating them puts a 2-channel bounded
+    code next to a 2-channel unbounded one, and the unbounded one wins: in the
+    trained `FourierSE2Encoder`, reversing the agent's heading by 180 deg moved
+    the injected vector **3.6x less than sliding it 10 cm** (|delta| 1.81 vs 6.48),
+    and heading accounted for ~1% of the output's varying energy. `pos_scale`
+    defaults to 4.0 because that puts `x/pos_scale` at std 0.77, alongside
+    heading's 0.71. It is a **buffer**, so training and rollout cannot disagree
+    about what a metre means -- the `ACTION_SCALES` pattern used elsewhere here.
+
+    Note this is a different quantity from `FourierSE2Encoder.pos_scale`, which
+    divides the position *before* the frequencies and therefore rescales the
+    periods rather than balancing the channels -- it could not have fixed this.
+
+    **The output norm is set, not hoped for.** The old encoder's `LayerNorm`
+    before a zero-init projection was documented as keeping the injected vector
+    from drowning out the text. It cannot: it is upstream of an unbounded
+    projection, so it pins the *direction* while leaving the norm free. Measured
+    outcome: the injected vector reached a median norm of **16.5** against a
+    median of **0.362** for the tokens actually present in a real sequence -- 45x,
+    still growing, with `grad_norm` median 10.7 against a comparable run's 1.9.
+    (Measure the tokens a sequence *contains*, not the vocabulary: all 151,936
+    rows of Qwen3-VL-2B's table have median norm 1.486, because rare tokens carry
+    large embeddings. The 4x gap between those two numbers is why `out_norm`
+    should be set from a real batch.) Here the output is normalised and
+    scaled to `out_norm`, a buffer, so the injected vector sits where token
+    embeddings sit by construction and cannot drift. Constant norm is not a lost
+    channel worth mourning: a 3-d input needs 3 of 2048 directions, and the
+    alternative was an 11x mismatch.
+
+    **`out_gain` starts at zero and the gradient still flows**, which is the
+    property `zero_init` was reaching for and -- combined with `max_norm` --
+    catastrophically failed to deliver. The failure: `zero_init` makes the output
+    exactly 0, the `max_norm` squash multiplies by `tanh(0)*m/(0+1e-12) == 0`,
+    backward carries the same factor, and the encoder is frozen at init forever
+    (observed: `run_v6_regress_pose` weights bit-identical at steps 200/2000/3600).
+    Here the scalar gain multiplies a normalised vector whose pre-activation is a
+    *randomly* initialised projection, so nothing is 0/0: the gain's own gradient
+    is nonzero on the first backward and the trunk's follows once it leaves zero.
+    Measured: the trunk is gated for exactly one step, not forever.
+
+    `gain_init` is a float rather than a switch. 0.0 keeps the step-0 guarantee
+    that the output cannot depend on the injected value. A small positive value
+    (0.1, say) trades that for a marker slot that holds a normal-magnitude token
+    from the start -- worth considering, because a zero vector is itself an input
+    the backbone has never seen, and the normalisation already removes the
+    blow-up risk that motivated zero-init in the first place.
+
+    Heading harmonics are available (`n_heading_harmonics`) but default to 1,
+    because k=1 is what every surveyed system uses and because the audit showed
+    the deficit was scale, not bandwidth -- `(cos, sin)` is already a lossless
+    code for an angle. Harmonics alias (`cos 2theta` cannot separate `theta` from
+    `theta + pi`), so k=1 is always included as the disambiguator.
+    """
+
+    def __init__(self, n_features: int, d_model: int, pos_scale: float = 4.0,
+                 hidden_dims: Sequence[int] = (256, 256), dropout: float = 0.0,
+                 out_norm: float = 1.0, gain_init: float = 0.0,
+                 n_heading_harmonics: int = 1, use_radius: bool = False):
+        super().__init__(n_features, d_model)
+        if self.n_features != 3:
+            raise ValueError(
+                f"PlanarSE2Encoder is a planar pose encoder: n_features must be 3 "
+                f"(x, y, theta), got {self.n_features}"
+            )
+        if float(pos_scale) <= 0:
+            raise ValueError(f"pos_scale must be > 0, got {pos_scale}")
+        if float(out_norm) <= 0:
+            raise ValueError(f"out_norm must be > 0, got {out_norm}")
+        if int(n_heading_harmonics) < 1:
+            raise ValueError(
+                f"n_heading_harmonics must be >= 1: k=1 is the only harmonic that "
+                f"separates theta from theta+pi, so it is never optional. Got "
+                f"{n_heading_harmonics}"
+            )
+        self.n_heading_harmonics = int(n_heading_harmonics)
+        self.use_radius = bool(use_radius)
+        # Buffers, not constructor arguments re-supplied at eval: they define what a
+        # metre means to this encoder and what scale its output sits at, so they
+        # travel with the checkpoint and training/rollout cannot disagree.
+        self.register_buffer("pos_scale", torch.tensor(float(pos_scale)))
+        self.register_buffer("out_norm", torch.tensor(float(out_norm)))
+        self.register_buffer(
+            "harmonics",
+            torch.arange(1, self.n_heading_harmonics + 1, dtype=torch.float32),
+            persistent=False,
+        )
+
+        self.feature_dim = 2 + 2 * self.n_heading_harmonics + int(self.use_radius)
+        dims = [self.feature_dim, *[int(h) for h in hidden_dims]]
+        layers: List[nn.Module] = []
+        for a, b in zip(dims[:-1], dims[1:]):
+            layers += [nn.Linear(a, b), nn.GELU()]
+            if dropout:
+                layers.append(nn.Dropout(dropout))
+        # No LayerNorm here: it would pin the direction and leave the norm to the
+        # projection, which is exactly the arrangement that let the norm reach 11x
+        # a token embedding. The norm is controlled at the output instead.
+        layers.append(nn.Linear(dims[-1], d_model))
+        self.net = nn.Sequential(*layers)
+        self.out_gain = nn.Parameter(torch.full((1,), float(gain_init)))
+
+    def features(self, values: torch.Tensor) -> torch.Tensor:
+        """`(N, 3) -> (N, feature_dim)`. Split out so a probe can look at the basis."""
+        xy = values[:, :2] / self.pos_scale
+        theta = values[:, 2:3]
+        angles = theta * self.harmonics                       # (N, K)
+        parts = [xy, torch.cos(angles), torch.sin(angles)]
+        if self.use_radius:
+            parts.append(xy.norm(dim=1, keepdim=True))
+        return torch.cat(parts, dim=1)
+
+    def encode(self, values: torch.Tensor) -> torch.Tensor:
+        raw = self.net(self.features(values))
+        # Normalise then scale: the injected vector's norm is `|out_gain| * out_norm`
+        # exactly, whatever the projection does. `eps` guards the direction at the
+        # origin only -- unlike the `max_norm` squash it does not multiply the
+        # gradient by a factor that vanishes there.
+        unit = raw / raw.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        return self.out_gain * self.out_norm * unit
 
 
 @register_encoder("bucket")
