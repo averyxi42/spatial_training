@@ -231,7 +231,8 @@ section above.
 
 `init_modality_from` warm-starts the ENCODERS ALONE from another run's checkpoint (the
 regression head's, in practice). That is the only module whose meaning survives a change of
-head. It costs the zero-init property -- see the method's docstring.
+head. What it costs depends on the spec's `gain_init` -- see the method's docstring, which
+is worth reading before attributing a lost step-0 guarantee to the warm start.
 """
 
 from __future__ import annotations
