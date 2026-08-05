@@ -1,0 +1,130 @@
+"""
+Load a FLOW-MATCHING-head checkpoint into the existing `VectorRolloutPolicy`.
+
+The exact analogue of `bin_rollout.load_bin_policy`, and for the same reason: the closed-
+loop ObjectNav harness (`habitat_physical_nav/src/objectnav_eval/bridge.py`) drives a
+`VectorRolloutPolicy`, and a `TurnFlowActionRegressor` fits that contract already --
+`FlowActionCodec` occupies the `normalizer` slot, so `step()`'s last line,
+`self.model.normalizer.denormalize(vector)`, runs the Euler loop from t=1 to t=0 and
+`compose_chunk`s the resulting per-tick differentials into the `(T, 3)` chunk the executor
+expects. Nothing in `vector_rollout.py` is touched, and nothing on the simulator side knows
+this head exists. `FlowRolloutBackend` in that bridge is the caller; it registers as
+`flow_rollout`.
+
+Three things this loader has to get right that the bin loader does not.
+
+**DECODE. `FlowActionCodec.DECODES` is `("sample", "context")` and there is deliberately no
+`mean`.** `"sample"` is the only executable policy: `"context"` is the offline passthrough
+that lets a script save the cheap-to-decode context once per real VLM forward and try decode
+rules later on CPU, exactly the role it plays for the AR head. Averaging several ODE
+solutions is NOT a sample from the conditional -- it is the conditional mean, which is the
+creeping failure this whole line of work exists to remove. Do not add one here, and do not
+average chunks at the call site. The validation below runs BEFORE the checkpoint is touched,
+against a class constant, so a bad rule fails identically in an interpreter that cannot load
+a 2B-parameter VLM at all.
+
+**INTEGRATION STEPS ARE A CHECKPOINT FIELD, NOT A CONSTANT.** `FlowMatchingConfig.
+num_inference_steps` round-trips through `turn_vector_head_config.json`, and
+`from_pretrained` restores it onto the codec, so the default here is whatever the run
+trained under -- never a literal. `num_inference_steps=` overrides it *for a sweep*, which
+is the one knob that changes what the same weights produce without changing the weights.
+
+**SEEDING. `FlowActionCodec.generator` is the settable fallback** `generate()` consults when
+no generator is passed explicitly -- which is `denormalize`'s case, and therefore the rollout
+path. Reseed once per episode (`seed_sampling(policy, base + episode)`) for a
+reproducible-per-episode noise stream rather than one that keeps mutating across a whole
+process's worth of episodes. `FlowRolloutBackend.reset()` does exactly this.
+
+The naming trap that makes `seed_sampling` differ from the AR backend's `_reseed`, recorded
+in `TurnFlowActionRegressor.codec`'s own docstring: `TurnBinClassifier.codec` is the
+normalizer-slot object, but `TurnARActionClassifier.codec` is the VQ codebook and its
+generator lives on `.normalizer`. This head has no lookup table, so `.codec` IS the
+normalizer-slot object -- the bin head's pattern transfers directly, with
+`codec.action_scales.device` standing in for `codec.centroids.device`.
+
+Pose injection needs nothing from this module. `VectorRolloutPolicy.__init__` resolves the
+checkpoint's own `modality_specs` (by transform, not by token name) and `pose_values` routes
+the raw planar `(x, y, theta)` through `pose_frame.relative_se2_last`, which is the same
+function the training collator calls. Reimplementing the frame here -- even correctly --
+would create the second implementation that `pose_frame.py`'s docstring exists to prevent.
+A checkpoint declaring no specs loads and runs with the mechanism inert.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional, Union
+
+import torch
+
+from longnav.utils.flow_matching_head import FlowActionCodec, TurnFlowActionRegressor
+from longnav.utils.vector_rollout import RolloutConfig, VectorRolloutPolicy
+
+
+def load_flow_policy(
+    checkpoint_dir: Union[str, Path],
+    cfg: Optional[RolloutConfig] = None,
+    decode: str = "sample",
+    num_inference_steps: Optional[int] = None,
+    processor=None,
+) -> VectorRolloutPolicy:
+    """Build a `VectorRolloutPolicy` over a `TurnFlowActionRegressor` checkpoint.
+
+    Mirrors `VectorRolloutPolicy.from_checkpoint` except for the model class: loading a flow
+    checkpoint through the regression path would fail on the state dict (the readout MLP
+    emits a context vector, not 30 numbers, and the velocity field has no counterpart at
+    all), which is the loud failure to prefer over a silently reshaped context.
+
+    `decode` and `num_inference_steps` are validated first, so the error does not require a
+    loadable checkpoint. `num_inference_steps=None` keeps the checkpoint's own value --
+    `from_pretrained` restores `FlowMatchingConfig` and hands it to the codec -- so an eval
+    integrates the ODE the same way the run that produced the metrics did unless it says
+    otherwise.
+    """
+    if decode not in FlowActionCodec.DECODES:
+        raise ValueError(
+            f"decode must be one of {FlowActionCodec.DECODES}, got {decode!r}"
+            + (" -- this head has no 'mean' decode and must not get one: averaging ODE "
+               "samples reproduces the conditional mean, which is the creeping failure "
+               "the head exists to avoid" if decode == "mean" else "")
+        )
+    if num_inference_steps is not None and int(num_inference_steps) < 1:
+        raise ValueError(
+            f"num_inference_steps must be >= 1, got {num_inference_steps}"
+        )
+
+    from transformers import AutoProcessor
+
+    cfg = cfg or RolloutConfig()
+    checkpoint_dir = Path(checkpoint_dir)
+    if processor is None:
+        processor = AutoProcessor.from_pretrained(str(checkpoint_dir))
+    model = TurnFlowActionRegressor.from_pretrained(
+        checkpoint_dir, processor, dtype=cfg.dtype, device=cfg.device
+    )
+    # `.codec` is the normalizer-slot object for THIS head; see the module docstring.
+    model.codec.decode = decode
+    if num_inference_steps is not None:
+        model.codec.num_inference_steps = int(num_inference_steps)
+    return VectorRolloutPolicy(model, processor, cfg)
+
+
+def seed_sampling(policy: VectorRolloutPolicy, seed: Optional[int]) -> None:
+    """Reseed the codec's fallback noise generator, or clear it if `seed is None`.
+
+    Call once per episode with a fixed, distinct seed (a base seed plus an episode counter).
+    The generator must live on the device the context does, because that is where
+    `generate()` allocates `x_1 ~ N(0, I)`; `action_scales` is a buffer on the codec, so it
+    moved with the model and is the cheapest correct way to ask where that is.
+
+    Every ODE integration in an episode draws from this one stream, so a rollout is
+    reproducible end to end -- which is what makes two closed-loop numbers comparable at all.
+    """
+    codec = policy.model.codec
+    if seed is None:
+        codec.generator = None
+        return
+    device = codec.action_scales.device
+    gen = torch.Generator(device=device if device.type == "cuda" else "cpu")
+    gen.manual_seed(int(seed))
+    codec.generator = gen
