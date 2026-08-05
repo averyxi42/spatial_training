@@ -48,6 +48,7 @@ import torch  # noqa: E402
 from transformers import AutoProcessor, TrainingArguments  # noqa: E402
 
 import train_vector_sft as base  # noqa: E402
+from longnav.utils.model_metrics import attach_model_metrics  # noqa: E402
 from longnav.utils.bin_codec import BinCodec  # noqa: E402
 from longnav.utils.bin_head import BinSFTTrainer, TurnBinClassifier  # noqa: E402
 from longnav.utils.vector_sft import (  # noqa: E402
@@ -214,6 +215,11 @@ def main():
     trainer.optimizer = optim_cls(
         base.build_optimizer_param_groups(model, args), lr=args.lr, **optim_kwargs
     )
+
+    # Per-module grad/weight/activation metrics, on the run's existing logging path.
+    # The parameter-group check above proves each module is in the optimizer; this
+    # proves the optimizer is actually moving it.
+    attach_model_metrics(trainer, args=args, verbose=is_main)
 
     if is_main:
         print(f"Effective batch: 1 x {args.grad_accum} accum x "

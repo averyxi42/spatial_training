@@ -50,6 +50,7 @@ import numpy as np
 import torch
 from transformers import AutoProcessor, TrainingArguments
 
+from longnav.utils.model_metrics import add_model_metrics_args, attach_model_metrics
 from longnav.utils.turn_vectors import ACTION_POSTFIX, ACTION_PREFIX
 from longnav.utils.vector_sft import (
     DataConfig,
@@ -142,8 +143,13 @@ def parse_args():
     s.add_argument("--stop-threshold", type=float, default=0.5)
 
     l = p.add_argument_group("lora")
-    l.add_argument("--lora-r", type=int, default=64)
-    l.add_argument("--lora-alpha", type=int, default=128)
+    # r=128 / alpha=256 is the standard for this project. The earlier r=64 / alpha=128 was
+    # a value inherited from agent-written launch scripts, never chosen deliberately, and
+    # it under-provisioned the adapter -- VRAM comfortably allows double. Every run before
+    # `reg-v6-pose-stop-ddp4` (2026-08-04) used 64, so any comparison spanning that
+    # boundary has adapter capacity as a confound alongside whatever it meant to vary.
+    l.add_argument("--lora-r", type=int, default=128)
+    l.add_argument("--lora-alpha", type=int, default=256)
     l.add_argument("--lora-dropout", type=float, default=0.05)
     l.add_argument("--lora-target-modules",
                    default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
@@ -186,6 +192,10 @@ def parse_args():
     w.add_argument("--no-wandb", action="store_true")
     w.add_argument("--no-preflight", action="store_true",
                    help="skip the one-batch alignment check before training")
+
+    # Per-module grad/weight/activation metrics. On by default and purely observational;
+    # every head script below re-parses through this function, so they all inherit it.
+    add_model_metrics_args(p)
 
     return p.parse_args()
 
@@ -466,6 +476,10 @@ def main():
     trainer.optimizer = optim_cls(
         build_optimizer_param_groups(model, args), lr=args.lr, **optim_kwargs
     )
+    # `model/<module>/{grad_norm,weight_delta,act_norm_mean,...}` alongside the run's own
+    # metrics. The group check above proves a module is in the optimizer; this proves the
+    # optimizer is actually moving it -- which is the failure that cost run_v6 3600 steps.
+    attach_model_metrics(trainer, args=args, verbose=is_main)
 
     if is_main:
         print(f"Effective batch: 1 x {args.grad_accum} accum x "
