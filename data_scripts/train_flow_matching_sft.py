@@ -22,6 +22,28 @@ predicts and how.
 NO CODEBOOK. Unlike the AR and bin heads there is nothing to fit offline and nothing to
 gate on: the head is continuous end to end, so `--codebook` does not exist here.
 
+`--modality-specs` comes from `train_vector_sft.py`'s parser like everything else, and now
+reaches this head's `ModelConfig`, both collators and the fresh-parameter LR group; see
+`longnav/utils/flow_matching_head.py`. Inert unless passed. There is deliberately NO
+`--stop-head` here -- this head's answer to creeping is modelling the whole conditional
+distribution, and a binary readout bolted on would be the heuristic that makes the result
+uninformative.
+
+`--init-modality-from` vs `--resume-from`
+-----------------------------------------
+`--resume-from` continues a run: optimizer state, LR schedule, global step, RNG and
+dataloader position all come back. `--init-modality-from` borrows exactly ONE module's
+weights -- the modality encoders -- from another run's checkpoint, typically the regression
+head's, and leaves the readout MLP, the velocity field and the LoRA adapter fresh. That
+narrowness is the point: across heads the encoders are the only module whose meaning
+survives (a pose -> a residual on a token embedding), while the readout and the adapter were
+trained against a different objective on a different output shape.
+
+It is not free. The encoder's output layer is zero-initialised so that step 0 is invariant
+to the injected pose values, which is what makes a pose run's step 0 identical to a no-pose
+baseline's; a trained encoder gives that up in exchange for not spending the first ~1000
+steps re-learning the same map.
+
 WHAT THE LOGGED METRICS MEAN (this is the part people get wrong across heads):
 
   * there is NO teacher-forced / free-running split. This head has one generation mode, so
@@ -74,6 +96,10 @@ def build_optimizer_param_groups(model, args):
     because the grouping is specific to this head having a second fresh module.
     """
     fresh = list(model.head.parameters()) + list(model.decoder.parameters())
+    # Same reason, and the same failure mode the base function documents: a module left out
+    # of the groups is SILENTLY FROZEN, and for the modality encoders that is
+    # indistinguishable from "the injection did not help" -- the experiment's conclusion.
+    fresh += list(model.modality_embedder.parameters())
     fresh = [p for p in fresh if p.requires_grad]
     fresh_ids = {id(p) for p in fresh}
     other = [p for p in model.parameters() if p.requires_grad and id(p) not in fresh_ids]
@@ -139,6 +165,28 @@ def parse_args():
                         "v2 AR decoder calibrated). '1,1,1' disables scaling, which is the "
                         "design document's literal recipe and is expected to train badly -- "
                         "see flow_matching_head's ACTION SCALING note")
+
+    pre.add_argument("--init-modality-from", default=None,
+                     help="warm start the MODALITY ENCODERS ONLY from another run's "
+                          "checkpoint (e.g. a regression run's "
+                          "dump/pose_injection/run_v7_planar_pose/checkpoint-1400). Loads "
+                          "blob['modality']['encoders'] and NOTHING else -- not the head, "
+                          "not the normalizer (this head's velocity field lives there), not "
+                          "the LoRA adapter; those stay at fresh init. The specs must match "
+                          "the source's, and a missing, extra or shape-drifted encoder "
+                          "raises rather than being skipped. COST: the encoder's output "
+                          "layer is zero-initialised so that step 0 is invariant to the "
+                          "injected pose values, which is what makes a pose run's step 0 "
+                          "comparable with a no-pose baseline's. A trained encoder gives "
+                          "that up -- from step 0 the pose moves the loss. A deliberate "
+                          "trade of comparability for convergence speed, not a free win. "
+                          "(A spec with a nonzero `gain_init`, e.g. pose_spec_planar.json's "
+                          "1.0, has already traded it away at fresh init, so on THAT spec "
+                          "the warm start costs nothing further on this axis -- what it "
+                          "costs there is agreement with a fresh-encoder run.) "
+                          "Distinct from --resume-from (which restores a whole training "
+                          "state) and from the AR script's --init-from (which borrows every "
+                          "shared module, meaningless across heads)")
     mine, rest = pre.parse_known_args()
 
     old_argv, sys.argv = sys.argv, [sys.argv[0], *rest]
@@ -147,6 +195,7 @@ def parse_args():
     finally:
         sys.argv = old_argv
 
+    args.init_modality_from = mine.init_modality_from
     # Derived, never accepted: there is no context projection, so the readout MLP must emit
     # exactly one d_model-wide vector per prefix token.
     args.context_dim = mine.context_tokens * mine.decoder_d_model
@@ -202,6 +251,11 @@ def main():
         head_hidden_dims=base._csv(args.head_hidden_dims, int),
         head_dropout=args.head_dropout,
         freeze_vision_tower=not args.train_vision_tower,
+        # `--modality-specs` comes from `base.parse_args()` already (this script only
+        # pre-parses the head-shape flags); what was missing was putting it on the
+        # ModelConfig. Inert unless passed. There is no `--stop-head` counterpart here on
+        # purpose -- see flow_matching_head's NO STOP / DEADBAND section.
+        modality_specs=base._modality_specs(args.modality_specs),
     )
     data_cfg = DataConfig(
         target_column=args.target_column,
@@ -247,6 +301,23 @@ def main():
     if not dt_native and row0.get("native_fps"):
         dt_native = 1.0 / float(row0["native_fps"])
     model.dt_native = float(dt_native or DEFAULT_DT_NATIVE)
+
+    # The encoders only, on every rank and before the optimizer exists. Everything else --
+    # the readout MLP, the velocity field, the adapter -- stays fresh, which is what makes
+    # this a head comparison rather than a continuation of the regression run. `--resume-from`
+    # restores a whole training state and wins if both are given.
+    if args.init_modality_from and not args.resume_from:
+        loaded = model.init_modality_from(args.init_modality_from)
+        if is_main:
+            print(f"[init-modality-from] loaded encoder(s) {loaded} from "
+                  f"{args.init_modality_from}; head, velocity field and adapter are fresh")
+            print("[init-modality-from] NOTE: a trained encoder gives up the zero-init "
+                  "property -- step 0 is no longer invariant to the injected pose values, "
+                  "so this run is not step-0-comparable with a no-pose baseline")
+    elif args.init_modality_from and args.resume_from and is_main:
+        print(f"[init-modality-from] ignored: --resume-from {args.resume_from} restores the "
+              "full training state, including the encoders")
+
     if is_main:
         fm, dk = args.fm_cfg, args.decoder_kwargs
         decoder_params = sum(p.numel() for p in model.decoder.parameters())
@@ -263,9 +334,17 @@ def main():
         print("NOTE: no free_* metrics -- this head has ONE generation mode. Compare "
               "rmse_*/pose_rmse_* against the AR head's free_* family, never its "
               "teacher-forced table.")
+        if model.modality_embedder:
+            print("Modality embeddings:\n" + model.modality_embedder.describe())
 
-    train_collator = TurnVectorCollator(processor, data_cfg, train=True, seed=args.seed)
-    eval_collator = TurnVectorCollator(processor, data_cfg, train=False, seed=args.seed)
+    # The model's own spec list, not a second copy: which column feeds which marker has
+    # exactly one definition, and `build()` has already registered the marker tokens on this
+    # processor's tokenizer.
+    specs = model_cfg.modality_specs
+    train_collator = TurnVectorCollator(processor, data_cfg, train=True, seed=args.seed,
+                                        modality_specs=specs)
+    eval_collator = TurnVectorCollator(processor, data_cfg, train=False, seed=args.seed,
+                                       modality_specs=specs)
 
     if not args.no_preflight and is_main:
         model.to("cuda" if torch.cuda.is_available() else "cpu")

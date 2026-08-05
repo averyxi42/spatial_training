@@ -213,6 +213,25 @@ quantity `ActionDecoderV2` scaffolds -- including its VALIDITY BIT, without whic
 vector conflates "genuinely stationary" with "unknown", which imply opposite continuations.
 It stays off so that both heads gain or lack it together and the comparison is not broken by
 a one-sided change.
+
+--------------------------------------------------------------------------------------
+MODALITY EMBEDDING (pose injection), ported from the other two heads
+--------------------------------------------------------------------------------------
+`forward` overrides the base wholesale, so the injection wiring exists here only because it
+was mirrored: `ModalityBatch.pop_from` before the backbone call, `pending` around ONLY that
+call, and `zero_touch` added to the loss so every encoder parameter is reached even in a
+window with no markers (`ddp_find_unused_parameters=False` hangs otherwise). Inert -- no
+extra keys, no extra parameters, no change to the checkpoint -- unless `ModelConfig.
+modality_specs` declares something; `dump/flow_pose/flow_inertness_check.py` pins that
+against the pre-port commit and `tests/test_flow_pose_injection.py` is its in-tree
+companion.
+
+There is NO stop head on this head and none should be added; see the NO STOP / DEADBAND
+section above.
+
+`init_modality_from` warm-starts the ENCODERS ALONE from another run's checkpoint (the
+regression head's, in practice). That is the only module whose meaning survives a change of
+head. It costs the zero-init property -- see the method's docstring.
 """
 
 from __future__ import annotations
@@ -221,7 +240,7 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -236,10 +255,12 @@ from longnav.utils.ar_action_head import (  # constants shared with the AR head,
 )
 from longnav.utils.ar_action_head_v2 import ActionDecoderV2
 from longnav.utils.bin_codec import compose_chunk, decompose_chunk
+from longnav.utils.modality_embed import ModalityBatch
 from longnav.utils.turn_vectors import extract_turn_vectors
 from longnav.utils.vector_sft import (
     ADAPTER_SUBDIR,
     HEAD_CONFIG_FILE,
+    HEAD_WEIGHTS_FILE,
     LossConfig,
     LoraSpec,
     ModelConfig,
@@ -837,16 +858,39 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         attention_mask: Optional[torch.Tensor] = None,
         num_turns: Optional[torch.Tensor] = None,
         num_items_in_batch: Optional[Union[int, torch.Tensor]] = None,
-        **multimodal,
+        **backbone_inputs,
     ) -> Dict[str, torch.Tensor]:
-        multimodal.pop("labels", None)
-        outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            logits_to_keep=1,
-            **multimodal,
+        """The flow-matching objective, wrapped in the same modality-injection wiring
+        `TurnVectorRegressor.forward` and `TurnARActionClassifier.forward` carry.
+
+        `backbone_inputs` is whatever else the collator produced (`pixel_values`,
+        `image_grid_thw`, ...) and is forwarded to the backbone **wholesale** -- which is
+        exactly why the `modality_*` keys have to come out first and by name. The backbone
+        does not accept them, so anything left behind is a `TypeError` from deep inside the
+        model; `pop_from` owns the whole `modality_*` prefix and raises on a key it does not
+        recognise rather than letting one through.
+
+        NO STOP HEAD here, unlike the other two heads: this head's own answer to the
+        creeping failure is modelling the whole conditional distribution (see the module
+        docstring), so a second binary readout would be a heuristic bolted onto the thing
+        being tested. `self.head` therefore stays inside `extract_turn_vectors` rather than
+        being applied explicitly -- there is no second consumer of the pooled state to keep
+        in agreement with it.
+        """
+        backbone_inputs.pop("labels", None)
+        modality = ModalityBatch.pop_from(
+            backbone_inputs, known_keys=self.modality_embedder.keys
         )
+        # The context wraps only the backbone call: entering the embedding twice under one
+        # context trips the consume-once assert instead of silently reusing the values.
+        with self.modality_embedder.pending(modality):
+            outputs = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                logits_to_keep=1,
+                **backbone_inputs,
+            )
         context, spans = extract_turn_vectors(
             outputs,
             input_ids,
@@ -894,6 +938,14 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         denom = num_items_in_batch if num_items_in_batch is not None else per_turn.numel()
         denom = torch.as_tensor(denom, dtype=total.dtype, device=total.device).clamp(min=1)
         loss = total / denom
+
+        # An example with no occurrences of a modality leaves its encoder out of the
+        # backward graph, which under `ddp_find_unused_parameters=False` hangs or errors.
+        # Identically zero -- no gradient and no metric moves -- and exists only so every
+        # encoder parameter is always reached.
+        touch = self.modality_embedder.zero_touch(loss.device, loss.dtype)
+        if touch is not None:
+            loss = loss + touch
 
         with torch.no_grad():
             metrics = self._generation_metrics(context.float(), gt_diffs, targets)
@@ -981,6 +1033,62 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
             "n_flip_pairs": both.double().sum().float(),
         }
 
+    # -- warm starting the encoders, and nothing else ------------------------------------
+    def init_modality_from(self, checkpoint_dir: Union[str, Path]) -> List[str]:
+        """Initialise **only** the modality encoders from another run's checkpoint.
+
+        Narrower than `warm_start`, deliberately. `warm_start` borrows every module the
+        source checkpoint and this model share -- head, normalizer, adapter -- which across
+        HEADS is meaningless: v7's readout MLP emits 30 numbers and this one emits a
+        context vector, and its adapter was trained against a Huber objective on that
+        readout. The encoders are the one module whose meaning is head-independent: they
+        map a pose to a residual on a token embedding, and both runs use the same
+        `pose_spec_planar.json` and the same 2048-wide backbone embedding.
+
+        So this loads `blob["modality"]["encoders"]` and touches nothing else -- not the
+        head, not the normalizer (which for this head holds the velocity field), not the
+        stop head, not the LoRA adapter. Everything else stays at fresh init.
+
+        Strictness is `load_state_blob`'s, which is strict in BOTH directions: weights for
+        a spec this run does not declare, a declared spec with no weights in the blob, and
+        shape drift all raise. Nothing is skipped silently -- the failure mode this guards
+        against is a run that reports "warm started" and trains a randomly-initialised
+        encoder, which is indistinguishable from "the injection did not help".
+
+        WHAT IT COSTS. A zero-initialised encoder output makes step 0 invariant to the
+        injected values, which is what makes a pose run's step 0 identical to a no-pose
+        baseline's. A trained encoder gives that up: from step 0 the pose values move the
+        loss. That is a deliberate trade of comparability for convergence speed, not a free
+        win -- and it is one the SPEC may already have made, which is worth checking before
+        attributing it here: `PlanarSE2Encoder`'s `gain_init` defaults to 0.0 but
+        `pose_spec_planar.json` sets it to 1.0, so a fresh encoder under that spec is
+        already live at step 0. Against such a spec what the warm start actually costs is
+        agreement with a fresh-encoder run, not the zero-init guarantee.
+
+        Returns the encoder keys loaded, so the caller can print them.
+        """
+        checkpoint_dir = Path(checkpoint_dir)
+        if not self.modality_embedder:
+            raise RuntimeError(
+                f"{checkpoint_dir} was given as a modality warm start but this run declares "
+                "no modality specs; pass --modality-specs or drop the warm start"
+            )
+        blob_path = checkpoint_dir / HEAD_WEIGHTS_FILE
+        if not blob_path.exists():
+            raise FileNotFoundError(f"no {HEAD_WEIGHTS_FILE} in {checkpoint_dir}")
+        blob = torch.load(blob_path, map_location="cpu", weights_only=False)
+        modality = blob.get("modality")
+        if not modality:
+            raise RuntimeError(
+                f"{blob_path} has no modality encoder weights (keys: {sorted(blob)}); it is "
+                "not from a run with --modality-specs, so there is nothing to warm start "
+                "the encoders from"
+            )
+        # Strict in both directions and on shapes. A mismatch raises here rather than
+        # leaving a silently-fresh encoder behind.
+        self.modality_embedder.load_state_blob(modality)
+        return list(self.modality_embedder.keys)
+
     # -- checkpointing ------------------------------------------------------------------
     def save_pretrained(self, output_dir: Union[str, Path]):
         super().save_pretrained(output_dir)
@@ -1018,6 +1126,10 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
             from peft import PeftModel
 
             model.backbone = PeftModel.from_pretrained(model.backbone, str(adapter_dir))
+            # The backbone was re-wrapped; re-point the modality hooks through the new
+            # wrapper, exactly as `TurnVectorRegressor.from_pretrained` does. A no-op with
+            # no specs declared.
+            model.attach_modality_hooks()
         model.load_trainable(checkpoint_dir, adapter=False)
         if device:
             model.to(device)
