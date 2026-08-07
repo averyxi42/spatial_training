@@ -162,6 +162,12 @@ def main():
         head_hidden_dims=base._csv(args.head_hidden_dims, int),
         head_dropout=args.head_dropout,
         freeze_vision_tower=not args.train_vision_tower,
+        # `--modality-specs` already comes off `base.parse_args()` -- this script only
+        # pre-parses the flow-shape flags -- but it was never put on the ModelConfig, so
+        # the flag parsed cleanly and was then silently ignored. A pose-injection run
+        # would have trained to completion with no `<pose>` input and no error. Inert
+        # unless passed; matches train_flow_matching_sft.py.
+        modality_specs=base._modality_specs(args.modality_specs),
     )
     data_cfg = DataConfig(
         target_column=args.target_column,
@@ -225,8 +231,16 @@ def main():
               f"min NLL/dim at sigma: {model.flow.min_nll_per_dim(1.0):.3f} nats "
               f"(at step 0: {model.flow.min_nll_per_dim(args.sigma_start):.3f})")
 
-    train_collator = TurnVectorCollator(processor, data_cfg, train=True, seed=args.seed)
-    eval_collator = TurnVectorCollator(processor, data_cfg, train=False, seed=args.seed)
+    # The collator is what turns the `<pose>` column into the `modality_*` batch keys the
+    # head pops and injects; without the specs it emits the marker text and no values, and
+    # the embedder refuses ("no values were provided for them"). Taken off model_cfg rather
+    # than re-parsed so there is exactly one definition, and `build()` has already
+    # registered the marker tokens on this processor's tokenizer.
+    specs = model_cfg.modality_specs
+    train_collator = TurnVectorCollator(processor, data_cfg, train=True, seed=args.seed,
+                                        modality_specs=specs)
+    eval_collator = TurnVectorCollator(processor, data_cfg, train=False, seed=args.seed,
+                                       modality_specs=specs)
 
     if not args.no_preflight and is_main:
         model.to("cuda" if torch.cuda.is_available() else "cpu")

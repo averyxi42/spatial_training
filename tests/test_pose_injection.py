@@ -807,3 +807,197 @@ def test_no_stop_head_means_no_extra_keys_at_all():
     assert "motion_loss_sum" not in out
     assert set(out) == {"loss", "loss_sum", "sum_sq_err", "sum_abs_err", "n_rows",
                         "n_turns", "n_tokens", "n_dense_tokens", "n_steps"}
+
+
+# ==========================================================================
+# PointNav: the goal as a second `<pose>` occurrence
+# ==========================================================================
+# `<pose>` is one modality type playing the role `<image>` plays for vision -- many
+# occurrences, one value row each, bound by occurrence order. A goal pose is simply
+# another occurrence. What has to hold is that the ROW ORDER matches the TEXT ORDER, and
+# that row 0 stays an agent pose so `relative_se2`'s anchor means the same thing it means
+# in an ObjectNav row.
+import sys as _sys
+from pathlib import Path as _Path
+
+_DATA_SCRIPTS = _Path(__file__).resolve().parents[1] / "data_scripts"
+if str(_DATA_SCRIPTS) not in _sys.path:
+    _sys.path.insert(0, str(_DATA_SCRIPTS))
+
+from format_action_chunk_dataset import (  # noqa: E402
+    build_messages,
+    expected_modality_len,
+    modality_values,
+    segment_starts,
+)
+from longnav.utils.vector_rollout import (  # noqa: E402
+    POINTNAV_SYSTEM_PROMPT,
+    SYSTEM_PROMPTS,
+    RolloutConfig,
+    goal_block_content,
+    user_block_content,
+)
+from longnav.utils.vector_sft import n_markers_in_message  # noqa: E402
+
+
+def _pointnav_example(n_obs=6, segment_lengths=(3, 3)):
+    segments = []
+    for seg, length in enumerate(segment_lengths):
+        segments += [seg] * length
+    assert len(segments) == n_obs
+    return {
+        "images": [f"f{i}.jpeg" for i in range(n_obs)],
+        "obs_poses": [[float(i), 0.0, 0.0] for i in range(n_obs)],
+        "obs_goals": [[100.0 + segments[i], 0.0, 0.0] for i in range(n_obs)],
+        "segment_indices": segments,
+        "task": "pointnav",
+        "goal_text": "",
+    }
+
+
+def _render(messages):
+    """The marker literals in the order the text puts them."""
+    out = []
+    for m in messages:
+        for part in m["content"]:
+            if part.get("type") == "text" and part.get("text"):
+                out += ["<pose>"] * part["text"].count("<pose>")
+    return out
+
+
+class TestSegmentStarts:
+    def test_the_first_observation_always_starts_a_segment(self):
+        assert segment_starts([0, 0, 0]) == {0}
+
+    def test_a_change_starts_one(self):
+        assert segment_starts([0, 0, 1, 1, 2]) == {0, 2, 4}
+
+    def test_an_empty_column_has_none(self):
+        assert segment_starts([]) == set()
+
+
+class TestModalityValueOrder:
+    """The row order must be the text order. Reversing a pair binds every value to the
+    wrong slot with the counts still matching and nothing raising."""
+
+    def test_segment_placement_emits_agent_then_goal_at_each_announcement(self):
+        ex = _pointnav_example()
+        values = modality_values(ex, "obs_poses", "obs_goals", "segment_indices", "segment")
+        # announcement(agent0, goal0) obs0 obs1 obs2 announcement(agent3, goal3) obs3 ...
+        assert values == [
+            ex["obs_poses"][0], ex["obs_goals"][0],
+            ex["obs_poses"][0], ex["obs_poses"][1], ex["obs_poses"][2],
+            ex["obs_poses"][3], ex["obs_goals"][3],
+            ex["obs_poses"][3], ex["obs_poses"][4], ex["obs_poses"][5],
+        ]
+
+    def test_observation_placement_pairs_every_turn(self):
+        ex = _pointnav_example()
+        values = modality_values(ex, "obs_poses", "obs_goals", "segment_indices",
+                                 "observation")
+        assert values[0::2] == ex["obs_poses"]
+        assert values[1::2] == ex["obs_goals"]
+
+    def test_row_zero_is_an_agent_pose_in_both_placements(self):
+        """Not the goal. With the goal at row 0 every PointNav row would anchor in a
+        different frame from every ObjectNav row, and nothing would detect it."""
+        ex = _pointnav_example()
+        for placement in ("segment", "observation"):
+            values = modality_values(ex, "obs_poses", "obs_goals", "segment_indices",
+                                     placement)
+            assert values[0] == ex["obs_poses"][0]
+
+    def test_relative_se2_puts_row_zero_at_the_origin(self):
+        ex = _pointnav_example()
+        values = modality_values(ex, "obs_poses", "obs_goals", "segment_indices", "segment")
+        rel = relative_se2(torch.tensor(values, dtype=torch.float64))
+        assert torch.allclose(rel[0], torch.zeros(3))
+
+    @pytest.mark.parametrize("placement", ["segment", "observation"])
+    def test_expected_length_matches_what_is_produced(self, placement):
+        ex = _pointnav_example(n_obs=6, segment_lengths=(2, 2, 2))
+        values = modality_values(ex, "obs_poses", "obs_goals", "segment_indices", placement)
+        assert len(values) == expected_modality_len(6, 3, placement)
+
+
+class TestPointNavMessages:
+    def test_the_text_carries_exactly_as_many_markers_as_there_are_rows(self):
+        """The count check in `_modality_kwargs` compares these two. If they disagree the
+        run dies on the first batch -- so it is checked here, per placement."""
+        for placement in ("segment", "observation"):
+            ex = dict(_pointnav_example())
+            build_messages(ex, "**____**", "goal_text", "images",
+                           modality_marker="<pose>", goal_marker="<pose>",
+                           goal_placement=placement)
+            values = modality_values(ex, "obs_poses", "obs_goals", "segment_indices",
+                                     placement)
+            markers = sum(n_markers_in_message(m, "<pose>") for m in ex["messages"])
+            assert markers == len(values), placement
+
+    def test_the_agent_marker_precedes_the_goal_marker_in_every_pair(self):
+        """The ordering is load-bearing and silent if reversed."""
+        cfg = RolloutConfig(modality_marker="<pose>", goal_marker="<pose>")
+        text = "".join(p.get("text") or "" for p in goal_block_content(cfg))
+        assert text.index("You are at") < text.index("Go to")
+        assert text.count("<pose>") == 2
+
+        inline = user_block_content(cfg, 0, inline_goal=True)
+        texts = [p.get("text") or "" for p in inline]
+        pose_at = next(i for i, t in enumerate(texts) if t == "<pose>")
+        goal_at = next(i for i, t in enumerate(texts) if t.startswith("Goal:"))
+        assert pose_at < goal_at, "the observation's own pose comes first"
+
+    def test_the_goal_announcement_is_its_own_user_message(self):
+        ex = dict(_pointnav_example())
+        build_messages(ex, "**____**", "goal_text", "images",
+                       modality_marker="<pose>", goal_marker="<pose>",
+                       goal_placement="segment")
+        # index 0 is the prompt, index 1 the first announcement, index 2 the first turn.
+        assert ex["messages"][1]["role"] == "user"
+        assert "Go to" in ex["messages"][1]["content"][0]["text"]
+        assert not any(p["type"] == "image" for p in ex["messages"][1]["content"])
+
+    def test_the_first_announcement_lands_in_the_prologue(self):
+        """Everything before the first image-bearing message is always kept by windowing,
+        so segment 0's goal survives a window that starts anywhere."""
+        ex = dict(_pointnav_example())
+        build_messages(ex, "**____**", "goal_text", "images",
+                       modality_marker="<pose>", goal_marker="<pose>",
+                       goal_placement="segment")
+        first_image = next(i for i, m in enumerate(ex["messages"])
+                           if any(p["type"] == "image" for p in m["content"]))
+        assert first_image == 2, "prompt, announcement, then the first observation"
+
+    def test_a_pointnav_row_gets_the_pointnav_prompt(self):
+        ex = dict(_pointnav_example())
+        build_messages(ex, "**____**", "goal_text", "images", modality_marker="<pose>",
+                       goal_marker="<pose>")
+        assert ex["messages"][0]["content"][0]["text"] == POINTNAV_SYSTEM_PROMPT
+        assert "point goal" in POINTNAV_SYSTEM_PROMPT
+        assert "{goal}" not in POINTNAV_SYSTEM_PROMPT, "a point goal is a value, not a string"
+
+    def test_an_objectnav_row_is_written_exactly_as_before(self):
+        """The regression that matters: no goal marker, no announcement, the old prompt."""
+        ex = {"images": ["a.jpeg", "b.jpeg"], "goal_text": "chair", "task": "objectnav"}
+        build_messages(ex, "**____**", "goal_text", "images", modality_marker="<pose>")
+        assert len(ex["messages"]) == 1 + 2 * 2
+        assert ex["messages"][0]["content"][0]["text"] == SYSTEM_PROMPTS["objectnav"].format(
+            goal="chair")
+        assert _render(ex["messages"]) == ["<pose>"] * 2
+
+    def test_a_row_with_no_task_column_reads_as_objectnav(self):
+        """Every corpus written before the field existed has no task."""
+        ex = {"images": ["a.jpeg"], "goal_text": "sofa"}
+        build_messages(ex, "**____**", "goal_text", "images")
+        assert "goal object" in ex["messages"][0]["content"][0]["text"]
+
+
+class TestRolloutConfigDefaultsAreInert:
+    def test_no_goal_marker_renders_the_block_exactly_as_before(self):
+        cfg = RolloutConfig(modality_marker="<pose>")
+        assert cfg.goal_marker is None
+        assert user_block_content(cfg, 3) == user_block_content(cfg, 3, inline_goal=True)
+
+    def test_goal_block_refuses_without_a_marker(self):
+        with pytest.raises(ValueError, match="goal_marker"):
+            goal_block_content(RolloutConfig())

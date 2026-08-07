@@ -59,6 +59,7 @@ import torch.nn as nn
 from longnav.cnf_head.flow import ConditionalFlow, flow_nll
 from longnav.utils.bin_codec import compose_chunk, decompose_chunk
 from longnav.utils.turn_vectors import extract_turn_vectors
+from longnav.utils.modality_embed import ModalityBatch
 from longnav.utils.vector_sft import (
     LossConfig,
     LoraSpec,
@@ -285,13 +286,25 @@ class TurnFlowPolicy(TurnVectorRegressor):
         **multimodal,
     ) -> Dict[str, torch.Tensor]:
         multimodal.pop("labels", None)
-        outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            logits_to_keep=1,
-            **multimodal,
+        # Modality injection, mirroring TurnVectorRegressor / flow_matching_head. The
+        # `modality_*` keys must come OUT of `multimodal` by name before the backbone sees
+        # it -- the backbone does not accept them -- and `pending` wraps ONLY the backbone
+        # call so entering the embedding twice trips the consume-once assert instead of
+        # silently reusing values. Without this the pre-hook raises "marker token(s)
+        # ['pose'] are in the sequence but no modality values are pending", which is what
+        # v12 hit on its first step: `modality_specs` on the ModelConfig makes the model
+        # expect pose and the collator emit the marker, but nothing fed it.
+        modality = ModalityBatch.pop_from(
+            multimodal, known_keys=self.modality_embedder.keys
         )
+        with self.modality_embedder.pending(modality):
+            outputs = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                logits_to_keep=1,
+                **multimodal,
+            )
         vectors, spans = extract_turn_vectors(
             outputs,
             input_ids,
@@ -330,6 +343,14 @@ class TurnFlowPolicy(TurnVectorRegressor):
         denom = num_items_in_batch if num_items_in_batch is not None else per_turn.numel()
         denom = torch.as_tensor(denom, dtype=total.dtype, device=total.device).clamp(min=1)
         loss = total / denom
+
+        # An example with no occurrences of a modality leaves its encoder out of the
+        # backward graph, which under `ddp_find_unused_parameters=False` hangs or errors.
+        # Identically zero -- no gradient, no metric moves -- and exists only so every
+        # encoder parameter is always reached.
+        touch = self.modality_embedder.zero_touch(loss.device, loss.dtype)
+        if touch is not None:
+            loss = loss + touch
 
         with torch.no_grad():
             metrics = self._flow_metrics(ctx_raw.detach(), gt_diffs)

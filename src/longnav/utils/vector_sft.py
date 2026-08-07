@@ -109,6 +109,33 @@ from longnav.utils.turn_vectors import (
     resolve_affix_ids,
 )
 
+def _shim_peft_tp_import() -> None:
+    """Let ``set_peft_model_state_dict`` import under transformers 4.57.
+
+    peft 0.19 calls ``_maybe_shard_state_dict_for_tp`` whenever
+    ``torch.distributed.is_initialized()`` -- true for ordinary DDP, not just
+    tensor parallelism -- and that function begins by importing
+    ``EmbeddingParallel`` from ``transformers.integrations.tensor_parallel``.
+    transformers 4.57.6 does not export that name, so **resuming from a
+    checkpoint dies on an ImportError while fresh training never touches the
+    path**. That asymmetry is why it survived until the first resume, on
+    2026-08-07, and cost two runs a restart.
+
+    The function is provably inert here: it skips every layer whose base layer
+    lacks ``_hf_tp_plan``/``_hf_device_mesh``, and nothing in this codebase sets
+    those. The missing symbol therefore only has to exist, never work.
+    Injecting a placeholder is narrower than pinning either package, and it
+    stops mattering the day transformers reintroduces the name.
+    """
+    try:
+        import transformers.integrations.tensor_parallel as _tp
+    except Exception:  # no TP module at all; peft's own import would fail too
+        return
+    for _name in ("EmbeddingParallel",):
+        if not hasattr(_tp, _name):
+            setattr(_tp, _name, type(_name, (), {}))
+
+
 HEAD_WEIGHTS_FILE = "turn_vector_head.pt"
 HEAD_CONFIG_FILE = "turn_vector_head_config.json"
 ADAPTER_SUBDIR = "adapter"
@@ -991,6 +1018,7 @@ class TurnVectorRegressor(nn.Module):
                 "backbone would silently stay at its pretrained values"
             )
         state = load_file(adapter_dir / "adapter_model.safetensors")
+        _shim_peft_tp_import()
         result = set_peft_model_state_dict(self.backbone, state)
         unexpected = getattr(result, "unexpected_keys", [])
         if unexpected:

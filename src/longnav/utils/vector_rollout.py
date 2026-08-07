@@ -77,6 +77,26 @@ DEFAULT_SYSTEM_PROMPT = (
     "trajectory of poses to follow, relative to your current pose."
 )
 
+# The PointNav counterpart. Chosen per row from the corpus's own `task` column rather
+# than by a flag, so a table can never end up describing one task with the other's
+# prompt. `{goal}` is deliberately absent: a point goal is a *value* injected at a
+# `<pose>` marker, not a string to interpolate.
+POINTNAV_SYSTEM_PROMPT = (
+    "You are a robot navigating an indoor environment toward a point goal.\n"
+    "You are given your own pose and the goal's pose in the same frame, and are told a "
+    "new goal whenever you reach the last one.\n"
+    "At each step you receive the current RGB observation. Produce the next short "
+    "trajectory of poses to follow, relative to your current pose."
+)
+
+#: Prompt per task, keyed by what the corpus stamps in
+#: `recording_metadata.RecordingParams.task_name`. Unknown task -> the ObjectNav prompt,
+#: which is what every corpus written before the field existed is.
+SYSTEM_PROMPTS = {
+    "objectnav": DEFAULT_SYSTEM_PROMPT,
+    "pointnav": POINTNAV_SYSTEM_PROMPT,
+}
+
 
 @dataclass
 class RolloutConfig:
@@ -106,6 +126,21 @@ class RolloutConfig:
     # writers build the *same message structure* and the chat template cannot join them
     # differently.
     modality_marker: Optional[str] = None
+    # PointNav's goal marker. Normally the SAME literal as `modality_marker` -- `<pose>`
+    # is one modality type playing the role `<image>` plays for vision, and a goal pose is
+    # simply another occurrence of it, bound by occurrence order like every other. It is a
+    # separate *field* even so, because what is being switched on is the presence of a
+    # SECOND occurrence per turn (or per segment), and a caller should have to say so.
+    # None -> no goal marker anywhere, which is exactly what every run before this did.
+    goal_marker: Optional[str] = None
+    # The per-segment announcement, when a goal is introduced. Carries the agent's own
+    # pose as well as the goal's, and that is load-bearing rather than decorative: it puts
+    # an AGENT pose at row 0 of the value column, so `relative_se2`'s anchor means the same
+    # thing here as in an ObjectNav row. With `Go to {marker}.` alone, row 0 would be the
+    # goal and the two tasks would sit in different frames with nothing to detect it.
+    goal_announce_text: str = "You are at {marker}. Go to {marker}."
+    # The alternative placement: the goal repeated inside every observation block.
+    goal_inline_text: str = "Goal: {marker}"
     use_sparse: bool = True
     merge_lora: bool = True  # fold adapters into the base weights for inference speed
     device: str = "cuda"
@@ -123,13 +158,18 @@ def render_prologue(processor, system_prompt: str) -> str:
     )
 
 
-def user_block_content(cfg: RolloutConfig, step: int) -> List[Dict[str, Any]]:
+def user_block_content(cfg: RolloutConfig, step: int,
+                       inline_goal: bool = False) -> List[Dict[str, Any]]:
     """The content parts of one turn's user message.
 
     The single definition of a user turn's shape. `format_action_chunk_dataset.py` builds
     the training conversations from this same function, so the marker cannot be present in
     one path and absent (or differently placed) in the other -- a divergence that produces
     a rollout context the head was never trained under and no error anywhere.
+
+    `inline_goal` is PointNav's `observation` goal placement: a second marker in every
+    turn, carrying the current goal. Default off, so every existing caller renders the
+    block character-for-character as before.
     """
     parts: List[Dict[str, Any]] = [
         {"type": "text", "text": cfg.user_text_before.format(step=step)},
@@ -140,8 +180,35 @@ def user_block_content(cfg: RolloutConfig, step: int) -> List[Dict[str, Any]]:
         # `get_rope_index` reads that one position to decide image-vs-video, and a marker
         # there makes every downstream position silently wrong.
         parts.append({"type": "text", "text": cfg.modality_marker})
+    if inline_goal and cfg.goal_marker:
+        # The `observation` goal placement. AFTER the observation's own marker, always:
+        # the binding is occurrence order, so this ordering is what decides whether row
+        # 2k is the agent's pose or the goal's. Reversing it binds every value to the
+        # wrong slot with the counts still matching and nothing raising.
+        parts.append({"type": "text", "text": cfg.goal_inline_text.format(
+            marker=cfg.goal_marker)})
     parts.append({"type": "text", "text": cfg.user_text_after})
     return parts
+
+
+def goal_block_content(cfg: RolloutConfig) -> List[Dict[str, Any]]:
+    """The content parts of a goal-announcement user message (the `segment` placement).
+
+    Its own message, emitted once when a goal is introduced, so the conversation reads the
+    way the task does: a new instruction arrives only when the last one is finished.
+
+    Two markers, in this order: the agent's current pose, then the goal's. See
+    `RolloutConfig.goal_announce_text` for why the agent's is there at all.
+    """
+    if not cfg.goal_marker:
+        raise ValueError("goal_block_content needs RolloutConfig.goal_marker")
+    return [{"type": "text", "text": cfg.goal_announce_text.format(marker=cfg.goal_marker)}]
+
+
+def render_goal_block(processor, cfg: RolloutConfig) -> str:
+    """One goal announcement, as text. The rollout's counterpart to `render_user_block`."""
+    user = {"role": "user", "content": goal_block_content(cfg)}
+    return processor.apply_chat_template([user], tokenize=False, add_generation_prompt=False)
 
 
 def render_user_block(processor, cfg: RolloutConfig, step: int) -> str:

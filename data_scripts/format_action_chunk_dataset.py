@@ -42,11 +42,69 @@ from datasets import DatasetDict, load_from_disk
 # string, and a silent divergence between the two would change the head's input
 # distribution at deployment without any error.
 from longnav.utils.vector_rollout import DEFAULT_SYSTEM_PROMPT as SYSTEM_PROMPT
-from longnav.utils.vector_rollout import RolloutConfig, user_block_content
+from longnav.utils.vector_rollout import (
+    SYSTEM_PROMPTS,
+    RolloutConfig,
+    goal_block_content,
+    user_block_content,
+)
+
+
+def segment_starts(segment_indices) -> set:
+    """Observation indices at which a new goal is introduced.
+
+    The first observation always is (index 0), and thereafter wherever the segment index
+    changes. Derived from the column rather than stored, because the column is already the
+    definition and a second representation could only disagree with it.
+    """
+    if not segment_indices:
+        return set()
+    starts = {0}
+    for i in range(1, len(segment_indices)):
+        if segment_indices[i] != segment_indices[i - 1]:
+            starts.add(i)
+    return starts
+
+
+def modality_values(example, modality_column: str, goal_values_column: str,
+                    segment_column: str, goal_placement: str):
+    """The value rows for the `<pose>` column, **in the order the markers appear in text**.
+
+    That order is the entire contract of the modality mechanism -- the k-th occurrence of
+    the marker receives the k-th row -- so this function and `build_messages` have to
+    agree exactly, and are deliberately adjacent.
+
+      * `segment`     -> at each goal announcement, `[agent pose, goal]`, then that
+                         segment's observation poses. Length `n_obs + 2 * n_segments`.
+      * `observation` -> `[agent pose, goal]` per turn. Length `2 * n_obs`.
+
+    In both, row 0 is an **agent** pose, which is what makes `relative_se2`'s anchor mean
+    the same thing here as in an ObjectNav row.
+    """
+    poses = example[modality_column]
+    goals = example[goal_values_column]
+    if goal_placement == "observation":
+        return [v for pair in zip(poses, goals) for v in pair]
+
+    starts = segment_starts(example.get(segment_column) or [])
+    values = []
+    for i, pose in enumerate(poses):
+        if i in starts:
+            values += [pose, goals[i]]
+        values.append(pose)
+    return values
+
+
+def expected_modality_len(n_obs: int, n_segments: int, goal_placement: str) -> int:
+    """How many value rows `modality_values` will produce, for the alignment filter."""
+    if goal_placement == "observation":
+        return 2 * n_obs
+    return n_obs + 2 * n_segments
 
 
 def build_messages(example, placeholder: str, goal_column: str, images_column: str,
-                   modality_marker=None):
+                   modality_marker=None, goal_marker=None, goal_placement="segment",
+                   segment_column="segment_indices", task_column="task"):
     """Write the conversation for one episode.
 
     The per-turn user block comes from `vector_rollout.user_block_content`, not from a copy
@@ -59,18 +117,36 @@ def build_messages(example, placeholder: str, goal_column: str, images_column: s
     which is what keeps the readout spans, `train_content_len` and the affix arithmetic
     exactly as they were; `tests/test_pose_injection.py` asserts that rather than assuming
     it.
+
+    PointNav adds a goal, carried by a *second occurrence of the same `<pose>` marker* --
+    one modality type, many occurrences, exactly as `<image>` works for vision. Two
+    placements:
+
+      * `segment` (default) -- its own user message wherever a new goal is introduced, so
+        the conversation reads the way the task does. Note the first announcement lands in
+        the prologue (everything before the first image-bearing message), so it survives
+        windowing; later ones do not, which is fine because windowing is an eval ablation
+        rather than the training regime.
+      * `observation` -- repeated in every turn, like a PointGoal sensor reading.
+
+    With `goal_marker=None` this writes exactly the conversation it always did.
     """
     goal = example.get(goal_column) or "the goal object"
-    cfg = RolloutConfig(modality_marker=modality_marker)
+    task = example.get(task_column) or "objectnav"
+    prompt = SYSTEM_PROMPTS.get(task, SYSTEM_PROMPT)
+    cfg = RolloutConfig(modality_marker=modality_marker, goal_marker=goal_marker)
+    inline = bool(goal_marker) and goal_placement == "observation"
+    starts = (segment_starts(example.get(segment_column) or [])
+              if goal_marker and goal_placement == "segment" else set())
+
     messages = [
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": SYSTEM_PROMPT.format(goal=goal)}],
-        }
+        {"role": "user", "content": [{"type": "text", "text": prompt.format(goal=goal)}]}
     ]
     for i in range(len(example[images_column])):
+        if i in starts:
+            messages.append({"role": "user", "content": goal_block_content(cfg)})
         messages += [
-            {"role": "user", "content": user_block_content(cfg, i)},
+            {"role": "user", "content": user_block_content(cfg, i, inline_goal=inline)},
             {"role": "assistant", "content": [{"type": "text", "text": placeholder}]},
         ]
     example["messages"] = messages
@@ -107,6 +183,24 @@ def main():
                    help="column that must be 1:1 with the observations when "
                         "--modality-marker is set (e.g. 'obs_poses'). Rows that disagree "
                         "are dropped, exactly as misaligned action chunks are")
+    p.add_argument("--goal-marker", default=None,
+                   help="PointNav's goal marker. Normally the SAME literal as "
+                        "--modality-marker: `<pose>` is one modality type and a goal pose "
+                        "is another occurrence of it, bound by occurrence order like every "
+                        "other. Omit for ObjectNav")
+    p.add_argument("--goal-values-column", default="obs_goals",
+                   help="column holding the per-observation goal poses. Distinct from "
+                        "--goal-column, which is the goal *text*")
+    p.add_argument("--goal-placement", choices=("segment", "observation"),
+                   default="segment",
+                   help="segment: its own user message wherever a new goal is introduced. "
+                        "observation: repeated in every turn, like a PointGoal sensor")
+    p.add_argument("--segment-column", default="segment_indices",
+                   help="per-observation segment index; goal announcements are derived "
+                        "from where it changes")
+    p.add_argument("--task-column", default="task",
+                   help="picks the system prompt per row, so a table cannot describe one "
+                        "task with the other's prompt")
     p.add_argument("--map-cache-dir", default=None,
                    help="write datasets' map/filter cache here instead of alongside the "
                         "input. Set it when --in-dir is a dataset something else is "
@@ -118,6 +212,9 @@ def main():
     if args.modality_column and not args.modality_marker:
         p.error("--modality-column without --modality-marker: the column would be carried "
                 "but never referenced, since nothing in the text would occur to bind it to")
+    if args.goal_marker and not args.modality_column:
+        p.error("--goal-marker needs --modality-column: the goal rows are written into "
+                "that same column, in text order, because both markers are the same token")
 
     ds = load_from_disk(os.path.expanduser(args.in_dir))
 
@@ -157,10 +254,10 @@ def main():
         print(f"  dropped {before - size(ds)} row(s) whose image and chunk counts disagreed")
 
     if args.modality_column:
-        # One marker is written per observation, and the binding is occurrence order, so a
-        # row with the wrong number of modality values would bind every later turn's value
-        # to the wrong turn. Checked here rather than at training time because here it is
-        # one dropped row instead of a crashed run.
+        # One marker per observation (plus, for PointNav, the goal ones), and the binding
+        # is occurrence order, so a row with the wrong number of modality values would bind
+        # every later turn's value to the wrong turn. Checked here rather than at training
+        # time because here it is one dropped row instead of a crashed run.
         before = size(ds)
         ds = ds.filter(
             lambda ex: len(ex[args.modality_column]) == len(ex[args.images_column]),
@@ -170,6 +267,28 @@ def main():
         if size(ds) != before:
             print(f"  dropped {before - size(ds)} row(s) whose {args.modality_column} count "
                   f"disagreed with the observation count")
+
+    if args.goal_marker:
+        before = size(ds)
+        ds = ds.filter(
+            lambda ex: len(ex[args.goal_values_column]) == len(ex[args.images_column]),
+            num_proc=args.num_proc, desc=f"{args.goal_values_column} align check",
+            **cache_kw("goal_align"),
+        )
+        if size(ds) != before:
+            print(f"  dropped {before - size(ds)} row(s) whose {args.goal_values_column} "
+                  f"count disagreed with the observation count")
+        # Rewrite the modality column in TEXT ORDER, interleaving the goal rows where
+        # their markers occur. Done here rather than in the arrow builder because it
+        # exists only as a consequence of how the conversation is written, and leaving
+        # the raw columns in the table keeps every placement ablatable without a rebuild.
+        ds = ds.map(
+            lambda ex: {args.modality_column: modality_values(
+                ex, args.modality_column, args.goal_values_column,
+                args.segment_column, args.goal_placement)},
+            num_proc=args.num_proc, desc="goal value rows",
+            **cache_kw("goal_values"),
+        )
 
     if args.max_turns:
         before = size(ds)
@@ -199,6 +318,10 @@ def main():
             "goal_column": args.goal_column,
             "images_column": args.images_column,
             "modality_marker": args.modality_marker,
+            "goal_marker": args.goal_marker,
+            "goal_placement": args.goal_placement,
+            "segment_column": args.segment_column,
+            "task_column": args.task_column,
         },
         num_proc=args.num_proc,
         desc="messages",
@@ -212,7 +335,11 @@ def main():
         if args.val_split is not None:
             out = DatasetDict({"train": ds[args.split], "validation": ds[args.val_split]})
         else:
-            out = DatasetDict({"train": ds})
+            # `ds` is a DatasetDict whenever the input was one, which it is for every
+            # corpus the builder writes. Wrapping it again nests DatasetDicts and the
+            # summary below then fails on a missing column -- after the save, so the
+            # output looked fine and the run looked broken. Unwrap the split instead.
+            out = DatasetDict({"train": ds[args.split] if hasattr(ds, "keys") else ds})
 
     Path(args.out_dir).parent.mkdir(parents=True, exist_ok=True)
     out.save_to_disk(args.out_dir)

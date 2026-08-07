@@ -31,7 +31,7 @@ set -euo pipefail
 
 HAB=/Projects/habitat_physical_nav
 PY=/workspace/conda/envs/vln/bin/python
-SRC=/Projects/continuous_demos/output_25hz     # recordings (data, not code)
+SRC=/Projects/habitat_physical_nav/recordings     # recordings (data, not code)
 ROOT=/Projects/spatial_training/data
 
 build () {          # $1 = name   $2 = obs_stride_frames   $3 = action_chunk_len
