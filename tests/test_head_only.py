@@ -183,6 +183,93 @@ def test_open_many_joins_parts_and_refuses_a_mixed_trunk(tmp_path):
         ContextStore.open_many([a.root, a.root])
 
 
+def test_a_shard_pin_makes_a_growing_harvest_reproducible(tmp_path):
+    """A harvest is appendable, so "the store" is a moving target unless it is pinned."""
+    store = _write_store(tmp_path, n_eps=6, rows_per_ep=5, shard_eps=2)   # 3 shards
+    assert len(ContextStore.open(store.root)) == 30
+    pinned = ContextStore.open(store.root, max_shards=2)
+    assert len(pinned) == 20 and pinned.n_episodes == 4
+    # The prefix must be the *same rows* the unpinned store starts with, or a pin would
+    # silently re-cut the data rather than snapshot it.
+    assert np.allclose(pinned.whole("pooled"),
+                       ContextStore.open(store.root).whole("pooled")[:20])
+    with pytest.raises(ValueError, match="cannot pin"):
+        ContextStore.open(store.root, max_shards=99)
+    with pytest.raises(ValueError, match="every part"):
+        ContextStore.open_many([store.root], max_shards=[1, 1])
+
+
+# =======================================================================================
+# Support filtering
+# =======================================================================================
+def _chunk(diffs):
+    """Per-tick differentials -> the anchor-relative chunk a store would hold."""
+    from longnav.utils.bin_codec import compose_chunk
+
+    return compose_chunk(torch.tensor(diffs, dtype=torch.float64)).float().numpy()
+
+
+def test_motion_filters_select_the_supports_they_name():
+    from longnav.utils.head_only import chunk_motion_mask
+
+    drive = [[0.06, 0.002, 0.01]] * 4               # every dim moving, every tick
+    turn = [[0.0, 0.0, 0.08]] * 4                   # in place every tick: the dx/dy atom
+    mixed = [[0.06, 0.002, 0.01], [0.0, 0.0, 0.08],
+             [0.06, 0.002, 0.01], [0.06, 0.002, 0.01]]
+    straight = [[0.06, 0.002, 0.0]] * 4             # no dtheta: a dtheta atom
+    x = _chunk([drive, turn, mixed, straight])
+
+    assert list(chunk_motion_mask(x, "none")) == [True, True, True, True]
+    # "translating" drops only the chunk that never translates.
+    assert list(chunk_motion_mask(x, "translating")) == [True, False, True, True]
+    # "dx_free" additionally drops the chunk with a single stopped-in-dx tick.
+    assert list(chunk_motion_mask(x, "dx_free")) == [True, False, False, True]
+    # "all_move" also drops the one whose dtheta is in the atom, since the atom is
+    # per-dimension and the point of this mode is that no dimension has one.
+    assert list(chunk_motion_mask(x, "all_move")) == [True, False, False, False]
+
+
+def test_the_filter_is_computed_on_differentials_not_on_stored_poses():
+    """A chunk that stops after one step is *not* motionless in anchor-relative poses.
+
+    Every pose after the first is far from the anchor, so a filter that thresholded the
+    stored chunk would keep this row as "moving". On differentials it is one tick of
+    motion followed by three stopped ones, which is what the density sees.
+    """
+    from longnav.utils.head_only import chunk_motion_mask
+
+    x = _chunk([[[0.06, 0.0, 0.0], [0.0] * 3, [0.0] * 3, [0.0] * 3]])
+    assert abs(x[0, -1, 0]) > 0.05, "the stored pose is far from the anchor"
+    assert list(chunk_motion_mask(x, "dx_free")) == [False]
+    assert list(chunk_motion_mask(x, "translating")) == [True]
+
+
+def test_filtering_a_store_keeps_the_row_indices_it_was_given(tmp_path):
+    from longnav.utils.head_only import filter_rows_by_motion
+
+    store = ContextStore(tmp_path / "store")
+    store.init(_provenance(chunk_shape=[4, 3]))
+    drive, turn = [[0.06, 0.0, 0.01]] * 4, [[0.0, 0.0, 0.08]] * 4
+    x = _chunk([drive, turn, drive, turn])
+    store.write_shard(
+        {"pooled": np.zeros((4, POOLED), np.float32),
+         "context": np.zeros((4, CTX), np.float32), "targets": x},
+        ["0", "1"], [2, 2])
+    s = ContextStore.open(store.root)
+    rows = np.array([3, 2, 1, 0])
+    kept = filter_rows_by_motion(s, rows, "translating", batch=2)
+    # Global row indices, in the order given -- the caller's split, not a re-derived one.
+    assert list(kept) == [2, 0]
+    assert list(filter_rows_by_motion(s, rows, "none")) == [3, 2, 1, 0]
+
+
+def test_an_unknown_filter_is_refused():
+    from longnav.utils.head_only import chunk_motion_mask
+
+    with pytest.raises(ValueError, match="unknown motion filter"):
+        chunk_motion_mask(np.zeros((2, 4, 3), np.float32), "drive_only")
+
+
 # =======================================================================================
 # Collapse diagnostics
 # =======================================================================================

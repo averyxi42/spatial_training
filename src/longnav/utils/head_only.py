@@ -269,7 +269,17 @@ class ContextStore:
 
     # -- reading -----------------------------------------------------------------------
     @classmethod
-    def open(cls, root: os.PathLike | str) -> "OpenedContextStore":
+    def open(cls, root: os.PathLike | str,
+             max_shards: Optional[int] = None) -> "OpenedContextStore":
+        """Open a store, optionally pinned to its first `max_shards` shards.
+
+        The pin exists because a harvest is *appendable*: workers keep adding shards while
+        experiments run against the store, so "the same store" on Tuesday is a superset of
+        Monday's and `split_by_episode` reshuffles when the episode list grows. A later run
+        would then be trained on rows a baseline held out, and nothing would raise -- the
+        two runs would simply not be comparable. Shards are appended in order and never
+        rewritten, so a prefix is exactly the snapshot that existed at some past moment.
+        """
         store = cls(root)
         if not store.manifest_path.exists():
             raise FileNotFoundError(
@@ -279,6 +289,14 @@ class ContextStore:
         blob = store.read_manifest()
         prov = HarvestProvenance.from_json(blob["provenance"])
         shards = sorted(blob["shards"], key=lambda s: s["index"])
+        if max_shards is not None:
+            if max_shards > len(shards):
+                raise ValueError(
+                    f"{root} holds {len(shards)} shard(s); cannot pin to the first "
+                    f"{max_shards}. A pin that cannot be honoured means the snapshot is "
+                    "not the one asked for, so it is refused rather than truncated."
+                )
+            shards = shards[:max_shards]
         if not shards:
             raise RuntimeError(f"{root} holds a manifest but no shards")
         names = [n for n in ARRAY_SPECS
@@ -296,7 +314,9 @@ class ContextStore:
                                   episode_ids=np.asarray(episode_ids), shards=shards)
 
     @classmethod
-    def open_many(cls, roots: Sequence[os.PathLike | str]) -> "OpenedContextStore":
+    def open_many(cls, roots: Sequence[os.PathLike | str],
+                  max_shards: Optional[Sequence[Optional[int]]] = None,
+                  ) -> "OpenedContextStore":
         """Concatenate several stores harvested from the *same* trunk in parallel.
 
         Harvesting is one forward pass per episode and embarrassingly parallel, but a
@@ -306,7 +326,14 @@ class ContextStore:
         two trunks' context into one training set is the one mistake this whole pipeline
         exists to prevent, and it would not be visible in any downstream number.
         """
-        parts = [cls.open(r) for r in roots]
+        if max_shards is None:
+            max_shards = [None] * len(roots)
+        if len(max_shards) != len(roots):
+            raise ValueError(
+                f"--store-shards has {len(max_shards)} entries for {len(roots)} store(s); "
+                "a per-part pin has to name every part or the snapshot is undefined"
+            )
+        parts = [cls.open(r, m) for r, m in zip(roots, max_shards)]
         if len(parts) == 1:
             return parts[0]
         first = parts[0].provenance
@@ -397,6 +424,114 @@ class OpenedContextStore:
         in_val = np.array([e in val for e in self.episode_ids])
         in_test = np.array([e in test for e in self.episode_ids])
         return idx[~(in_val | in_test)], idx[in_val], idx[in_test]
+
+
+# =======================================================================================
+# Support filtering: taking the zero atom out of what the density has to represent
+# =======================================================================================
+#
+# Why this is chunk-level selection and not per-tick masking
+# ---------------------------------------------------------
+# The hypothesis under test is that a smooth diffeomorphism of a Gaussian cannot put zero
+# mass in the gap between the data's zero atom and its drive mode, so it leaks -- and the
+# leak is what `creep_*` measures. Testing it means removing the atom from the support the
+# density is fitted on.
+#
+# The atom is per-tick and per-dimension, so the obvious move is to drop the offending
+# *dims* from the likelihood. That is not available here, and the reason is structural
+# rather than a matter of effort. `ConditionalFlow` is a coupling flow: its log-density is
+# `log p_base(z) + sum_i log|s_i|`, which looks separable, but `z` is a function of the
+# whole input vector -- every coupling conditions half the dims on the other half. Dropping
+# the terms belonging to a masked dim does not marginalise that dim out; it leaves the
+# masked value still driving every surviving term through the conditioner. The result is
+# not the marginal density of the unmasked dims, and it is not a normalised density of
+# anything else either. It would train, print a loss, and mean nothing. Marginalising a
+# coupling flow properly requires a different model (an explicit stop/drive gate with the
+# flow fitted on the drive-conditional), which is a build task, not this hypothesis test.
+#
+# What *is* available without changing the model is to change which rows it is fitted on,
+# because a row is a whole 60-dim vector and dropping one leaves the joint intact. So the
+# filters below all select whole chunks, and each names the support it leaves behind.
+#
+# Measured on the `ctx_v9_ck11400` snapshot (2.5 Hz corpus, 20-tick chunks, 121,683 rows),
+# which is why the modes are shaped the way they are:
+#
+#   * 46.2% of ticks have |dx| < 1e-5 AND |dy| < 1e-5, and 95.4% of *those* have
+#     |dtheta| > 1e-2. The translation atom is the robot **turning in place**, not the
+#     robot being stopped. Ticks that are zero in all three dims are 1.1%.
+#   * consequently no chunk at all is entirely motionless, and "drop rows whose whole
+#     chunk is near-zero" in the joint sense drops nothing. The chunk-level mode that
+#     does exist is the whole-chunk *turn*: 28.1% of chunks have |dx| < 1e-4 at every one
+#     of their 20 ticks.
+#   * the chunk-level structure is sharply bimodal in dx: 35.9% of chunks never enter the
+#     dx atom, 28.1% never leave it, and the remaining 36% straddle.
+MOTION_FILTERS = ("none", "translating", "dx_free", "all_move")
+
+
+def chunk_motion_mask(targets: np.ndarray, mode: str = "none",
+                      tol: float = 1e-4) -> np.ndarray:
+    """Anchor-relative chunks `(N, T, 3)` -> a boolean keep-mask `(N,)`.
+
+    The mask is defined on the **per-tick body-frame differentials**, via the same
+    `decompose_chunk` in the same float64 the objective uses, because that is the space the
+    density lives in and the space the atom is an atom in. Computing it on the stored poses
+    instead would ask a different question (has the robot moved since the anchor) and would
+    silently keep chunks that are one long stop after an initial step.
+
+    Modes:
+
+      none         keep everything.
+      translating  drop chunks with no translating tick at all -- `max(|dx|, |dy|) < tol`
+                   for all T ticks. On this corpus that is the whole-chunk in-place turn,
+                   i.e. the chunk-level realisation of the atom, and it is the closest
+                   thing available to the "turn-level" filter. It removes the *mode* but
+                   not the *atom*: chunks that straddle keep their zero ticks.
+      dx_free      keep only chunks whose every tick has `|dx| >= tol`. dx -- the dimension
+                   `stop_ratio_dx` and `creep_sample_dx` are read on -- then has no atom at
+                   all, while dy and dtheta still do.
+      all_move     keep only chunks whose every one of the T x 3 dims exceeds `tol`. No
+                   atom in any dimension: the strongest available change of support, and
+                   the arm that decides the hypothesis.
+
+    `tol` is 1e-4 by default, matching the band statistics' `EXACT`, so "in the atom" and
+    "counted as a stop by the metric" are the same predicate. The atom's edge is sharp
+    enough that this is not a knife edge -- on the snapshot, moving the threshold across
+    three decades (1e-5 to 3e-3) moves the `dx_free` keep-rate from 36.1% to 34.9%.
+    """
+    if mode not in MOTION_FILTERS:
+        raise ValueError(f"unknown motion filter {mode!r}; expected one of {MOTION_FILTERS}")
+    targets = np.asarray(targets)
+    if targets.ndim != 3 or targets.shape[-1] < 3:
+        raise ValueError(f"expected (N, T, >=3) anchor-relative chunks, got {targets.shape}")
+    if mode == "none":
+        return np.ones(len(targets), dtype=bool)
+    from longnav.utils.bin_codec import decompose_chunk
+
+    a = np.abs(decompose_chunk(torch.from_numpy(
+        np.ascontiguousarray(targets)).double()).numpy())
+    if mode == "translating":
+        return (np.maximum(a[..., 0], a[..., 1]) >= tol).any(-1)
+    if mode == "dx_free":
+        return (a[..., 0] >= tol).all(-1)
+    return (a >= tol).all(-1).all(-1)
+
+
+def filter_rows_by_motion(store: "OpenedContextStore", rows: np.ndarray, mode: str = "none",
+                          tol: float = 1e-4, batch: int = 16384) -> np.ndarray:
+    """`chunk_motion_mask` applied to a row selection of a store, in batches.
+
+    Batched because the mask is wanted for the whole train split (~10^5 rows) and the
+    targets are the only array that has to be touched to compute it -- gathering `pooled`
+    as well, which a naive whole-split read would do, is 2048 floats per row of pure waste.
+    """
+    rows = np.asarray(rows)
+    if mode == "none":
+        return rows
+    keep = np.zeros(len(rows), dtype=bool)
+    for i in range(0, len(rows), batch):
+        sl = slice(i, i + batch)
+        keep[sl] = chunk_motion_mask(store.get("targets", rows[sl]), mode, tol)
+    return rows[keep]
 
 
 # =======================================================================================

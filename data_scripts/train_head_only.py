@@ -68,8 +68,9 @@ import torch  # noqa: E402
 from transformers import TrainingArguments  # noqa: E402
 
 from longnav.utils.head_only import (  # noqa: E402
-    ContextStore, FrozenContextCollator, FrozenContextDataset, FrozenContextFlowPolicy,
-    HeadOnlyFlowTrainer, context_collapse_stats,
+    MOTION_FILTERS, ContextStore, FrozenContextCollator, FrozenContextDataset,
+    FrozenContextFlowPolicy, HeadOnlyFlowTrainer, context_collapse_stats,
+    filter_rows_by_motion,
 )
 from longnav.utils.model_metrics import (  # noqa: E402
     add_model_metrics_args, attach_model_metrics,
@@ -115,6 +116,11 @@ def parse_args():
                     help="one or more harvest_context.py output directories. Several "
                          "parts of one parallel harvest are joined; they must agree on "
                          "the source trunk and corpus, which is checked")
+    ap.add_argument("--store-shards", default=None,
+                    help="pin each --store part to its first N shards, e.g. '11,9,11,9'. "
+                         "A harvest is appendable, so without a pin the same store grows "
+                         "between runs and split_by_episode reshuffles -- a later run then "
+                         "trains on rows an earlier one held out, silently")
     ap.add_argument("--head", default="cnf", choices=sorted(HEAD_BUILDERS))
     ap.add_argument("--context-key", default="pooled", choices=("pooled", "context"),
                     help="'pooled' trains the projection AND the flow (the real trainer's "
@@ -159,6 +165,23 @@ def parse_args():
                         "default: there is no backbone forcing it here and fp32 is both "
                         "cheaper to reason about and free")
     o.add_argument("--seed", type=int, default=42)
+
+    f = ap.add_argument_group("support filtering (see head_only.chunk_motion_mask)")
+    f.add_argument("--target-filter", default="none", choices=MOTION_FILTERS,
+                   help="drop chunks so the density is fitted on a support without the "
+                        "zero atom. Applied AFTER the episode split, so every arm holds "
+                        "out the same episodes and only the rows differ")
+    f.add_argument("--filter-tol", type=float, default=1e-4,
+                   help="'in the atom' threshold, in metres/radians per tick. The default "
+                        "is the band statistics' EXACT, so the filter and the metric use "
+                        "one definition of a stopped tick")
+    f.add_argument("--filter-eval", dest="filter_eval", action="store_true", default=True,
+                   help="filter the val split the same way (default): a run's own eval is "
+                        "then on the support it was fitted on")
+    f.add_argument("--no-filter-eval", dest="filter_eval", action="store_false",
+                   help="keep the full val split, so eval_* is on the unfiltered "
+                        "distribution and is directly comparable to a baseline's -- at the "
+                        "cost of scoring the model off its own support")
 
     d = ap.add_argument_group("data / logging")
     d.add_argument("--val-frac", type=float, default=0.1)
@@ -205,8 +228,11 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    store = ContextStore.open_many(args.store)
+    pins = _csv(args.store_shards, int) or None
+    store = ContextStore.open_many(args.store, pins)
     prov = store.provenance
+    if pins:
+        print(f"store pinned to the first {list(pins)} shard(s) of each part")
     print(f"store {' + '.join(args.store)}")
     print(f"  {len(store)} rows over {store.n_episodes} episode(s), "
           f"pooled {prov.pooled_dim} context {prov.context_dim} chunk {prov.chunk_shape}")
@@ -220,6 +246,25 @@ def main():
         raise SystemExit("the val split is empty -- raise --val-frac or harvest more "
                          "episodes; a run with no held-out number is not a measurement")
     print(f"  split by episode: train {len(tr)} / val {len(va)} / test {len(te)} rows")
+
+    # After the split, never before: the episodes held out must not depend on the filter,
+    # or two arms would differ in *which* episodes they were scored on as well as in which
+    # rows they were fitted on, and the difference between them would be uninterpretable.
+    n_tr_all, n_va_all = len(tr), len(va)
+    if args.target_filter != "none":
+        tr = filter_rows_by_motion(store, tr, args.target_filter, args.filter_tol)
+        if args.filter_eval:
+            va = filter_rows_by_motion(store, va, args.target_filter, args.filter_tol)
+        if len(tr) == 0 or len(va) == 0:
+            raise SystemExit(
+                f"filter {args.target_filter!r} at tol {args.filter_tol} leaves "
+                f"train {len(tr)} / val {len(va)} rows -- nothing to fit"
+            )
+        print(f"  filter {args.target_filter!r} (tol {args.filter_tol:g}): "
+              f"train {len(tr)}/{n_tr_all} ({len(tr) / n_tr_all:.1%}) / "
+              f"val {len(va)}/{n_va_all} ({len(va) / n_va_all:.1%}) rows kept")
+        print("  NOTE: nll_* are a density on this support and are NOT comparable to a "
+              "run fitted on another one. The band and error statistics are.")
 
     # The control the whole experiment leans on, printed before anything trains: what the
     # frozen vector's own statistics are. If these already look collapsed, nothing the
@@ -317,6 +362,7 @@ def main():
     (Path(args.output_dir) / "head_only_run.json").write_text(json.dumps({
         "args": vars(args), "provenance": prov.to_json(),
         "n_train_rows": int(len(tr)), "n_val_rows": int(len(va)),
+        "n_train_rows_unfiltered": int(n_tr_all), "n_val_rows_unfiltered": int(n_va_all),
         "n_test_rows": int(len(te)), "n_episodes": int(store.n_episodes),
     }, indent=2))
 
