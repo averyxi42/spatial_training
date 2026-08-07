@@ -70,9 +70,14 @@ after `relative_se2` -- i.e. what the encoder saw, not the scene-frame column).
 
 ### Storage format, and why
 
-Sharded `.npy`, opened `mmap_mode="r"`, with a JSON manifest. **Measured: 12,548 bytes per
-row** (`pooled` 2048 + `context` 1024 + `targets` 20x3 + `pose` 3, all float32), which at
-the full 39k-episode corpus is roughly 2M rows and ~25 GB.
+Sharded `.npy`, opened `mmap_mode="r"`, with a JSON manifest. **Measured: 12,540 bytes per
+row** (`pooled` 2048 + `context` 1024 + `targets` 20x3 + `pose` 3, all float32) over a
+221,090-row / 4,672-episode harvest occupying 2.58 GiB. The full 39,061-episode train split
+extrapolates to ~1.85M rows and ~23 GB.
+
+Harvest throughput, measured on one H100 with four workers on four GPUs: **~26 rows/s per
+worker**, ~1.9 s/episode, so ~104 rows/s aggregate. The full corpus is therefore around
+five hours wall-clock on four GPUs, and is worth doing once.
 
 * `.npz` -- what the prior work used -- is a zip container. It cannot be memory-mapped and
   every read decompresses whole arrays into RAM. Fine at 11k rows, impossible at 2M.
