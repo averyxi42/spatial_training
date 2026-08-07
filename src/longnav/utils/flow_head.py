@@ -224,44 +224,25 @@ def warm_start_from_marginal(flow: ConditionalFlow, path: Union[str, Path]) -> d
             "source": str(path), "source_config": blob.get("config", {})}
 
 
-class TurnFlowPolicy(TurnVectorRegressor):
-    """`TurnVectorRegressor` whose trunk emits a conditioning vector and whose loss is NLL."""
+class FlowObjectiveMixin:
+    """The head's objective, given a conditioning vector -- and nothing else.
 
-    @classmethod
-    def build(
-        cls,
-        model_cfg: ModelConfig,
-        loss_cfg: LossConfig,
-        lora: Optional[LoraSpec],
-        target_shape: Sequence[int],
-        processor,
-        dtype: torch.dtype = torch.bfloat16,
-        chunk_shape: Sequence[int] = (10, 3),
-        flow_kwargs: Optional[Dict[str, Any]] = None,
-        decode: str = "best_of_k",
-        decode_k: int = 16,
-    ) -> "TurnFlowPolicy":
-        """`target_shape` is `(context_dim,)`; `chunk_shape` is the action chunk `(T, 3)`."""
-        target_shape = tuple(int(d) for d in target_shape)
-        if len(target_shape) != 1:
-            raise ValueError(
-                f"target_shape must be (context_dim,), got {target_shape}. The trunk emits "
-                "the conditioning vector, not the action -- the action comes from the flow."
-            )
-        chunk_shape = tuple(int(d) for d in chunk_shape)
-        # `normalize_targets` is meaningless here (a density is fitted in raw units) and
-        # leaving it on would make the parent raise on an un-fitted normalizer.
-        loss_cfg = LossConfig(**{**loss_cfg.__dict__, "normalize_targets": False})
-        model = super().build(model_cfg, loss_cfg, lora, target_shape, processor, dtype)
-        flow = ConditionalFlow(
-            context_dim=target_shape[0], chunk_len=chunk_shape[0],
-            n_channels=chunk_shape[1], **(flow_kwargs or {}),
-        )
-        model.normalizer = FlowActionDecoder(flow, decode=decode, k=decode_k)
-        model.chunk_shape = chunk_shape
-        model.flow_kwargs = dict(flow_kwargs or {})
-        model.sigma_mult = 1.0
-        return model
+    Everything in here needs `self.normalizer` (a `FlowActionDecoder`) and
+    `self.sigma_mult`, and nothing else about the model. That is the point: the flow's
+    loss and its metrics must not know whether the context in front of them came from a
+    live backbone or from a `.npy` on disk.
+
+    Two callers:
+
+      * `TurnFlowPolicy` -- the real trainer, context from `encode_turns` + `head.project`;
+      * `head_only.FrozenContextFlowPolicy` -- head-only training, context read from a
+        harvested trunk state.
+
+    They share this class rather than each computing "the same" NLL, because a divergence
+    between the two would not raise. It would produce two numbers that look comparable,
+    are not, and would invalidate every conclusion drawn by comparing them -- which is
+    the entire purpose of the head-only pipeline.
+    """
 
     # -- convenience -------------------------------------------------------------------
     @property
@@ -276,56 +257,20 @@ class TurnFlowPolicy(TurnVectorRegressor):
         self.sigma_mult = float(value)
 
     # -- the objective -----------------------------------------------------------------
-    def forward(
+    def flow_objective(
         self,
-        input_ids: torch.Tensor,
+        ctx_raw: torch.Tensor,
         targets: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        num_turns: Optional[torch.Tensor] = None,
         num_items_in_batch: Optional[Union[int, torch.Tensor]] = None,
-        **multimodal,
+        n_sparse_tokens: Optional[int] = None,
+        n_dense_tokens: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
-        multimodal.pop("labels", None)
-        # Modality injection, mirroring TurnVectorRegressor / flow_matching_head. The
-        # `modality_*` keys must come OUT of `multimodal` by name before the backbone sees
-        # it -- the backbone does not accept them -- and `pending` wraps ONLY the backbone
-        # call so entering the embedding twice trips the consume-once assert instead of
-        # silently reusing values. Without this the pre-hook raises "marker token(s)
-        # ['pose'] are in the sequence but no modality values are pending", which is what
-        # v12 hit on its first step: `modality_specs` on the ModelConfig makes the model
-        # expect pose and the collator emit the marker, but nothing fed it.
-        modality = ModalityBatch.pop_from(
-            multimodal, known_keys=self.modality_embedder.keys
-        )
-        with self.modality_embedder.pending(modality):
-            outputs = self.backbone(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-                logits_to_keep=1,
-                **multimodal,
-            )
-        vectors, spans = extract_turn_vectors(
-            outputs,
-            input_ids,
-            self.head,
-            prefix_ids=self.prefix_ids,
-            postfix_ids=self.postfix_ids,
-            shift_left=self.model_cfg.shift_left,
-            strict=True,
-        )
-        if vectors.shape[0] != targets.shape[0]:
-            tail = input_ids[0, -64:].tolist()
-            raise RuntimeError(
-                f"found {vectors.shape[0]} assistant turn span(s) but got "
-                f"{targets.shape[0]} target(s). prefix={self.model_cfg.prefix!r} "
-                f"postfix={self.model_cfg.postfix!r} "
-                f"shift_left={self.model_cfg.shift_left}. Last 64 input_ids: {tail}"
-            )
-        if self.train_content_len is None and spans:
-            self.train_content_len = int(len(spans[0]))
+        """Raw trunk output + anchor-relative chunks -> `{"loss": ..., **metrics}`.
 
-        ctx_raw = vectors.view(-1, self.target_shape[0]).float()
+        `targets` are the dataset's anchor-relative poses `(N, T, 3)`; the conversion to
+        per-tick differentials happens here so both callers get it, in float64 for the
+        reason stated below.
+        """
         targets = targets.to(ctx_raw.device)
         # The flow lives on per-tick body-frame differentials, not the anchor-relative
         # poses the dataset stores: that is the only space where "the robot did not move"
@@ -344,14 +289,6 @@ class TurnFlowPolicy(TurnVectorRegressor):
         denom = torch.as_tensor(denom, dtype=total.dtype, device=total.device).clamp(min=1)
         loss = total / denom
 
-        # An example with no occurrences of a modality leaves its encoder out of the
-        # backward graph, which under `ddp_find_unused_parameters=False` hangs or errors.
-        # Identically zero -- no gradient, no metric moves -- and exists only so every
-        # encoder parameter is always reached.
-        touch = self.modality_embedder.zero_touch(loss.device, loss.dtype)
-        if touch is not None:
-            loss = loss + touch
-
         with torch.no_grad():
             metrics = self._flow_metrics(ctx_raw.detach(), gt_diffs)
             metrics["loss_sum"] = total.detach()
@@ -360,9 +297,13 @@ class TurnFlowPolicy(TurnVectorRegressor):
                 self.flow.min_nll_per_dim(self.sigma_mult) * per_turn.shape[0],
                 device=ctx_raw.device, dtype=torch.float32)
             metrics["n_turns"] = torch.tensor(ctx_raw.shape[0], device=ctx_raw.device)
+            # Token counts are a property of the *encoder*, so a caller with no backbone
+            # reports zero rather than a made-up number: `sparse_tokens = 0` in a
+            # head-only run reads as "there was no sequence", which is true.
             metrics["n_tokens"] = torch.tensor(
-                outputs["last_hidden_state"].shape[1], device=ctx_raw.device)
-            metrics["n_dense_tokens"] = torch.tensor(input_ids.shape[1], device=ctx_raw.device)
+                int(n_sparse_tokens or 0), device=ctx_raw.device)
+            metrics["n_dense_tokens"] = torch.tensor(
+                int(n_dense_tokens or 0), device=ctx_raw.device)
             metrics["n_steps"] = torch.tensor(1, device=ctx_raw.device)
         return {"loss": loss, **metrics}
 
@@ -408,6 +349,80 @@ class TurnFlowPolicy(TurnVectorRegressor):
             "logdet_absmax": torch.tensor(rep["logdet_abs_max"], device=dev),
             "sat_sum": torch.tensor(rep["scale_saturation"], device=dev),
         }
+
+
+class TurnFlowPolicy(FlowObjectiveMixin, TurnVectorRegressor):
+    """`TurnVectorRegressor` whose trunk emits a conditioning vector and whose loss is NLL."""
+
+    @classmethod
+    def build(
+        cls,
+        model_cfg: ModelConfig,
+        loss_cfg: LossConfig,
+        lora: Optional[LoraSpec],
+        target_shape: Sequence[int],
+        processor,
+        dtype: torch.dtype = torch.bfloat16,
+        chunk_shape: Sequence[int] = (10, 3),
+        flow_kwargs: Optional[Dict[str, Any]] = None,
+        decode: str = "best_of_k",
+        decode_k: int = 16,
+    ) -> "TurnFlowPolicy":
+        """`target_shape` is `(context_dim,)`; `chunk_shape` is the action chunk `(T, 3)`."""
+        target_shape = tuple(int(d) for d in target_shape)
+        if len(target_shape) != 1:
+            raise ValueError(
+                f"target_shape must be (context_dim,), got {target_shape}. The trunk emits "
+                "the conditioning vector, not the action -- the action comes from the flow."
+            )
+        chunk_shape = tuple(int(d) for d in chunk_shape)
+        # `normalize_targets` is meaningless here (a density is fitted in raw units) and
+        # leaving it on would make the parent raise on an un-fitted normalizer.
+        loss_cfg = LossConfig(**{**loss_cfg.__dict__, "normalize_targets": False})
+        model = super().build(model_cfg, loss_cfg, lora, target_shape, processor, dtype)
+        flow = ConditionalFlow(
+            context_dim=target_shape[0], chunk_len=chunk_shape[0],
+            n_channels=chunk_shape[1], **(flow_kwargs or {}),
+        )
+        model.normalizer = FlowActionDecoder(flow, decode=decode, k=decode_k)
+        model.chunk_shape = chunk_shape
+        model.flow_kwargs = dict(flow_kwargs or {})
+        model.sigma_mult = 1.0
+        return model
+
+    # -- the objective -----------------------------------------------------------------
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        num_turns: Optional[torch.Tensor] = None,
+        num_items_in_batch: Optional[Union[int, torch.Tensor]] = None,
+        **multimodal,
+    ) -> Dict[str, torch.Tensor]:
+        """Encode, then score. Both halves are shared code, deliberately.
+
+        `encode_turns` is the parent's -- one definition of the modality injection, the
+        backbone call and the turn extraction, and the same one the harvest runs. The
+        objective is `FlowObjectiveMixin.flow_objective`, the same one head-only training
+        runs. This method is the join between them, and nothing else.
+        """
+        enc = self.encode_turns(input_ids, attention_mask, **multimodal)
+        ctx_raw = self.head.project(enc.pooled).view(-1, self.target_shape[0]).float()
+        self._assert_turn_alignment(ctx_raw.shape[0], targets.shape[0], input_ids)
+        out = self.flow_objective(
+            ctx_raw, targets, num_items_in_batch,
+            n_sparse_tokens=enc.n_sparse_tokens, n_dense_tokens=enc.n_dense_tokens,
+        )
+        # An example with no occurrences of a modality leaves its encoder out of the
+        # backward graph, which under `ddp_find_unused_parameters=False` hangs or errors.
+        # Identically zero -- no gradient, no metric moves -- and exists only so every
+        # encoder parameter is always reached. It lives here rather than in the shared
+        # objective because head-only training has no modality encoders to reach.
+        touch = self.modality_embedder.zero_touch(out["loss"].device, out["loss"].dtype)
+        if touch is not None:
+            out["loss"] = out["loss"] + touch
+        return out
 
     # -- checkpointing -----------------------------------------------------------------
     def save_pretrained(self, output_dir: Union[str, Path]):

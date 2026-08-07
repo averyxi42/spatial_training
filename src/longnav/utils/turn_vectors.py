@@ -472,12 +472,24 @@ class TurnVectorHead(nn.Module):
         """Width of `pooled_context`'s output -- what an auxiliary head must accept."""
         return self.hidden_size * self.content_len if self.mode == "flat" else self.hidden_size
 
+    def project(self, pooled: torch.Tensor) -> torch.Tensor:
+        """`(N_turns, pooled_dim)` -> `(N_turns, out_dim)`. The trainable half of the head.
+
+        Split out of `forward` for the same reason `pooled_context` was: something other
+        than `forward` needs exactly this computation and must not acquire a second
+        definition of it. Here that something is head-only training
+        (`longnav.utils.head_only`), which replays a *cached* pooled vector -- the frozen
+        trunk's output -- through the head. `forward` is pooling followed by projection,
+        and the seam between them is precisely where a harvested context is cut.
+        """
+        out = self.mlp(self.pre_norm(pooled.to(self._dtype)))
+        return F.normalize(out, dim=-1) if self.normalize_output else out
+
     def forward(self, states: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """(N_turns, L, H) -> (N_turns, out_dim)."""
         if states.shape[0] == 0:
             return states.to(self._dtype).new_zeros((0, self.out_dim))
-        out = self.mlp(self.pre_norm(self.pooled_context(states, mask)))
-        return F.normalize(out, dim=-1) if self.normalize_output else out
+        return self.project(self.pooled_context(states, mask))
 
 
 def extract_turn_vectors(

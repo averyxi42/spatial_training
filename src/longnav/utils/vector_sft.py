@@ -592,6 +592,26 @@ class TurnVectorCollator:
         return batch.to_kwargs()
 
 
+@dataclass
+class TurnEncoding:
+    """What the trunk produced for one collated conversation, before any head runs.
+
+    `pooled` is the seam of this codebase: everything upstream of it is the frozen
+    trunk (backbone + LoRA + modality encoders + the pooling rule), everything
+    downstream is the head. `harvest_context.py` writes exactly this vector to disk and
+    `head_only.py` trains on it, which is only sound because `forward` reads the same
+    one -- hence a named object rather than a tuple, so a caller cannot quietly take the
+    unpooled states and call them the context.
+    """
+
+    pooled: torch.Tensor            # (N_turns, pooled_dim) -- head input
+    states: torch.Tensor            # (N_turns, L_max, H) -- padded content states
+    span_mask: torch.Tensor         # (N_turns, L_max) bool
+    spans: List[Any]                # the TurnSpans, in row order
+    n_sparse_tokens: int
+    n_dense_tokens: int
+
+
 # ======================================================================================
 # Model: LoRA backbone + turn-vector head, as one DDP-friendly module
 # ======================================================================================
@@ -770,6 +790,86 @@ class TurnVectorRegressor(nn.Module):
             f"adapters {trainable - head - mod - stop:,}"
         )
 
+    # -- the encoder half --------------------------------------------------------------
+    def encode_turns(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **backbone_inputs,
+    ) -> "TurnEncoding":
+        """Batch -> one pooled trunk state per assistant turn. Everything before the head.
+
+        Factored out of `forward` because three callers need *exactly* this and none of
+        them may acquire its own version of it:
+
+          * `forward` (this class and `TurnFlowPolicy`) -- training;
+          * `data_scripts/harvest_context.py` -- writing the frozen-context dataset that
+            head-only training consumes;
+          * `data_scripts/reattach_head.py` -- proving, after reattachment, that the
+            trunk still computes the context that was harvested from it.
+
+        The modality wiring in particular has to be identical across all three. It is the
+        step that fails silently: a harvest that never injected `<pose>` produces a
+        perfectly plausible dataset conditioned on an input the model was not trained
+        with, and nothing downstream would raise. There is now one place it can be got
+        wrong, and every caller shares it.
+
+        `backbone_inputs` is forwarded wholesale, so the `modality_*` keys must come out
+        of it by name first -- the backbone does not accept them.
+        """
+        backbone_inputs.pop("labels", None)
+        modality = ModalityBatch.pop_from(
+            backbone_inputs, known_keys=self.modality_embedder.keys
+        )
+        # The context wraps only the backbone call: entering it twice under one context
+        # trips the consume-once assert instead of silently reusing the same values.
+        with self.modality_embedder.pending(modality):
+            outputs = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                logits_to_keep=1,  # never materialize (B, S, vocab); the LM head is unused
+                **backbone_inputs,
+            )
+        # `head=None` and pool explicitly, so the motion head and the stop head read the
+        # same pooled context from one extraction rather than two.
+        states, spans, span_mask = extract_turn_vectors(
+            outputs,
+            input_ids,
+            None,
+            prefix_ids=self.prefix_ids,
+            postfix_ids=self.postfix_ids,
+            shift_left=self.model_cfg.shift_left,
+            strict=True,
+            return_mask=True,
+        )
+        if self.train_content_len is None and spans:
+            self.train_content_len = int(len(spans[0]))
+        return TurnEncoding(
+            pooled=self.head.pooled_context(states, span_mask),
+            states=states,
+            span_mask=span_mask,
+            spans=spans,
+            n_sparse_tokens=int(outputs["last_hidden_state"].shape[1]),
+            n_dense_tokens=int(input_ids.shape[1]),
+        )
+
+    def _assert_turn_alignment(self, n_vectors: int, n_targets: int,
+                               input_ids: torch.Tensor) -> None:
+        """Turn k's vector must line up with target k.
+
+        A tokenizer or windowing change that shifts the count would otherwise train
+        silently against mismatched pairs.
+        """
+        if n_vectors == n_targets:
+            return
+        tail = input_ids[0, -64:].tolist()
+        raise RuntimeError(
+            f"found {n_vectors} assistant turn span(s) but got {n_targets} target(s). "
+            f"prefix={self.model_cfg.prefix!r} postfix={self.model_cfg.postfix!r} "
+            f"shift_left={self.model_cfg.shift_left}. Last 64 input_ids: {tail}"
+        )
+
     # -- the objective -----------------------------------------------------------------
     def _elementwise_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         kind = self.loss_cfg.kind
@@ -799,49 +899,11 @@ class TurnVectorRegressor(nn.Module):
         the model; `pop_from` owns the entire `modality_*` prefix and raises on a key it
         does not recognise rather than letting one through.
         """
-        backbone_inputs.pop("labels", None)
-        modality = ModalityBatch.pop_from(
-            backbone_inputs, known_keys=self.modality_embedder.keys
-        )
-        # The context wraps only the backbone call: entering it twice under one context
-        # trips the consume-once assert instead of silently reusing the same values.
-        with self.modality_embedder.pending(modality):
-            outputs = self.backbone(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-                logits_to_keep=1,  # never materialize (B, S, vocab); the LM head is unused
-                **backbone_inputs,
-            )
-
-        # `head=None` and pool explicitly, so the motion head and the stop head read the
-        # same pooled context from one extraction rather than two. `self.head(states,
-        # mask)` below is the exact call `extract_turn_vectors` would have made internally.
-        states, spans, span_mask = extract_turn_vectors(
-            outputs,
-            input_ids,
-            None,
-            prefix_ids=self.prefix_ids,
-            postfix_ids=self.postfix_ids,
-            shift_left=self.model_cfg.shift_left,
-            strict=True,
-            return_mask=True,
-        )
-        vectors = self.head(states, span_mask)
-        # The alignment gate. Turn k's vector must line up with target k; a tokenizer or
-        # windowing change that shifts the count would otherwise train silently against
-        # mismatched pairs.
-        if vectors.shape[0] != targets.shape[0]:
-            tail = input_ids[0, -64:].tolist()
-            raise RuntimeError(
-                f"found {vectors.shape[0]} assistant turn span(s) but got "
-                f"{targets.shape[0]} target(s). prefix={self.model_cfg.prefix!r} "
-                f"postfix={self.model_cfg.postfix!r} "
-                f"shift_left={self.model_cfg.shift_left}. Last 64 input_ids: {tail}"
-            )
-
-        if self.train_content_len is None and spans:
-            self.train_content_len = int(len(spans[0]))
+        enc = self.encode_turns(input_ids, attention_mask, **backbone_inputs)
+        # `head.project(enc.pooled)` is exactly `self.head(states, span_mask)`; going
+        # through the pooled seam keeps this identical to what the harvest records.
+        vectors = self.head.project(enc.pooled)
+        self._assert_turn_alignment(vectors.shape[0], targets.shape[0], input_ids)
         targets = targets.to(next(self.head.parameters()).dtype).to(vectors.device)
         pred = vectors.view(-1, *self.target_shape)
         tgt_norm = self.normalizer.normalize(targets)
@@ -863,7 +925,7 @@ class TurnVectorRegressor(nn.Module):
         motion_loss = loss
         stop_extra: Dict[str, torch.Tensor] = {}
         if self.stop_head is not None:
-            pooled = self.head.pooled_context(states, span_mask)
+            pooled = enc.pooled
             if self.stop_head.cfg.stop_grad:
                 # The constraint that makes this head free. Detached, the stop gradient
                 # reaches the stop head's own parameters and stops: not the backbone, not
@@ -906,10 +968,8 @@ class TurnVectorRegressor(nn.Module):
                 "sum_abs_err": err.abs().sum(0),
                 "n_rows": torch.tensor(err.shape[0], device=err.device),
                 "n_turns": torch.tensor(pred.shape[0], device=err.device),
-                "n_tokens": torch.tensor(
-                    outputs["last_hidden_state"].shape[1], device=err.device
-                ),
-                "n_dense_tokens": torch.tensor(input_ids.shape[1], device=err.device),
+                "n_tokens": torch.tensor(enc.n_sparse_tokens, device=err.device),
+                "n_dense_tokens": torch.tensor(enc.n_dense_tokens, device=err.device),
                 "n_steps": torch.tensor(1, device=err.device),
             }
         return {"loss": loss, **metrics, **stop_extra}
@@ -1159,13 +1219,20 @@ class TurnVectorSFTTrainer(Trainer):
       `_save` / `_load_from_checkpoint`  save/restore adapter + head only.
     """
 
+    # Both reasons for the B == 1 rule are properties of the backbone: the sparse model
+    # unions its visual keep mask across the batch, and turn extraction indexes row 0.
+    # A subclass that has no backbone (head-only training on cached trunk states) has
+    # neither, and batching there is the whole point -- so the rule is a class attribute
+    # to be turned off deliberately rather than a constant to be worked around.
+    requires_unit_batch = True
+
     def __init__(self, *args, data_config: Optional[DataConfig] = None,
                  eval_data_collator: Optional[Any] = None, **kwargs):
         super().__init__(*args, **kwargs)
         # Eval must not use the train collator: that one samples a *random* turn window
         # per row, so eval numbers would move for reasons unrelated to the model.
         self.eval_data_collator = eval_data_collator
-        if self.args.per_device_train_batch_size != 1:
+        if self.requires_unit_batch and self.args.per_device_train_batch_size != 1:
             raise ValueError(
                 "per_device_train_batch_size must be 1: the sparse backbone unions its "
                 "visual keep mask across the batch (modeling.py) and turn extraction "
