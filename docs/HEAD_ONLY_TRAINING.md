@@ -273,7 +273,61 @@ Useful controls:
 
 * `--context-key context` -- freeze the source head too, train only the flow.
 * `--init-flow <marginal.pt>` -- the same warm start `train_flow_sft.py` takes.
+* `--store-shards 11,9,11,9` -- pin each store part to a shard prefix. **Use this whenever
+  a run has to be compared to an earlier one and the harvest is still running.** A harvest
+  is appendable, so the same `--store` path grows between runs; `split_by_episode` then
+  recuts over the larger episode list and the later run trains on rows the earlier one held
+  out. Nothing raises, and the two runs' held-out numbers are simply not about the same
+  thing. Shards are appended in order and never rewritten, so a prefix is exactly the
+  snapshot that existed at some past moment.
 * `--no-wandb` -- everything still lands in `trainer_state.json`.
+
+## Changing the support: `--target-filter`
+
+Fits the density on a subset of chunks, to ask what a piece of the data's structure is
+costing. Modes (`head_only.chunk_motion_mask`, defined on per-tick differentials via the
+objective's own `decompose_chunk`, not on the stored anchor-relative poses):
+
+| mode | keeps |
+|---|---|
+| `none` | everything |
+| `translating` | chunks with at least one tick where `max(\|dx\|,\|dy\|) >= --filter-tol` |
+| `dx_free` | chunks whose every tick has `\|dx\| >= --filter-tol` |
+| `all_move` | chunks whose every one of the `T x 3` dims exceeds `--filter-tol` |
+
+Three things about it are deliberate:
+
+* **The filter runs after the episode split**, so every arm holds out the same episodes and
+  only the fitted rows differ. Filtering first would change what is held out as well as what
+  is fitted, and the difference between two arms would be uninterpretable.
+* **Selection is per chunk, never per tick.** Masking individual dims out of the likelihood
+  is the tempting alternative and it is unsound here: `ConditionalFlow` is an affine-coupling
+  flow, so `z` depends on the whole input vector and dropping a dim's log-density terms does
+  not marginalise it out -- the masked value keeps driving every surviving term through the
+  conditioner. The objective would train, print a loss, and be a normalised density of
+  nothing. Marginalising properly means a different model (an explicit gate plus a
+  conditional flow), not a flag.
+* **`nll_*` is not comparable across a change of support.** A density on a subset has a
+  different normalisation, so `nll_headroom` differences between differently-filtered runs
+  measure the filter. The run prints this warning itself. The band statistics (`creep_*`,
+  `stop_*`) and the reconstruction errors are what transfer.
+
+Because each run's own eval is on its own support, comparing arms needs a common yardstick:
+
+```bash
+PYTHONPATH=src python data_scripts/eval_head_only.py \
+  --store dump/head_only/ctx_v9_ck11400/part{0,1,2,3} --store-shards 11,9,11,9 \
+  --checkpoint baseline=dump/head_only/run_A_pooled/final \
+  --checkpoint filtered=dump/head_only/atom_filter/F2_all_move/final \
+  --support none --support all_move --out .../cross_support_eval.json
+```
+
+Every checkpoint is scored on every named support, off one episode split, through
+`HeadOnlyFlowTrainer.evaluate` -- the identical code that produced the numbers inside each
+run -- with `sigma_mult` forced to 1.0 so the noise floor, and therefore `min_nll_per_dim`,
+is the same on all of them. Reading a model on *another* arm's support is the point, not an
+abuse: it is what separates "this model creeps less" from "this model was scored on easier
+rows".
 
 ## Evaluating a reattached checkpoint
 
