@@ -75,9 +75,13 @@ row** (`pooled` 2048 + `context` 1024 + `targets` 20x3 + `pose` 3, all float32) 
 221,090-row / 4,672-episode harvest occupying 2.58 GiB. The full 39,061-episode train split
 extrapolates to ~1.85M rows and ~23 GB.
 
-Harvest throughput, measured on one H100 with four workers on four GPUs: **~26 rows/s per
-worker**, ~1.9 s/episode, so ~104 rows/s aggregate. The full corpus is therefore around
-five hours wall-clock on four GPUs, and is worth doing once.
+Harvest throughput, four workers on four H100s: **~26 rows/s per worker** (~1.9 s/episode,
+~104 rows/s aggregate) with the cards otherwise idle, falling to **~16 rows/s** once
+head-only training runs share them. A completed 1500-episode worker averaged 16.0 rows/s /
+2.96 s/episode end to end under that contention, for 70,981 rows in 0.829 GiB. So the full
+39k train split is roughly five hours on four dedicated GPUs and closer to eight if you are
+training on them at the same time -- either way a once-only cost, and part of why the
+harvest is resumable.
 
 * `.npz` -- what the prior work used -- is a zip container. It cannot be memory-mapped and
   every read decompresses whole arrays into RAM. Fine at 11k rows, impossible at 2M.
