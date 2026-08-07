@@ -153,6 +153,27 @@ differs.
 `eval_sparse_tokens` and `eval_dense_tokens` are 0 here rather than absent, because there
 was no sequence. That is true, and it is a useful marker that a log came from this pipeline.
 
+## Two analysis traps
+
+Both of these reverse the conclusion if read carelessly, and both bit during this
+pipeline's own first analysis.
+
+**`nll_headroom` is measured against a moving floor during the sigma anneal.**
+`min_nll_per_dim` falls ~4.6 nats over a 1000-step anneal from `sigma_start = 100`, so
+headroom grows during the anneal whatever the model does. Read across the boundary, v12
+looks like it goes 1.67 -> 3.96 and is losing ground; read only after the floor settles at
+-9.495, v12's headroom **shrinks**, 4.07 -> 3.94. `dump/head_only/compare_to_v12.py`
+splits the two phases and labels every row `ANNEAL` or `post`.
+
+**`grad_norm` is confounded by the learning-rate schedule.** With `--lr-scheduler cosine`,
+a short run spends most of its length at a decaying rate and its gradient norm falls for
+that reason alone. A 2000-step run of this pipeline peaks at 256 around step 1050 and
+descends to 48 -- which looks like stability and is mostly the cosine. The same
+configuration at 8000 steps is still climbing at step 3000, where the rate is still ~78%
+of peak. v12 died at step 2366 of a 20000-step cosine, i.e. at ~99% of peak rate, so its
+monotone climb is the one measured at nearly constant rate. Compare gradient norms only at
+comparable points of the schedule, or with `--lr-scheduler constant`.
+
 ## The collapse diagnostics
 
 Logged per eval, on a fixed held-out probe split:
