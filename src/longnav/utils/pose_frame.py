@@ -95,15 +95,31 @@ def relative_se2(poses: Any) -> torch.Tensor:
     return torch.stack([rel_x, rel_y, rel_t], dim=1).float()
 
 
-def relative_se2_last(poses: Any) -> torch.Tensor:
-    """`relative_se2(poses)[-1]`, shaped `(1, 3)` -- the rollout's per-step form.
+def relative_se2_tail(poses: Any, k: int = 1) -> torch.Tensor:
+    """`relative_se2(poses)[-k:]`, shaped `(k, 3)` -- the rollout's per-step form.
 
-    The rollout has one new pose per step but must express it against the episode's first
-    observation, so it keeps every raw pose it has seen and re-derives the current one.
-    Deliberately the whole-sequence function and not a two-row shortcut: the shortcut is
-    algebraically equal and would be one more thing that can quietly stop being equal.
+    The rollout accumulates the raw rows of the value column and re-derives the ones it
+    has just added, because every row is expressed against **row 0 of the whole column**
+    and that row has to survive the whole episode. Deliberately the whole-sequence
+    function and not an incremental shortcut: the shortcut is algebraically equal and
+    would be one more thing that can quietly stop being equal.
+
+    `k > 1` exists for PointNav, where one *step* can write more than one marker: a goal
+    announcement writes the agent's pose and the goal's, and both are rows of the same
+    column. Feeding them through separate calls would work too; feeding them through the
+    same accumulator is what makes the k-th marker's row the k-th row, which is the only
+    binding the modality mechanism has.
     """
+    if k < 1:
+        raise ValueError(f"relative_se2_tail needs k >= 1, got {k}")
     rel = relative_se2(poses)
-    if rel.shape[0] == 0:
-        raise ValueError("relative_se2_last needs at least one pose")
-    return rel[-1:]
+    if rel.shape[0] < k:
+        raise ValueError(
+            f"relative_se2_tail({k}) needs at least {k} pose(s), got {rel.shape[0]}"
+        )
+    return rel[-k:]
+
+
+def relative_se2_last(poses: Any) -> torch.Tensor:
+    """`relative_se2(poses)[-1]`, shaped `(1, 3)`. `relative_se2_tail(poses, 1)`."""
+    return relative_se2_tail(poses, 1)

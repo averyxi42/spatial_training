@@ -1001,3 +1001,197 @@ class TestRolloutConfigDefaultsAreInert:
     def test_goal_block_refuses_without_a_marker(self):
         with pytest.raises(ValueError, match="goal_marker"):
             goal_block_content(RolloutConfig())
+
+    def test_goal_placement_defaults_to_none_and_leaves_the_turn_alone(self, processor):
+        """The field a rollout has to be told. Unset, `render_user_block` is what it was."""
+        cfg = RolloutConfig(modality_marker="<pose>", goal_marker="<pose>")
+        assert cfg.goal_placement is None
+        assert (render_user_block(processor, cfg, 2)
+                == render_user_block(processor, cfg, 2, inline_goal=False))
+
+
+# ==========================================================================
+# The rollout's row order IS the formatter's row order
+# ==========================================================================
+# `modality_value_rows` orders a whole episode's rows; `PointNavValueStream` produces the
+# same order one event at a time, because a rollout does not have the episode in front of
+# it. Two producers of one order is exactly the shape of divergence this design exists to
+# prevent, so the equality is asserted here rather than argued in a docstring: if the
+# stream ever stops reproducing the batch function, the k-th marker stops receiving the
+# k-th row and the model reads a well-formed vector meaning something else.
+from longnav.utils.pose_frame import relative_se2_tail  # noqa: E402
+from longnav.utils.vector_rollout import (  # noqa: E402
+    GOAL_PLACEMENTS,
+    PointNavValueStream,
+    modality_value_rows,
+    pointnav_context_text,
+    render_user_block,
+)
+
+
+def _stream_rows(example, placement):
+    """Drive the incremental stream over an episode, exactly as a rollout would.
+
+    Announce whenever the segment index changes (which is what `segment_starts` means),
+    then one `observe` per observation turn. The caller does not branch on the placement
+    -- that is the stream's job -- which is what makes this a fair comparison.
+    """
+    stream = PointNavValueStream(placement)
+    starts = segment_starts(example["segment_indices"])
+    rows = []
+    for i, pose in enumerate(example["obs_poses"]):
+        if i in starts:
+            rows += stream.announce(pose, example["obs_goals"][i])
+        rows += stream.observe(pose)
+    assert rows == stream.rows, "the stream's own record disagrees with what it returned"
+    return rows
+
+
+class TestStreamMatchesTheBatchOrdering:
+    @pytest.mark.parametrize("placement", list(GOAL_PLACEMENTS))
+    def test_incremental_and_whole_episode_orders_are_identical(self, placement):
+        ex = _pointnav_example(n_obs=9, segment_lengths=(4, 2, 3))
+        batch = modality_value_rows(ex["obs_poses"], ex["obs_goals"],
+                                    ex["segment_indices"], placement)
+        assert _stream_rows(ex, placement) == [[float(v) for v in row] for row in batch]
+
+    @pytest.mark.parametrize("placement", list(GOAL_PLACEMENTS))
+    def test_a_single_segment_episode_is_the_eval_case(self, placement):
+        """One point goal for the whole episode -- what the eval harness runs. It is the
+        degenerate chained episode, not a separate code path."""
+        ex = _pointnav_example(n_obs=5, segment_lengths=(5,))
+        rows = _stream_rows(ex, placement)
+        assert rows == [[float(v) for v in r] for r in modality_value_rows(
+            ex["obs_poses"], ex["obs_goals"], ex["segment_indices"], placement)]
+        assert len(rows) == expected_modality_len(5, 1, placement)
+
+    def test_row_zero_is_the_agent_pose_the_first_observation_will_report(self):
+        """Row 0 anchors the whole column. In the rollout the announcement happens before
+        observation 0 is rendered -- but the robot has not moved between them, so the
+        announced pose IS observation 0's pose, exactly as in the training row."""
+        ex = _pointnav_example()
+        for placement in GOAL_PLACEMENTS:
+            rows = _stream_rows(ex, placement)
+            assert rows[0] == [float(v) for v in ex["obs_poses"][0]]
+
+    def test_observe_before_announce_is_an_error_not_an_empty_goal(self):
+        with pytest.raises(RuntimeError, match="observe\\(\\) before announce\\(\\)"):
+            PointNavValueStream("segment").observe([0.0, 0.0, 0.0])
+
+    def test_an_unknown_placement_is_rejected_by_both_producers(self):
+        with pytest.raises(ValueError, match="goal_placement"):
+            PointNavValueStream("everywhere")
+        with pytest.raises(ValueError, match="goal_placement"):
+            modality_value_rows([[0, 0, 0]], [[1, 1, 0]], [0], "everywhere")
+
+    def test_a_goal_column_out_of_step_with_the_poses_raises(self):
+        """The counts would still add up per turn, so nothing downstream would notice."""
+        with pytest.raises(ValueError, match="goal column is per observation"):
+            modality_value_rows([[0, 0, 0], [1, 0, 0]], [[9, 9, 0]], [0, 0], "segment")
+
+
+class TestRolloutValuesMatchTheCollator:
+    """The transform, over the interleaved column. `pose_rows` is the rollout's side."""
+
+    @pytest.mark.parametrize("placement", list(GOAL_PLACEMENTS))
+    def test_stepwise_pose_rows_reproduce_the_collated_column(self, placement):
+        from longnav.utils.vector_rollout import VectorRolloutPolicy
+
+        ex = _pointnav_example(n_obs=8, segment_lengths=(3, 5))
+        rows = torch.tensor(_stream_rows(ex, placement), dtype=torch.float64)
+        collated = POSE_SPEC.apply_transform(rows.float())
+
+        # The rollout feeds the same rows in the same order, but in the batches one step
+        # writes: an announcement's two rows arrive together with the turn's one.
+        policy = object.__new__(VectorRolloutPolicy)
+        policy._raw_poses = []
+        stream = PointNavValueStream(placement)
+        starts = segment_starts(ex["segment_indices"])
+        stepwise = []
+        for i, pose in enumerate(ex["obs_poses"]):
+            batch = []
+            if i in starts:
+                batch += stream.announce(pose, ex["obs_goals"][i])
+            batch += stream.observe(pose)
+            stepwise.append(policy.pose_rows(batch))
+        assert torch.allclose(torch.cat(stepwise, dim=0), collated, atol=1e-6)
+
+    def test_relative_se2_tail_is_relative_se2_sliced(self):
+        poses = _episode(n=9, seed=21)
+        rel = relative_se2(poses)
+        for k in (1, 2, 3):
+            assert torch.equal(relative_se2_tail(poses, k), rel[-k:])
+        assert torch.equal(relative_se2_last(poses), rel[-1:])
+        with pytest.raises(ValueError):
+            relative_se2_tail(poses[:2], 3)
+
+
+class TestPointNavRolloutTextMatchesTraining:
+    """Token-exact, as `test_rollout_text_matches_the_training_conversation` is for
+    ObjectNav. If these drift the rollout feeds the head a context it never trained on --
+    and the marker COUNT would still match, so nothing would raise."""
+
+    @pytest.mark.parametrize("placement", list(GOAL_PLACEMENTS))
+    def test_the_rollout_context_equals_the_formatted_conversation(self, processor,
+                                                                  placement):
+        ex = dict(_pointnav_example(n_obs=6, segment_lengths=(2, 4)))
+        build_messages(ex, "**____**", "goal_text", "images",
+                       modality_marker="<pose>", goal_marker="<pose>",
+                       goal_placement=placement)
+        training = processor.apply_chat_template(ex["messages"], tokenize=False)
+
+        cfg = RolloutConfig(modality_marker="<pose>", goal_marker="<pose>",
+                            goal_placement=placement)
+        rollout = pointnav_context_text(
+            processor, cfg, n_turns=6,
+            goal_turns=segment_starts(ex["segment_indices"]),
+            system_prompt=POINTNAV_SYSTEM_PROMPT,
+        )
+        assert rollout == training
+
+    def test_queue_user_block_owes_exactly_the_goal_block_to_the_next_step(self, processor):
+        """The mechanism the rollout announces a goal with.
+
+        `step()` forwards `self._pending + <this turn's user block> + emit_ids`, so
+        queuing the announcement's tokens is what puts it *before* the next turn -- and
+        the value rows are queued in the same call, because "before in the text" and
+        "before in the rows" have to be one statement. Checked without a backbone: what
+        is under test is the composition, not the forward pass.
+        """
+        from longnav.utils.modality_embed import ModalityBatch
+        from longnav.utils.vector_rollout import (
+            VectorRolloutPolicy,
+            render_goal_block,
+        )
+
+        cfg = RolloutConfig(modality_marker="<pose>", goal_marker="<pose>",
+                            goal_placement="segment")
+        policy = object.__new__(VectorRolloutPolicy)
+        policy.processor = processor
+        policy.cfg = cfg
+        policy._pending = []
+        policy._pending_modality = None
+
+        text = render_goal_block(processor, cfg)
+        policy.queue_user_block(text, {"pose": [[0.0, 0.0, 0.0], [1.0, 2.0, 0.5]]})
+        assert processor.tokenizer.decode(policy._pending) == text
+        assert isinstance(policy._pending_modality, ModalityBatch)
+        assert policy._pending_modality.values["pose"].shape == (2, 3)
+
+        # A second queued block appends, in order -- two goals cannot arrive between the
+        # same pair of turns, but the concatenation must be order-preserving anyway.
+        policy.queue_user_block(text, {"pose": [[3.0, 0.0, 0.0], [4.0, 0.0, 0.0]]})
+        assert policy._pending_modality.values["pose"].shape == (4, 3)
+        assert policy._pending_modality.values["pose"][2].tolist() == [3.0, 0.0, 0.0]
+
+    @pytest.mark.parametrize("placement", list(GOAL_PLACEMENTS))
+    def test_the_marker_count_in_that_text_equals_the_row_count(self, processor, placement):
+        ex = _pointnav_example(n_obs=6, segment_lengths=(2, 4))
+        cfg = RolloutConfig(modality_marker="<pose>", goal_marker="<pose>",
+                            goal_placement=placement)
+        text = pointnav_context_text(
+            processor, cfg, n_turns=6,
+            goal_turns=segment_starts(ex["segment_indices"]),
+            system_prompt=POINTNAV_SYSTEM_PROMPT,
+        )
+        assert text.count("<pose>") == len(_stream_rows(ex, placement))

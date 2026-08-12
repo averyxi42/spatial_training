@@ -42,64 +42,30 @@ from datasets import DatasetDict, load_from_disk
 # string, and a silent divergence between the two would change the head's input
 # distribution at deployment without any error.
 from longnav.utils.vector_rollout import DEFAULT_SYSTEM_PROMPT as SYSTEM_PROMPT
+# `segment_starts` / `modality_values` / `expected_modality_len` used to live here, next
+# to `build_messages`. They now live in `vector_rollout.py` and are imported, for the same
+# reason `SYSTEM_PROMPT` is: the ROLLOUT has to produce the same row order for the same
+# conversation, and it cannot import a data script. One definition, two callers -- rather
+# than two definitions that agree today. They are re-exported by this import, so
+# `from format_action_chunk_dataset import modality_values` still resolves.
 from longnav.utils.vector_rollout import (
+    GOAL_PLACEMENTS,
     SYSTEM_PROMPTS,
     RolloutConfig,
+    expected_modality_len,
+    anchor_suffix,
     goal_block_content,
+    modality_values,
+    segment_starts,
     user_block_content,
 )
 
-
-def segment_starts(segment_indices) -> set:
-    """Observation indices at which a new goal is introduced.
-
-    The first observation always is (index 0), and thereafter wherever the segment index
-    changes. Derived from the column rather than stored, because the column is already the
-    definition and a second representation could only disagree with it.
-    """
-    if not segment_indices:
-        return set()
-    starts = {0}
-    for i in range(1, len(segment_indices)):
-        if segment_indices[i] != segment_indices[i - 1]:
-            starts.add(i)
-    return starts
-
-
-def modality_values(example, modality_column: str, goal_values_column: str,
-                    segment_column: str, goal_placement: str):
-    """The value rows for the `<pose>` column, **in the order the markers appear in text**.
-
-    That order is the entire contract of the modality mechanism -- the k-th occurrence of
-    the marker receives the k-th row -- so this function and `build_messages` have to
-    agree exactly, and are deliberately adjacent.
-
-      * `segment`     -> at each goal announcement, `[agent pose, goal]`, then that
-                         segment's observation poses. Length `n_obs + 2 * n_segments`.
-      * `observation` -> `[agent pose, goal]` per turn. Length `2 * n_obs`.
-
-    In both, row 0 is an **agent** pose, which is what makes `relative_se2`'s anchor mean
-    the same thing here as in an ObjectNav row.
-    """
-    poses = example[modality_column]
-    goals = example[goal_values_column]
-    if goal_placement == "observation":
-        return [v for pair in zip(poses, goals) for v in pair]
-
-    starts = segment_starts(example.get(segment_column) or [])
-    values = []
-    for i, pose in enumerate(poses):
-        if i in starts:
-            values += [pose, goals[i]]
-        values.append(pose)
-    return values
-
-
-def expected_modality_len(n_obs: int, n_segments: int, goal_placement: str) -> int:
-    """How many value rows `modality_values` will produce, for the alignment filter."""
-    if goal_placement == "observation":
-        return 2 * n_obs
-    return n_obs + 2 * n_segments
+__all__ = [
+    "build_messages",
+    "expected_modality_len",
+    "modality_values",
+    "segment_starts",
+]
 
 
 def build_messages(example, placeholder: str, goal_column: str, images_column: str,
@@ -134,13 +100,25 @@ def build_messages(example, placeholder: str, goal_column: str, images_column: s
     goal = example.get(goal_column) or "the goal object"
     task = example.get(task_column) or "objectnav"
     prompt = SYSTEM_PROMPTS.get(task, SYSTEM_PROMPT)
-    cfg = RolloutConfig(modality_marker=modality_marker, goal_marker=goal_marker)
+    # `goal_placement` rides on the config so `render_user_block` derives `inline_goal`
+    # from the same field the rollout does; `inline` below stays explicit because
+    # `user_block_content` is the shared primitive and takes it directly.
+    cfg = RolloutConfig(modality_marker=modality_marker, goal_marker=goal_marker,
+                        goal_placement=goal_placement if goal_marker else None)
     inline = bool(goal_marker) and goal_placement == "observation"
+    # Both `segment` and `anchor` emit an announcement message wherever the goal changes;
+    # they differ only in what that message says and in whether the prologue carries the
+    # frame anchor. `observation` emits none, carrying the goal inline instead.
     starts = (segment_starts(example.get(segment_column) or [])
-              if goal_marker and goal_placement == "segment" else set())
+              if goal_marker and goal_placement in ("segment", "anchor") else set())
 
+    # Under the `anchor` placement the frame is set once, here, by a single agent pose in
+    # the prologue; each later announcement then carries the goal alone. Empty string for
+    # every other placement, so the prompt is byte-identical to what it always was.
     messages = [
-        {"role": "user", "content": [{"type": "text", "text": prompt.format(goal=goal)}]}
+        {"role": "user",
+         "content": [{"type": "text",
+                      "text": prompt.format(goal=goal) + anchor_suffix(cfg)}]}
     ]
     for i in range(len(example[images_column])):
         if i in starts:
@@ -179,6 +157,11 @@ def main():
                         "the model's modality spec -- for pose that is `obs_poses`, which "
                         "is already carried through untouched. Omit for the classic "
                         "no-marker conversations")
+    # NOTE: the conventional value, `obs_poses`, is a misnomer -- the column holds a
+    # mixed occurrence-ordered stream of agent AND goal poses, exactly as `images` would
+    # hold observation and goal images. A rename to `poses` is queued; see
+    # docs/column_naming.md before changing it, because the spec file and every corpus on
+    # disk have to move in the same commit.
     p.add_argument("--modality-column", default=None,
                    help="column that must be 1:1 with the observations when "
                         "--modality-marker is set (e.g. 'obs_poses'). Rows that disagree "
@@ -191,7 +174,7 @@ def main():
     p.add_argument("--goal-values-column", default="obs_goals",
                    help="column holding the per-observation goal poses. Distinct from "
                         "--goal-column, which is the goal *text*")
-    p.add_argument("--goal-placement", choices=("segment", "observation"),
+    p.add_argument("--goal-placement", choices=GOAL_PLACEMENTS,
                    default="segment",
                    help="segment: its own user message wherever a new goal is introduced. "
                         "observation: repeated in every turn, like a PointGoal sensor")

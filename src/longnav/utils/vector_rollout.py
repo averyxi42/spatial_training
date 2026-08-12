@@ -133,12 +133,32 @@ class RolloutConfig:
     # SECOND occurrence per turn (or per segment), and a caller should have to say so.
     # None -> no goal marker anywhere, which is exactly what every run before this did.
     goal_marker: Optional[str] = None
+    # WHERE the goal marker goes -- the same choice `format_action_chunk_dataset.py
+    # --goal-placement` made when the corpus was written, and therefore a property of the
+    # DATA rather than of the weights. It is not recorded in the checkpoint, so a rollout
+    # has to be told; telling it wrong writes the markers somewhere the model never saw
+    # them, with the counts still adding up. None -> no goal anywhere, which is exactly
+    # what every ObjectNav run does and is byte-identical to this field not existing.
+    goal_placement: Optional[str] = None
     # The per-segment announcement, when a goal is introduced. Carries the agent's own
     # pose as well as the goal's, and that is load-bearing rather than decorative: it puts
     # an AGENT pose at row 0 of the value column, so `relative_se2`'s anchor means the same
     # thing here as in an ObjectNav row. With `Go to {marker}.` alone, row 0 would be the
     # goal and the two tasks would sit in different frames with nothing to detect it.
     goal_announce_text: str = "You are at {marker}. Go to {marker}."
+    # The `anchor` placement's two strings. The frame is set ONCE, in the prologue, and
+    # every later announcement is just the goal.
+    #
+    # This supersedes `goal_announce_text` for that placement, and it is strictly better.
+    # Repeating "You are at {marker}" at every announcement puts an agent pose at row 0 --
+    # which is the point -- but it also emits a row that EXACTLY duplicates the very next
+    # observation's pose. Measured on a real 198-observation, 19-segment episode: 19 of 19
+    # announcement agent-rows were bit-identical to the observation that followed, i.e.
+    # 8.1% of the column carried no information. Anchoring once leaves a single such row
+    # (0.4%) and keeps row 0 an agent pose, so the frame still means the same thing it
+    # means in an ObjectNav row.
+    anchor_text: str = "You are at {marker}."
+    goal_only_text: str = "Go to {marker}."
     # The alternative placement: the goal repeated inside every observation block.
     goal_inline_text: str = "Goal: {marker}"
     use_sparse: bool = True
@@ -202,7 +222,19 @@ def goal_block_content(cfg: RolloutConfig) -> List[Dict[str, Any]]:
     """
     if not cfg.goal_marker:
         raise ValueError("goal_block_content needs RolloutConfig.goal_marker")
-    return [{"type": "text", "text": cfg.goal_announce_text.format(marker=cfg.goal_marker)}]
+    text = (cfg.goal_only_text if cfg.goal_placement == "anchor"
+            else cfg.goal_announce_text)
+    return [{"type": "text", "text": text.format(marker=cfg.goal_marker)}]
+
+
+def anchor_suffix(cfg: RolloutConfig) -> str:
+    """The " You are at <pose>." appended to the prologue under the `anchor` placement.
+
+    Empty for every other placement, so the prompt is untouched where it always was.
+    """
+    if cfg.goal_placement != "anchor" or not cfg.goal_marker:
+        return ""
+    return " " + cfg.anchor_text.format(marker=cfg.goal_marker)
 
 
 def render_goal_block(processor, cfg: RolloutConfig) -> str:
@@ -211,9 +243,250 @@ def render_goal_block(processor, cfg: RolloutConfig) -> str:
     return processor.apply_chat_template([user], tokenize=False, add_generation_prompt=False)
 
 
-def render_user_block(processor, cfg: RolloutConfig, step: int) -> str:
-    """One turn's user block, ending with the chat template's assistant opening."""
-    user = {"role": "user", "content": user_block_content(cfg, step)}
+# ======================================================================================
+# PointNav: the order of the `<pose>` value rows
+# ======================================================================================
+# `<pose>` is ONE modality type playing the role `<image>` plays for vision: many
+# occurrences, one value row each, bound by occurrence order and nothing else. A goal pose
+# is simply another occurrence. So the entire contract of PointNav's conversation is:
+#
+#     the k-th `<pose>` marker in the rendered text receives the k-th value row,
+#     and row 0 is an AGENT pose.
+#
+# Row 0 matters because `pose_frame.relative_se2` anchors the whole column on it. With the
+# goal at row 0 a PointNav example would sit in a different frame from every ObjectNav
+# example, and nothing anywhere would raise.
+#
+# Everything below is the SINGLE definition of that order. `data_scripts/
+# format_action_chunk_dataset.py` imports it to rewrite the training column, and
+# `PointNavValueStream` is the same order produced one event at a time, for a rollout that
+# does not have the episode in front of it. A second, "equivalent" ordering is precisely
+# the divergence this design exists to prevent: it would agree today, drift later, raise
+# never, and the model would read confident nonsense while the run still printed a number.
+
+#: The two placements, as `format_action_chunk_dataset.py --goal-placement` means them.
+#: The literals are corpus provenance, so they live beside the function that orders rows.
+GOAL_PLACEMENTS = ("anchor", "segment", "observation")
+
+
+def segment_starts(segment_indices) -> set:
+    """Observation indices at which a new goal is introduced.
+
+    The first observation always is (index 0), and thereafter wherever the segment index
+    changes. Derived from the column rather than stored, because the column is already the
+    definition and a second representation could only disagree with it.
+    """
+    if not segment_indices:
+        return set()
+    starts = {0}
+    for i in range(1, len(segment_indices)):
+        if segment_indices[i] != segment_indices[i - 1]:
+            starts.add(i)
+    return starts
+
+
+def modality_value_rows(poses, goals, segment_indices=None, goal_placement="segment"):
+    """The value rows for the `<pose>` column, **in the order the markers appear in text**.
+
+      * `segment`     -> at each goal announcement, `[agent pose, goal]`, then that
+                         segment's observation poses. Length `n_obs + 2 * n_segments`.
+      * `observation` -> `[agent pose, goal]` per turn. Length `2 * n_obs`.
+
+    In both, row 0 is an **agent** pose. See the section header for why that is the whole
+    point rather than a detail.
+    """
+    if goal_placement not in GOAL_PLACEMENTS:
+        raise ValueError(
+            f"goal_placement must be one of {GOAL_PLACEMENTS}, got {goal_placement!r}"
+        )
+    poses, goals = list(poses), list(goals)
+    if len(poses) != len(goals):
+        raise ValueError(
+            f"{len(poses)} observation pose(s) against {len(goals)} goal(s); the goal "
+            "column is per observation, so a mismatch would bind every later row to the "
+            "wrong marker with the counts still adding up"
+        )
+    if goal_placement == "observation":
+        return [v for pair in zip(poses, goals) for v in pair]
+
+    starts = segment_starts(list(segment_indices or []))
+    if goal_placement == "anchor":
+        # The frame is set once, by a single agent pose in the prologue; each announcement
+        # then carries the goal alone. Row 0 is still an agent pose -- and still the same
+        # pose the first observation reports -- so the anchor means exactly what it means
+        # in an ObjectNav row, at the cost of one duplicated row per EPISODE rather than
+        # one per segment. Length `1 + n_segments + n_obs`.
+        values = [poses[0]] if poses else []
+        for i, pose in enumerate(poses):
+            if i in starts:
+                values.append(goals[i])
+            values.append(pose)
+        return values
+
+    values = []
+    for i, pose in enumerate(poses):
+        if i in starts:
+            values += [pose, goals[i]]
+        values.append(pose)
+    return values
+
+
+def modality_values(example, modality_column: str, goal_values_column: str,
+                    segment_column: str, goal_placement: str):
+    """:func:`modality_value_rows` over one dataset row -- the formatter's `.map` shape.
+
+    Deliberately a thin adapter: the ordering lives in one function and the column names
+    are the caller's business.
+    """
+    return modality_value_rows(
+        example[modality_column],
+        example[goal_values_column],
+        example.get(segment_column) or [],
+        goal_placement,
+    )
+
+
+def expected_modality_len(n_obs: int, n_segments: int, goal_placement: str) -> int:
+    """How many value rows :func:`modality_value_rows` produces, for the alignment filter."""
+    if goal_placement == "observation":
+        return 2 * n_obs
+    return n_obs + 2 * n_segments
+
+
+class PointNavValueStream:
+    """:func:`modality_value_rows`, produced one event at a time. For a rollout.
+
+    A rollout does not have the episode: it is told a new goal when it reaches the last
+    one, and it emits value rows as the text is written, turn by turn. This is that same
+    order in incremental form, and it exists so the rollout does not need its own copy of
+    the ordering rule.
+
+    The equality is not argued, it is asserted: `tests/test_pose_injection.py` drives this
+    class over an episode and compares the sequence it emits, row for row, against
+    :func:`modality_value_rows` on the same columns, for both placements.
+
+    Usage mirrors the text exactly -- announce a goal when one arrives, then one call per
+    observation turn::
+
+        stream = PointNavValueStream("segment")
+        rows = stream.announce(agent_pose, goal)   # [agent, goal] -- its own user message
+        rows = stream.observe(agent_pose)          # [agent]       -- this turn's marker
+
+    Under `observation` placement there is no announcement *message*: `announce` records
+    the goal and returns no rows, and `observe` returns `[agent, goal]`. Callers therefore
+    do not branch on the placement, which is the point -- a caller that branched would be
+    the second implementation.
+
+    `rows` keeps everything emitted, in order, so a caller can cheaply assert that its own
+    accumulator (the one `relative_se2` is computed over) has not drifted from it.
+    """
+
+    def __init__(self, goal_placement: str = "segment"):
+        if goal_placement not in GOAL_PLACEMENTS:
+            raise ValueError(
+                f"goal_placement must be one of {GOAL_PLACEMENTS}, got {goal_placement!r}"
+            )
+        self.goal_placement = goal_placement
+        self.goal: Optional[List[float]] = None
+        self.rows: List[List[float]] = []
+        self.goals_announced = 0
+        #: `anchor` only: the prologue's single agent-pose row, which sets the frame for
+        #: the whole episode and is emitted exactly once, before anything else.
+        self.anchored = False
+
+    @staticmethod
+    def _row(value) -> List[float]:
+        row = [float(v) for v in value]
+        if len(row) != 3:
+            raise ValueError(f"a pose row is (x, y, theta), got {len(row)} number(s): {row}")
+        return row
+
+    def announce(self, agent_pose, goal) -> List[List[float]]:
+        """A new goal arrives. Returns the rows its announcement message writes.
+
+        The agent's own pose comes **first** and that is load-bearing rather than
+        decorative: it is what puts an agent pose at row 0 of the column, so
+        `relative_se2`'s anchor means the same thing here as in an ObjectNav row.
+        Reversing the pair binds every value to the wrong slot with the counts still
+        matching and nothing raising.
+        """
+        self.goal = self._row(goal)
+        self.goals_announced += 1
+        if self.goal_placement == "anchor":
+            # The frame is set once, by a single agent pose in the prologue; every
+            # announcement after that carries the goal alone. The first announcement
+            # therefore emits BOTH -- the anchor and its goal -- and later ones only the
+            # goal. That is what removes the per-segment duplicate: under `segment` the
+            # announcement's agent row is bit-identical to the observation that follows
+            # it, measured 19 times out of 19 on a real episode.
+            emitted = []
+            if not self.anchored:
+                emitted.append(self._row(agent_pose))
+                self.anchored = True
+            emitted.append(list(self.goal))
+            self.rows += emitted
+            return emitted
+        if self.goal_placement != "segment":
+            return []
+        emitted = [self._row(agent_pose), list(self.goal)]
+        self.rows += emitted
+        return emitted
+
+    def observe(self, agent_pose) -> List[List[float]]:
+        """One observation turn. Returns the rows that turn's markers write."""
+        if self.goal is None:
+            raise RuntimeError(
+                "observe() before announce(): every PointNav turn is conditioned on a "
+                "goal, and under the 'observation' placement the turn's own text carries "
+                "one. Announce the first goal before the first observation."
+            )
+        emitted = [self._row(agent_pose)]
+        if self.goal_placement == "observation":
+            emitted.append(list(self.goal))
+        self.rows += emitted
+        return emitted
+
+
+def pointnav_context_text(processor, cfg: RolloutConfig, n_turns: int,
+                          goal_turns: Sequence[int] = (0,),
+                          system_prompt: Optional[str] = None) -> str:
+    """The exact text a PointNav rollout builds, for `n_turns` observations.
+
+    `goal_turns` are the observation indices a goal announcement precedes -- i.e.
+    `segment_starts(segment_indices)`. Must equal the training-time single-shot
+    `apply_chat_template` of the same conversation; `tests/test_pose_injection.py`
+    asserts that against `format_action_chunk_dataset.build_messages`, which is the
+    check that keeps the rollout's context in the distribution the head was trained on.
+    """
+    # `anchor` announces at the same turns `segment` does; the two differ in what the
+    # announcement SAYS and in whether the prologue carries the frame anchor, not in when
+    # it fires. `observation` announces never, carrying the goal inline instead.
+    announce = (set(int(t) for t in goal_turns)
+                if cfg.goal_placement in ("segment", "anchor") else set())
+    # The anchor rides on the prologue, exactly as `format_action_chunk_dataset` appends
+    # it there -- so the rollout's first tokens match the training conversation's.
+    prologue = (system_prompt + anchor_suffix(cfg)) if system_prompt else None
+    parts = [render_prologue(processor, prologue)] if prologue else []
+    for i in range(n_turns):
+        if i in announce:
+            parts.append(render_goal_block(processor, cfg))
+        parts.append(render_user_block(processor, cfg, i))
+        parts.append(cfg.placeholder + TURN_CLOSE)
+    return "".join(parts)
+
+
+def render_user_block(processor, cfg: RolloutConfig, step: int,
+                      inline_goal: Optional[bool] = None) -> str:
+    """One turn's user block, ending with the chat template's assistant opening.
+
+    `inline_goal` defaults to whether `cfg.goal_placement` is `"observation"`, so a
+    caller never has to restate the corpus's placement and cannot restate it differently.
+    With the default `goal_placement=None` this renders the block exactly as it always
+    did.
+    """
+    if inline_goal is None:
+        inline_goal = cfg.goal_placement == "observation"
+    user = {"role": "user", "content": user_block_content(cfg, step, inline_goal=inline_goal)}
     return processor.apply_chat_template([user], tokenize=False, add_generation_prompt=True)
 
 
@@ -270,6 +543,68 @@ def full_context_text(processor, cfg: RolloutConfig, n_turns: int,
         parts.append(render_user_block(processor, cfg, i))
         parts.append(cfg.placeholder + TURN_CLOSE)
     return "".join(parts)
+
+
+def seed_anchor(raw_poses: List[Any], offset: Optional[Sequence[float]],
+                first_row: Any) -> None:
+    """Diagnostic: move `relative_se2`'s origin **without touching the context**.
+
+        `relative_se2` anchors on row 0 of the accumulated column, so the only way to ask
+        "does the same task get harder when the anchor is further away" is to change what
+        row 0 is. This seeds it with a fictitious pose at `anchor_offset` from the first
+        real one, and the crucial property is that the seeded row is **never emitted**:
+        `accumulate_pose_rows` returns `relative_se2_tail(..., len(rows))`, the tail only.
+        So the number of value rows, the number of `<pose>` markers, the rendered text and
+        the images are all bit-identical to a run without it -- the *only* difference is
+        the numeric value of every injected pose, which is exactly the variable under test.
+        Inserting a real extra pose turn instead would change the context and confound the
+        thing being measured.
+
+        The offset carries `(dx, dy, dtheta)` and the two parts are deliberately separable,
+        because they test different things:
+
+          * `(dx, dy)` with `dtheta = 0` keeps the first pose's heading, so
+            `relative_se2`'s rotation into the anchor frame is unchanged and every injected
+            pose shifts by one constant vector. That isolates **distance** from the anchor.
+          * `dtheta` alone rotates the anchor's heading, which rotates the whole pose cloud
+            by `-dtheta` and shifts every injected heading by `-dtheta`. That isolates
+            **orientation** relative to the anchor -- whether the model is confused by
+            facing a direction far from the one the frame was pinned to.
+
+        Off (`anchor_offset=None`) leaves `_raw_poses` empty, which is what it always was.
+        """
+    if offset is None or raw_poses:
+        return
+    p = torch.as_tensor(first_row, dtype=torch.float64).reshape(-1)
+    dx, dy, dth = offset
+    raw_poses.append(
+        torch.tensor([p[0] + dx, p[1] + dy, p[2] + dth], dtype=torch.float64)
+    )
+
+
+def accumulate_pose_rows(raw_poses: List[Any], rows: Sequence[Any]) -> torch.Tensor:
+    """Append `rows` to the episode's raw column and return their `(K, 3)` injected values.
+
+    A free function over the accumulator rather than a method, because both
+    `VectorRolloutPolicy.pose_values` and `.pose_rows` are it and neither should be a
+    second copy -- and because that makes the *production* code runnable against a stub
+    carrying nothing but `_raw_poses`, which is how the parity tests in both repos avoid
+    loading a multi-billion-parameter backbone to check three floats.
+    """
+    from longnav.utils.pose_frame import POSE_DIM, relative_se2_tail
+
+    rows = list(rows)
+    if not rows:
+        raise ValueError("pose_rows needs at least one row")
+    for row in rows:
+        pose = torch.as_tensor(row, dtype=torch.float64).reshape(-1)
+        if pose.numel() != POSE_DIM:
+            raise ValueError(
+                f"a pose row must be {POSE_DIM} numbers (x, y, theta), got "
+                f"{tuple(pose.shape)}"
+            )
+        raw_poses.append(pose)
+    return relative_se2_tail(torch.stack(raw_poses), len(rows))
 
 
 class VectorRolloutPolicy:
@@ -423,7 +758,8 @@ class VectorRolloutPolicy:
 
     # ---------------------------------------------------------------------------------
     def reset(self, goal_text: Optional[str] = None, system_prompt: Optional[str] = None,
-              modality: Optional[Dict[str, Any]] = None):
+              modality: Optional[Dict[str, Any]] = None,
+              anchor_offset: Optional[Sequence[float]] = None):
         """Start a fresh episode. The prologue is prepended to the first turn's tokens.
 
         `modality` carries values for any markers in the **prologue** -- an episode-level
@@ -459,6 +795,17 @@ class VectorRolloutPolicy:
         # the origin has to survive the whole episode; `reset` is what makes a new episode
         # a new origin, which is exactly what a training window does.
         self._raw_poses: List[Any] = []
+        self._anchor_offset = None
+        if anchor_offset is not None:
+            off = [float(v) for v in anchor_offset]
+            if len(off) == 2:
+                off.append(0.0)
+            if len(off) != 3:
+                raise ValueError(
+                    "anchor_offset must be (dx, dy) or (dx, dy, dtheta), got "
+                    f"{len(off)} values"
+                )
+            self._anchor_offset = tuple(off)
         self.last_stats: Dict[str, Any] = {}
         return self
 
@@ -471,15 +818,48 @@ class VectorRolloutPolicy:
         second implementation of the frame convention to drift from, which is the failure
         this experiment could least afford to have and least easily notice.
         """
-        from longnav.utils.pose_frame import POSE_DIM, relative_se2_last
+        seed_anchor(self._raw_poses, getattr(self, '_anchor_offset', None), obs_pose)
+        return accumulate_pose_rows(self._raw_poses, [obs_pose])
 
-        pose = torch.as_tensor(obs_pose, dtype=torch.float64).reshape(-1)
-        if pose.numel() != POSE_DIM:
-            raise ValueError(
-                f"obs_pose must be {POSE_DIM} numbers (x, y, theta), got {tuple(pose.shape)}"
-            )
-        self._raw_poses.append(pose)
-        return relative_se2_last(torch.stack(self._raw_poses))
+    def pose_rows(self, obs_poses: Sequence[Any]) -> torch.Tensor:
+        """Record K raw rows of the value column and return their `(K, 3)` injected values.
+
+        The generalisation of :meth:`pose_values` to a step that writes more than one
+        `<pose>` marker -- PointNav's goal announcement writes two, the agent's pose and
+        the goal's. Both are rows of the *same* column, so both go through this one
+        accumulator: `relative_se2` anchors on row 0 of the whole column, and the k-th
+        marker in the text has to receive the k-th row. Keeping a separate stream for
+        goals would put them in a different frame and nothing would raise.
+
+        Order within `obs_poses` is the order the markers appear in the text. See
+        :class:`PointNavValueStream`, which is what decides that order.
+        """
+        if obs_poses:
+            seed_anchor(self._raw_poses, getattr(self, '_anchor_offset', None),
+                        list(obs_poses)[0])
+        return accumulate_pose_rows(self._raw_poses, obs_poses)
+
+    def queue_user_block(self, text: str, modality: Optional[Dict[str, Any]] = None) -> None:
+        """Owe an extra rendered user message, and its value rows, to the next `step()`.
+
+        The mechanism `reset()` already uses for the prologue, exposed: the tokens are
+        appended to `_pending` and the rows to `_pending_modality`, so both land *before*
+        the next turn's own tokens and rows. Occurrence order is the only binding the
+        modality mechanism has, so "before in the text" and "before in the rows" have to
+        be the same statement, and doing it in one call is what makes them one.
+
+        Used by PointNav's goal announcement (`render_goal_block`), which is its own user
+        message between two observation turns. Nothing in this method is PointNav-specific
+        -- what to say and what to bind to it is the caller's business.
+        """
+        self._pending += self.processor.tokenizer.encode(text, add_special_tokens=False)
+        if not modality:
+            return
+        batch = single_example_batch(modality)
+        self._pending_modality = (
+            batch if self._pending_modality is None
+            else self._pending_modality.concat(batch)
+        )
 
     def _render_prologue(self, system_prompt: str) -> str:
         return render_prologue(self.processor, system_prompt)
