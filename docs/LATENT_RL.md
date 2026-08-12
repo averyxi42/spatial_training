@@ -33,7 +33,15 @@ the policy.
   (images, text, `<pose>` values). Operationally: the pooled final-hidden readout.
 * `A` -- the action chunk, `(20, 3)` cumulative relative planar poses `[dx, dy, dtheta]` in
   the emitting pose's frame, in `FlowActionCodec`'s **scaled** space.
-* `c in R^1024` -- the latent intent.
+* `h = f_theta(o) in R^1024` -- the **deterministic readout**: the backbone's pooled state
+  through the readout MLP. This is the vector v3 calls `c` and feeds straight to the head.
+* `c in R^1024` -- the **latent intent**, a random variable drawn from a distribution
+  parameterised by `h`. In v3 there is no such thing; `h` went to the decoder directly.
+
+Keeping these two apart is not pedantry. `h` is a function of `o`, so conditioning on `h`
+conditions on (part of) `o`; `c` is *drawn*, so nothing that produces `c` may condition on
+it. The one-symbol collapse is how `q(c | o, A)` gets accidentally written as a function of
+`c`, which is circular.
 
 **Generative model.**
 
@@ -97,7 +105,7 @@ L = E_{c ~ q_xi} [ L_FM(A ; c) ]  +  beta * KL( q_xi(c|o,A) || p_phi(c|o) )
 ```
 Qwen3-VL-2B (hidden 2048, LoRA r=128 a=256, vision tower frozen)
   -> pool over assistant content span (pool_mode=mean, train_content_len=1)   (2048,)
-  -> readout MLP  2048 -> [1024] -> 1024, layer_norm=True                     (1024,) = c
+  -> readout MLP  2048 -> [1024] -> 1024, layer_norm=True                     (1024,) = h
   -> view(N, 8, 128)                        <- reshape only, NO projection
   -> FlowActionDecoder  d_model 128, 4 layers, 4 heads, ff 512, pre-norm
        mask: context bidirectional among itself + sees nothing else;
@@ -118,7 +126,7 @@ W_mu    = I (1024x1024)      b_mu    = 0
 W_sigma = 0                  b_sigma = log sigma_0
 ```
 
-**`PosteriorEncoder`** -- `(stopgrad(c), A) -> delta_mu`, output layer zero-initialised.
+**`PosteriorEncoder`** -- `(stopgrad(h), A) -> delta_mu`, output layer zero-initialised.
 See below.
 
 `fm_context_dim` stays 1024, so `FlowActionDecoder`'s
@@ -169,11 +177,45 @@ Free `sigma_q` (run 2) is not wrong -- KL's `log(sigma_p/sigma_q)` term already 
 `sigma_q -> 0` -- but it adds a second interacting knob with no benefit until run 1's number
 is in hand.
 
-### `q` is a residual on `p`, and `c` is detached into it
+### `q` conditions on `h`, not on `o` directly, and not on `c` ever
+
+`q_xi(c | o, A)` is entitled to all of `o`. It is given `h` instead, and that is a decision
+with a reason rather than a shortcut.
+
+`p` depends on `o` **only** through `h` -- by construction, since `mu_p` and `sigma_p` are
+maps of `h`. So any feature of `o` that `h` drops is a feature `p` cannot express. A `q` fed
+the full 2048-d pooled state could push `mu_q` along such a direction; `p` could not follow;
+the residual would show up as KL, and the KL is what sets `sigma_p`. The result reads as
+"the outcome is unpredictable here" when the truth is "the prior was not shown the relevant
+feature." Since `sigma_p` *is* the exploration distribution at RL time, that would mean
+exploring along directions that encode an architectural information gap. **Aligning `q`'s
+information set with `p`'s is what keeps the KL a measurement of what `A` adds.**
+
+The cost is bounded and already measured: the readout MLP discards 0.0007 R^2 against the
+pooled 2048-d state for chunk prediction, so `h` is very nearly sufficient for this purpose.
+That number was taken on v3, where `h` was optimised for prediction alone; re-take it once
+`h` is also carrying `sigma_p`.
+
+`q` never sees `c`. `c` is drawn from the distribution `q` parameterises, so a `q` that read
+it would be circular. (An earlier draft of this document wrote `q(stopgrad(c), A)`, which is
+that mistake, produced by using one symbol for the readout and for the latent.)
+
+### `q` is a residual on `p`, and `h` is detached into it
 
 ```
-mu_q = mu_p + delta_mu( stopgrad(c), A ),      delta_mu output layer zero-init
+mu_q = mu_p + delta_mu( stopgrad(h), A ),      delta_mu output layer zero-init
 ```
+
+**This is not extra information.** `mu_p = W_mu h + b_mu` is a deterministic function of `h`,
+which `q` already conditions on, so adding it to `q`'s output changes the parameterisation
+and not the hypothesis class -- `mu_q` is a function of `(h, A)` either way. What it changes
+is the optimisation geometry: `q` learns the *correction* that knowing `A` implies, instead
+of re-deriving the prediction that the whole backbone exists to make.
+
+It also **couples `q` to `p` during training**, which is the more important effect. Without
+the residual, `q` and `p` are two separately-parameterised networks chasing each other, and
+any lag between them appears in the KL as information that is not there. The residual makes
+"`q` has nothing to add" representable exactly, as `delta_mu = 0`, rather than approximately.
 
 * **Residual + zero init => `KL = 0` exactly at step 0.** A freshly-initialised posterior
   otherwise makes `KL(q||p)` large and meaningless, and its gradient drags `mu` off the v3
@@ -183,12 +225,24 @@ mu_q = mu_p + delta_mu( stopgrad(c), A ),      delta_mu output layer zero-init
   to prevent posterior collapse when `q` starts far from `p`. Here `q` starts *at* `p`, so
   there is nothing to anneal away: constant `beta` is the default. Say so in the launch
   script, or "we skipped KL warmup" reads as an oversight.
-* **`stopgrad(c)`** so `q`'s parameters -- which are discarded at RL -- cannot shape the
+* **`stopgrad(h)`** so `q`'s parameters -- which are discarded at RL -- cannot shape the
   trunk. The trunk's objectives stay exactly `L_FM` (through `c ~ q`, which still reaches
   `mu_p`) and the KL's `p`-side pull. Note the alternative is *benign* rather than harmful
   (the trunk cannot see `A`, so `q`'s gradient could only make `mu_p` a better predictor of
   `A`, which `L_FM` already wants) -- detaching is a cleanliness choice and is worth keeping
   as an ablation switch.
+
+**The one real hazard the residual introduces**, and it points at the failure mode we care
+about: zero-init plus weight decay is a standing pull toward `delta_mu = 0`, which is
+`sigma_p -> 0`, which is the degenerate solution. It is not an information problem, it is a
+regulariser pointed the wrong way. Two guards, both cheap:
+
+* **exclude `delta_mu`'s output layer from weight decay** (the run's `--weight-decay` is
+  1e-4 and applies to everything by default);
+* **log `||delta_mu|| / sigma_p` from step 0.** If it rises off zero in the first few hundred
+  steps and settles, the residual is doing its job. If it decays back toward zero while the
+  FM loss is still falling, `beta` is too large or decay is winning, and the spread gate will
+  fail later for a reason that was visible on step 300.
 
 ### `q` is deliberately under-parameterised
 
@@ -197,7 +251,7 @@ in detail is capacity to over-migrate. Proposed:
 
 ```
 A_scaled (20x3 -> 60) -> LayerNorm -> Linear(60, 256) -> GELU
-concat with Linear(1024, 256)(stopgrad(c))
+concat with Linear(1024, 256)(stopgrad(h))
   -> GELU -> Linear(512, 256) -> GELU -> Linear(256, 1024)   [zero-init]
 ```
 
