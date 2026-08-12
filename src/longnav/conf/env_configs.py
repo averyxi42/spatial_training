@@ -47,6 +47,40 @@ class DummyContinuousEnvConfig:
 
 
 @dataclass
+class ContinuousObjectNavEnvConfig:
+    """ObjectNav driven by action chunks through the PID tracker. See docs/LATENT_RL_ENV.md.
+
+    One env step is one chunk: the first `gap` setpoints are tracked, one control tick each,
+    and the tail is discarded exactly as training and the eval harness do. `gap * dt` seconds
+    of simulated time per step -- the same currency the eval budget is quoted in.
+    """
+
+    _target_: str = "longnav.env.objectnav_continuous.ContinuousObjectNavEnvActor"
+    episodes: str = "/Projects/spatial_training/data/datasets/objectnav/hm3d/v1/val"
+    scene_root: Optional[str] = "/Projects/spatial_training/data/scene_datasets"
+    episode_source: str = "objectnav"
+    gap: int = 10
+    dt: float = 0.04
+    max_steps: int = 175          # 70 s at gap 10, the budget every sample101 number uses
+    success_distance: float = 1.0
+    # `dataset`, not `robot`: on the robot mesh `snap_point` can resolve the proxy across an
+    # island boundary and the metric silently starts measuring a different goal instance.
+    navmesh: str = "dataset"
+    distance_to: str = "VIEW_POINTS"
+    sensor_uuid: str = "color_sensor"
+    width: int = 640
+    height: int = 480
+    pid_preset: str = "baseline"
+    # Reward shaping. Progress is the geodesic reduction per step and needs no coefficient;
+    # these two are the costs. Collision is measured on OBSTRUCTION contacts, never the raw
+    # count -- the robot is always touching the floor.
+    slack_penalty: float = 0.0
+    collision_penalty: float = 0.0
+    seed: int = 0
+    source_kwargs: Optional[Dict[str, Any]] = None
+
+
+@dataclass
 class ColorBanditEnvConfig:
     _target_: str = "longnav.env.color_bandit.ColorBanditEnvActor"
 
@@ -77,5 +111,6 @@ cs.store(name="voxel", group="sim", node=HabitatEnvConfig(
 ))
 cs.store(name="dummy_discrete", group="sim", node=DummyDiscreteEnvConfig())
 cs.store(name="dummy_continuous", group="sim", node=DummyContinuousEnvConfig())
+cs.store(name="objectnav_continuous", group="sim", node=ContinuousObjectNavEnvConfig())
 cs.store(name="color_bandit", group="sim", node=ColorBanditEnvConfig())
 cs.store(name="replay", group="sim", node=ReplayEnvConfig())
