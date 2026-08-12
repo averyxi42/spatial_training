@@ -67,6 +67,8 @@ def load_flow_policy(
     decode: str = "sample",
     num_inference_steps: Optional[int] = None,
     processor=None,
+    latent_mode: str = "mean",
+    pin_flow_noise: Optional[int] = None,
 ) -> VectorRolloutPolicy:
     """Build a `VectorRolloutPolicy` over a `TurnFlowActionRegressor` checkpoint.
 
@@ -74,6 +76,17 @@ def load_flow_policy(
     checkpoint through the regression path would fail on the state dict (the readout MLP
     emits a context vector, not 30 numbers, and the velocity field has no counterpart at
     all), which is the loud failure to prefer over a silently reshaped context.
+
+    `latent_mode` selects what a CVAE checkpoint does at rollout. `mean` takes the prior's
+    mean and is the PARITY path -- bit-identical to the deterministic model at init, and the
+    arm to compare against a pre-latent checkpoint. `sample` draws `c ~ p(c|o)`, which is
+    what an RL policy does. Requesting `sample` from a checkpoint with no latent raises
+    rather than quietly giving the deterministic answer, because those two results are
+    indistinguishable once written to a results file.
+
+    `pin_flow_noise` freezes the ODE base noise at that seed, so execution is constant across
+    decodes and only the intent varies. Without it, `sample` mode varies `c` AND the flow
+    noise together -- reproducible, but not the semantics RL will run under.
 
     `decode` and `num_inference_steps` are validated first, so the error does not require a
     loadable checkpoint. `num_inference_steps=None` keeps the checkpoint's own value --
@@ -92,6 +105,8 @@ def load_flow_policy(
         raise ValueError(
             f"num_inference_steps must be >= 1, got {num_inference_steps}"
         )
+    if latent_mode not in ("mean", "sample"):
+        raise ValueError(f"latent_mode must be 'mean' or 'sample', got {latent_mode!r}")
 
     from transformers import AutoProcessor
 
@@ -106,6 +121,16 @@ def load_flow_policy(
     model.codec.decode = decode
     if num_inference_steps is not None:
         model.codec.num_inference_steps = int(num_inference_steps)
+    if latent_mode != "mean" and getattr(model.codec, "latent", None) is None:
+        raise ValueError(
+            f"--latent-mode {latent_mode} was asked for but {checkpoint_dir} has no latent "
+            "split; it is a deterministic checkpoint. Refusing rather than silently running "
+            "the mean path, whose results are indistinguishable from a sampled run."
+        )
+    model.codec.latent_mode = latent_mode
+    if pin_flow_noise is not None:
+        model.codec.pin_flow_noise(int(pin_flow_noise))
+    print(f"[flow] {model.codec.describe()}", flush=True)
     return VectorRolloutPolicy(model, processor, cfg)
 
 

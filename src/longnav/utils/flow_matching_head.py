@@ -723,6 +723,14 @@ class FlowActionCodec(nn.Module):
         #: defaults to `mean`, which is bit-for-bit the deterministic path.
         self.latent = latent
         self.latent_mode = "mean"
+        #: When set, EVERY decode reuses this base noise instead of drawing a fresh one.
+        #: This is the RL-time actuator: with `z_0` pinned and the ODE step count fixed,
+        #: `c -> chunk` is deterministic and differentiable, which is what lets a critic
+        #: gradient reach the policy. It also makes `latent_mode="sample"` mean what RL
+        #: means by it -- vary the INTENT while execution is held fixed. Without pinning,
+        #: sample mode varies `c` and the flow noise together (they share `self.generator`),
+        #: which measures something the RL policy will never do.
+        self.pinned_flow_noise: Optional[torch.Tensor] = None
         scales = torch.tensor([float(s) for s in action_scales], dtype=torch.float64)
         if scales.numel() != decoder.n_dims or bool((scales <= 0).any()):
             raise ValueError(f"action_scales must be {decoder.n_dims} positive floats")
@@ -788,10 +796,38 @@ class FlowActionCodec(nn.Module):
         if self.decode == "context":
             return context
         ctx = context
+        noise = None
         if self.latent is not None:
             ctx = self.latent.draw(context.float(), mode=self.latent_mode,
                                    generator=self.generator)["c"]
-        return compose_chunk(self.generate(ctx))
+            if self.pinned_flow_noise is not None:
+                noise = self.pinned_flow_noise.to(ctx.device, torch.float32)
+                noise = noise.expand(ctx.shape[0], *noise.shape[1:])
+        elif self.latent_mode != "mean":
+            raise ValueError(
+                f"latent_mode={self.latent_mode!r} on a codec with no latent split: there "
+                "is no `c` to sample. This checkpoint is deterministic."
+            )
+        return compose_chunk(self.generate(ctx, noise=noise))
+
+    def pin_flow_noise(self, seed: Optional[int]) -> None:
+        """Freeze the ODE's base noise at `seed`, or clear it with `None`.
+
+        Separate from `seed_sampling`, which reseeds the generator that draws a FRESH noise
+        per decode. Both are reproducible; only this one makes execution constant across
+        decodes, which is the difference between "the policy is stochastic" and "the
+        intent is stochastic and the actuator is not".
+        """
+        if seed is None:
+            self.pinned_flow_noise = None
+            return
+        dev = self.action_scales.device
+        gen = torch.Generator(device=dev if dev.type == "cuda" else "cpu")
+        gen.manual_seed(int(seed))
+        self.pinned_flow_noise = torch.randn(
+            1, self.decoder.n_ticks, self.decoder.n_dims,
+            device=gen.device, dtype=torch.float32, generator=gen,
+        ).to(dev)
 
     def denormalize_from_latent(self, c: torch.Tensor,
                                 noise: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -809,10 +845,16 @@ class FlowActionCodec(nn.Module):
     def describe(self) -> str:
         """One line for the run log / `predict_*` tooling: the deploy-time knobs that change
         what the SAME weights produce."""
+        # The latent state is printed unconditionally, including when there is no latent.
+        # A latent checkpoint silently evaluated in `mean` mode is indistinguishable in its
+        # results from a deterministic one, so the run record has to say which it was.
+        latent = ("none" if self.latent is None
+                  else f"mode={self.latent_mode} pinned_noise="
+                       f"{self.pinned_flow_noise is not None}")
         return (f"flow-matching head: decode={self.decode} "
                 f"num_inference_steps={self.num_inference_steps} "
                 f"action_scales={tuple(self.action_scales.tolist())} "
-                f"seeded={self.generator is not None}")
+                f"seeded={self.generator is not None} latent[{latent}]")
 
 
 # ======================================================================================
