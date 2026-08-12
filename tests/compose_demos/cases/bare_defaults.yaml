@@ -1,0 +1,5 @@
+description: >
+  No overrides at all. Should resolve to the schema defaults: sim=habitat,
+  vlm.policy_head=lm_head, task.logger=None.
+composables: []
+overrides: []

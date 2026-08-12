@@ -1,0 +1,10 @@
+description: >
+  The real training entrypoint's flagship combo:
+  `+checkpoint=sft +dataset=hm3d_train +experiment=train +resources=octo +training=rpp`.
+composables: []
+overrides:
+  - +checkpoint=sft
+  - +dataset=hm3d_train
+  - +experiment=train
+  - +resources=octo
+  - +training=rpp

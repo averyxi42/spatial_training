@@ -19,6 +19,10 @@ class DummyEnvActor:
     Dummy Environment that demonstrates the interface but uses dummy RGB data.
     Reward is a trivial bandit problem: reward of 1 for stop, small negative reward otherwise. Episode ends when stop is taken or randomly with small probability.
     '''
+    def __init__(self, logging_output_dir=None, logger_actor=None, **kwargs):
+        self.logging_output_dir = logging_output_dir
+        self.logger_actor = logger_actor
+
     def step(self, action: int, supplementary_logs: Dict[str, Any] = None):
         # generate random RGB data and state dict
         print(f"step {self.sc} of dummy env")
@@ -54,6 +58,52 @@ class DummyEnvActor:
         '''
         returns True if the actor has exhausted its assigned episodes.
         '''
+        return False
+
+
+class DummyContinuousEnvActor:
+    '''
+    Continuous-action dummy environment for smoke tests.
+    Accepts vector actions and returns the same reset/step interface as DummyEnvActor.
+    '''
+
+    def __init__(self, logging_output_dir=None, logger_actor=None, **kwargs):
+        self.logging_output_dir = logging_output_dir
+        self.logger_actor = logger_actor
+
+    def step(self, action, supplementary_logs: Dict[str, Any] = None):
+        print(f"step {self.sc} of continuous dummy env")
+        self.sc += 1
+        rgb = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
+        state = get_dummy_state()
+
+        action_arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        action_norm = float(np.linalg.norm(action_arr))
+
+        # Encourage small control magnitudes and sparse termination by random chance.
+        state['reward'] = 1.0 - 0.1 * action_norm
+        state['done'] = state['done']
+        state['info'] = {
+            "action_norm": action_norm,
+            "action_abs_mean": float(np.mean(np.abs(action_arr))),
+        }
+        return rgb, state
+
+    def reset(self):
+        self.sc = 0
+        print("resetting continuous dummy env")
+        rgb = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
+        state = get_dummy_state()
+        state['done'] = False
+        return rgb, state
+
+    def assign_shard(self, episodes: list[str] | None = None):
+        pass
+
+    def flush_logs_to_disk(self):
+        pass
+
+    def is_exhausted(self):
         return False
     
     

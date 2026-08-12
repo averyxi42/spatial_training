@@ -1,0 +1,3 @@
+description: "Trivial color-bandit sim, for RL-plumbing smoke tests."
+overrides:
+  - sim=color_bandit

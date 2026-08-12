@@ -1,7 +1,17 @@
 import ray
 import os
 from omegaconf import OmegaConf
+from hydra.utils import get_class
 from longnav.config_schema import *
+
+# Metadata keys that exist purely for the factory/registry layer (dispatch, discrimination)
+# and have no corresponding constructor parameter on the actor being instantiated. Strip
+# these centrally wherever a resolved config dict gets spread into a `.remote()` call.
+RESERVED_CONFIG_KEYS = {"_target_", "type", "name"}
+
+
+def strip_reserved_keys(config_dict: dict) -> dict:
+    return {k: v for k, v in config_dict.items() if k not in RESERVED_CONFIG_KEYS}
 
 # Use these imports for type hinting
 from typing import List, Dict, Any, Iterator, Optional,Union
@@ -118,7 +128,7 @@ class InferenceWorkerFactory:
                 **vlm_dict
             ) for _ in range(res_cfg.num_vlms)
         ]
-    
+
 class RLWorkerFactory:
     @staticmethod
     def create(vlm_dict: dict, rollout_dict: dict, res_cfg: ResourceConfig):
@@ -176,12 +186,16 @@ class RLWorkerFactory:
 
 class SimWorkerFactory:
     @staticmethod
-    def create(sim_dict: dict, res_cfg: ResourceConfig, task_cfg: RunConfig, logger_actor=None,config_overrides=None):
-        from longnav.env.habitat import HabitatEnvActor
+    def create(sim_dict: dict, res_cfg: ResourceConfig, task_cfg: RunConfig, logger_actor=None):
+        sim_dict = dict(sim_dict)
+        target = sim_dict.pop("_target_")
+        config_overrides = sim_dict.pop("per_worker_config_overrides", None)
+        env_actor_cls = get_class(target)
+
         env_dict = {}
         if res_cfg.habitat_conda_env is not None:
             env_dict = {"conda": res_cfg.habitat_conda_env}
-        RemoteSim = ray.remote(HabitatEnvActor).options(
+        RemoteSim = ray.remote(env_actor_cls).options(
             resources={res_cfg.sim_resource_tag: 1},
             num_cpus=res_cfg.sim_cpus,
             num_gpus=res_cfg.sim_gpu_fraction,
@@ -190,17 +204,18 @@ class SimWorkerFactory:
             max_task_retries=-1,
         )
 
+        ctor_kwargs = strip_reserved_keys(sim_dict)
         handles = []
         for i in range(res_cfg.num_sims):
             if config_overrides is not None:
                 print(f"overriding sim {i} config with: {config_overrides[i]}")
-                sim_dict['config_path'] = config_overrides[i]
+                ctor_kwargs['config_path'] = config_overrides[i]
             # Calculate dynamic per-worker arguments
             log_dir = os.path.join(task_cfg.output_dir, task_cfg.run_name,"rollout")# f'worker_{i}')
-            
-            # We merge the static sim_dict with our dynamic arguments
+
+            # We merge the static ctor_kwargs with our dynamic arguments
             h = RemoteSim.remote(
-                **sim_dict,
+                **ctor_kwargs,
                 logging_output_dir=log_dir,
                 logger_actor=logger_actor,
                 # Ensure these match your HabitatRayWorker __init__
@@ -208,22 +223,21 @@ class SimWorkerFactory:
             handles.append(h)
         return handles
 
-class WandbFactory:
+class LoggerFactory:
     @staticmethod
     def create(run_cfg: RunConfig, res_cfg: ResourceConfig, full_dict_cfg: dict):
         '''
-        Returns a Ray Actor for logging to WandB, and set of episode labels to skip.
+        Returns a Ray Actor for logging, and set of episode labels to skip.
         Checks the episode_label column of the existing run (if any) to determine which episodes have already been logged, and returns that as a set to skip.
         '''
-        if not run_cfg.wandb_project:
-            # Callers unpack (actor, episodes_to_skip); returning a bare None here
-            # broke the no-wandb path with "cannot unpack non-iterable NoneType".
+        if run_cfg.logger is None:
             return None, set()
 
-        from longnav.utils.logging_workers import WandbLoggerActor
-        
-        RemoteLogger = ray.remote(WandbLoggerActor).options(
-            num_cpus=0, 
+        logger_actor_cls = get_class(run_cfg.logger._target_)
+        project = run_cfg.logger.project
+
+        RemoteLogger = ray.remote(logger_actor_cls).options(
+            num_cpus=0,
             runtime_env={"conda": res_cfg.vlm_conda_env}
         )
         import wandb
@@ -231,14 +245,14 @@ class WandbFactory:
         # fetch latest run id matching name
         id = None
         try:
-            runs = api.runs(run_cfg.wandb_project,filters={"displayName":run_cfg.run_name})
-            print(f"Found {len(runs)} existing runs with name '{run_cfg.run_name}' in project '{run_cfg.wandb_project}'.")
+            runs = api.runs(project,filters={"displayName":run_cfg.run_name})
+            print(f"Found {len(runs)} existing runs with name '{run_cfg.run_name}' in project '{project}'.")
         except:
-            print(f"Could not fetch runs for project '{run_cfg.wandb_project}'. Check your WandB connection and project name.")
+            print(f"Could not fetch runs for project '{project}'. Check your WandB connection and project name.")
             runs = []
         episodes_to_skip = set()
         if len(runs) > 0:
-            # Sort runs by creation time descending      
+            # Sort runs by creation time descending
             latest_run = runs[-1] #defualt wandb behavior oldest to newest. we resume from newest
             id = latest_run.id
             print(f"Resuming WandB run '{run_cfg.run_name}' with ID: {id}")
@@ -250,15 +264,15 @@ class WandbFactory:
                 print(f"Could not determine episodes to skip from WandB history: {e}")
         return RemoteLogger.remote(
             wandb_init_kwargs={
-                "project": run_cfg.wandb_project,
+                "project": project,
                 "name": run_cfg.run_name,
-                "job_type": "eval", # Hardcode or add to RunConfig schema,
+                "job_type": run_cfg.jobtype,
                 "id": id,
                 "resume": "allow",
             },
             run_config=full_dict_cfg
         ),episodes_to_skip
-        
+
 
 class ExpBootstrapper:
     def __init__(self, cfg: Union[InferenceConfig,RLConfig]):
@@ -295,9 +309,9 @@ class ExpBootstrapper:
             ray.init(address=res.ray_address, ignore_reinit_error=True,_system_config=system_config)#,object_store_memory=res.osm_gb * 1024 * 1024 * 1024)
     def bootstrap_logger(self):
         save_hydra_config(self.typed_cfg,os.path.join(self.typed_cfg.task.output_dir,self.typed_cfg.task.run_name))
-        return WandbFactory.create(
-            self.typed_cfg.task, 
-            self.typed_cfg.resources, 
+        return LoggerFactory.create(
+            self.typed_cfg.task,
+            self.typed_cfg.resources,
             self.resolved_dict
         )
     
@@ -318,6 +332,8 @@ class ExpBootstrapper:
                 self.typed_cfg.vlm.model_id = base_model_path
             # self.resolved_dict['training']['checkpoint'] = checkpoint_path
             self.typed_cfg.training.checkpoint = checkpoint_path
+        # vlm_dict['save_outputs'] = True # force save outputs for RL
+        self.resolved_dict['vlm']['save_outputs'] = True
         workers = RLWorkerFactory.create(
             vlm_dict=self.resolved_dict['vlm'], 
             rollout_dict=self.resolved_dict['rollout'], 
@@ -337,11 +353,10 @@ class ExpBootstrapper:
     
     def bootstrap_sims(self,logger=None):
         return SimWorkerFactory.create(
-            sim_dict=self.resolved_dict['sim'], 
-            res_cfg=self.typed_cfg.resources, 
-            task_cfg=self.typed_cfg.task, 
+            sim_dict=self.resolved_dict['sim'],
+            res_cfg=self.typed_cfg.resources,
+            task_cfg=self.typed_cfg.task,
             logger_actor=logger,
-            config_overrides = self.typed_cfg.hab_config_list
         )
     
     def bootstrap_eval(self):

@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
+from omegaconf import MISSING
 
 # --- 1. Resource & Environment Config ---
 @dataclass
@@ -24,28 +25,27 @@ class ResourceConfig:
 @dataclass
 class VLMConfig:
     model_id: Optional[str] = "Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800"
-    attn_impl: str = "sdpa"
+    attn_impl: str = "flash_attention_2"
     dtype: str = "bfloat16"
     prefix: str = '<|im_start|>assistant\n**'
     postfix: str = '**<|im_end|>\n'
-    vocab: List[str] = field(default_factory=lambda: ["stop", "forward", "left", "right"])
+    policy_head: Any = MISSING
     offload_cache: bool = False
     use_sparse: bool = True
     save_outputs: bool = False # only need this for RL
 
 @dataclass 
 class PolicyLossConfig:
-    clip_cov_ratio: Optional[float] = 0.0002
-    clip_cov_ub: Optional[float] = 5.0
-    clip_cov_lb: Optional[float] = 1.0
-    
-@dataclass 
+    name: str = "vanilla"
+    clip_cov_ratio: Optional[float] = None
+    clip_cov_ub: Optional[float] = None
+    clip_cov_lb: Optional[float] = None
+
+@dataclass
 class RLAlgoConfig:
     # generic on policy params
-    use_value: bool = False
-    value_grad_scale: float = 0.1
+    value_head: Optional[Any] = None
     advantage_estimator: str = "reinforce_plus_plus"
-    policy_loss_name: str = "vanilla"
     n_rollout: int = 12 # note: must be divisible by num vlms times gradient accumulation
     n_adv: int = 256 # number of trajectories for advantage estimation, must > n_rollout
     n_epoch: int = 2 # number of policy gradient epochs
@@ -73,7 +73,6 @@ class RLAlgoConfig:
     distance_pad_mode: Optional[str] = "replicate"
     distance_pad_val: Optional[float] = None
     # Value & Entropy
-    cliprange_value: float = 0.2
     entropy_bonus: float = 0.0
 
     # Ref KL Control
@@ -131,13 +130,8 @@ class VLMTrainingConfig:
     total_optimization_steps: int = 100000 # used for linear LR schedule
     warmup_steps: int = 64
     save_step: Optional[int] = 10
-
-    # Value Head Configuration
-    value_head_learning_rate: float = 5e-4  # Often higher than Adapter LR
-    value_head_dropout: float = 0.0
-    value_head_dtype: str = "float32"  
-    # List of hidden layer sizes. Empty list [] implies a single linear layer (Linear Probe).
-    value_head_hidden_dims: List[int] = field(default_factory=lambda:[1024,512])
+    
+    action_head_learning_rate: float = 5e-4
 
     # PEFT: Pass the actual configuration object here (e.g., LoraConfig)
     # Typed as Any to avoid crashing if peft isn't installed on the driver
@@ -146,37 +140,12 @@ class VLMTrainingConfig:
     rl_config:Optional[RLAlgoConfig] = field(default_factory=RLAlgoConfig) # RL Algorithm 
     sft_config:Optional[SFTConfig] = None
 
-# --- habitat sim configs ---
-@dataclass
-class HabitatConfig:
-    config_path: str = "habitat_configs/objectnav_hm3d_rgbd_semantic.yaml"
-    dataset_path: Optional[str] = None
-    workspace: Optional[str] = "."
-    scenes_dir: Optional[str] = None
-    split: str = "val"
-    fp_guard: bool = False
-    fn_guard: bool = False
-    voxel_kwargs: Optional[Dict[str, Any]] = field(default_factory=lambda: None)
-    output_schema: Optional[Dict[str, Any]] = field(default_factory=lambda: {
-        "obs": {"rgb": True, "instr_or_goal": True, "patch_coords": False},
-        "info": {"episode_label": True, "spl": True, "soft_spl":True, "success": True,"distance_to_goal":True},
-        "done": True,
-        "reward": True,
-        "stuck": True,
-        "fp_stop": True
-    })
-    auto_flush: bool = False # automatically flush logs upon reset
-    ep_seed: Optional[bool] = None # if set, episode iterators are deterministic with same set seed all habitat workers
-    explr_bonus: Optional[float] = 0.13
-    collision_penalty: Optional[float] = 0.05
-    fpstop_penalty: Optional[float] = 0.3
-    add_top_down_map:bool = False
 # --- Rollouts (both for Eval and RL) ---
 @dataclass
 class RolloutConfig:
     max_steps: int = 350
     temperature: float = 1.0
-    action_space_str: str = "[stop, forward, left, right, up, down]"
+    action_space_str: str = "[stop, forward, left, right]"
     system_prompt: str = "${read_text:src/longnav/conf/prompts/objectnav_prompt.txt}"
     action_space: List[str] = field(default_factory=lambda: ["stop", "forward", "left", "right"])
     # Templates are lists of dicts (JSON-like)
@@ -192,13 +161,19 @@ class RolloutConfig:
         {"role": "assistant", "content": [{"type": "text", "text": "**forward**"}]}
     ])
     stop_prob_threshold: Optional[float] = None
+    # Deterministic-rollout mode: act on the env-provided state_dict['info']['oracle_action']
+    # instead of sampling from the policy's own output distribution. The policy still runs a
+    # real forward pass; only which action is taken (and fed back into the next turn's prompt)
+    # is overridden. Used by the forward-pass test tier for reproducible rollouts -- see
+    # tests/forward/_bootstrap.py.
+    use_oracle_action: bool = False
 
 
 # --- Experiment housekeeping ---
 @dataclass
 class RunConfig:
     run_name: str = "debug_run"
-    wandb_project: Optional[str] = None
+    logger: Optional[Any] = None
     shard_size: int = 6
     subset_label: str = "sample400_a"
     episode_json: str = ""
@@ -206,15 +181,25 @@ class RunConfig:
     jobtype: str = "eval"
 
 # --- ROOT CONFIGs ---
+# `sim` and `vlm.policy_head` are Hydra ConfigStore groups (see conf/env_configs.py,
+# conf/vlm_configs.py), not plain fields. To pick a non-default member:
+#   - from the CLI: bare `sim=dummy_discrete` / `policy_head@vlm.policy_head=gaussian_head`
+#     (no `+`, since they're already in the defaults list below).
+#   - from a yaml (e.g. an experiment/*.yaml under `# @package _global_`): plain
+#     `sim: dummy_discrete` does NOT work -- that just assigns the literal string
+#     "dummy_discrete" to the field and fails validation once merged against the
+#     already-typed group default. Use Hydra's defaults-list override syntax instead:
+#       defaults:
+#         - override /sim: dummy_discrete
 @dataclass
 class InferenceConfig:
     resources: ResourceConfig = field(default_factory=ResourceConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     vlm: VLMConfig = field(default_factory=VLMConfig)
-    sim: HabitatConfig = field(default_factory=HabitatConfig)
+    sim: Any = MISSING
     task: RunConfig = field(default_factory=RunConfig)
+    defaults: List[Any] = field(default_factory=lambda: ["_self_", {"sim": "habitat"}, {"policy_head@vlm.policy_head": "lm_head"}])
 
 @dataclass
 class RLConfig(InferenceConfig):
     training: VLMTrainingConfig = field(default_factory=VLMTrainingConfig)
-    hab_config_list: Optional[List] = None

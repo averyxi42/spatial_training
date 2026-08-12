@@ -1,0 +1,11 @@
+{
+  "actor/pg_clipfrac": 0.0,
+  "actor/ppo_kl": 0.01785714365541935,
+  "loss/pg_loss": -0.04679224267601967,
+  "return": 1.2649080753326416,
+  "train/entropy": 0.91015625,
+  "train/grad_norm": 8.730443000793457,
+  "train/lr": 6.25e-08,
+  "train/ref_kl_divergence": 0.032064031809568405,
+  "train/rollout_kl_divergence": 0.0017135312082245946
+}

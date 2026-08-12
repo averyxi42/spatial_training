@@ -1,0 +1,15 @@
+description: >
+  Exercises the real experiment/continuous_dummy.yaml file. Confirms the sim
+  group resolves to the continuous dummy env via
+  `defaults: - override /sim: dummy_continuous`, and (regression for the
+  trailing `vlm: {policy_head: {type: "whatever"}}` plain-field bug that used
+  to fight the `defaults: - override /policy_head@vlm.policy_head:
+  gaussian_head` line in this same file) that the policy head still resolves
+  through the group-override mechanism rather than being left as a broken
+  literal string.
+composables: []
+overrides:
+  - +experiment=continuous_dummy
+  - +training=rpp
+assert_sim_target: longnav.env.env_base.DummyContinuousEnvActor
+assert_policy_head_type: continuous

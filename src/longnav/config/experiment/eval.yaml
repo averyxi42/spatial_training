@@ -1,7 +1,9 @@
 # @package _global_
 task:
   run_name: "name me"
-  wandb_project: "longnav_eval"
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "longnav_eval"
   output_dir: ./dump/longnav_eval
   jobtype: eval
 rollout:

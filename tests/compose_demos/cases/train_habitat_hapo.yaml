@@ -1,0 +1,8 @@
+description: "Same as train_habitat_rpp but with the HAPO training preset and quad resources."
+composables: []
+overrides:
+  - +checkpoint=sft
+  - +dataset=hm3d_train
+  - +experiment=train
+  - +resources=quad
+  - +training=hapo

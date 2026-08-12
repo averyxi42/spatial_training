@@ -1,0 +1,7 @@
+description: >
+  Dependency-free discrete quickstart, equivalent to what
+  `python3 -m longnav.scripts.train_rl sim=dummy_discrete` composes.
+composables:
+  - sim_dummy_discrete
+  - policy_head_lm
+overrides: []

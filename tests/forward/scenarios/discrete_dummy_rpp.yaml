@@ -1,0 +1,19 @@
+# One production config combination to fingerprint through the Component
+# A/B/C chain. Adding coverage for a new run setup (a different experiment
+# yaml, training preset, policy head, etc.) means dropping another file
+# like this one in tests/forward/scenarios/ -- the three component test
+# files auto-discover every *.yaml here and need no code changes.
+#
+# overrides: passed straight to compose_rl_config(...), same syntax as the
+#   real CLI (see CLAUDE.md's Hydra compositional CLI examples).
+# n_steps: length of the scripted ReplayEnvActor episode Component A drives.
+overrides:
+  - "+checkpoint=longnav"
+  - "+experiment=discrete_dummy"
+  - "+training=rpp"
+  - "sim=replay"
+  - "resources.vlm_conda_env=null"
+  - "resources.habitat_conda_env=null"
+  - "task.logger=null"
+  - "rollout.use_oracle_action=true"
+n_steps: 8

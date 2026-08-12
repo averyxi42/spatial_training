@@ -1,0 +1,3 @@
+description: "Scripted replay sim (script left null here; tests override it via hydra.utils.instantiate)."
+overrides:
+  - sim=replay

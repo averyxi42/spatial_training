@@ -1,0 +1,14 @@
+{
+  "case": "policy_loss_vanilla__base",
+  "scalars": {
+    "actor/pg_clipfrac": 0.0,
+    "actor/pg_clipfrac_lower": 0.0,
+    "actor/ppo_kl": -0.0030073821544647217,
+    "pg_loss": 0.31931182742118835
+  },
+  "tensors": {},
+  "tolerance": {
+    "atol": 1e-05,
+    "rtol": 1e-05
+  }
+}

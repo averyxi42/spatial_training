@@ -1,0 +1,13 @@
+{
+  "case": "policy_loss_clip_cov__seeded_base",
+  "scalars": {
+    "actor/pg_clipfrac": 0.4166666567325592,
+    "actor/ppo_kl": -0.0030073821544647217,
+    "pg_loss": 0.057609349489212036
+  },
+  "tensors": {},
+  "tolerance": {
+    "atol": 1e-05,
+    "rtol": 1e-05
+  }
+}

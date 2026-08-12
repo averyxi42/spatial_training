@@ -1,0 +1,12 @@
+description: >
+  Exercises the real experiment/discrete_dummy.yaml file (not a composable
+  override list) -- this is the yaml that select a non-default `sim` group
+  member from *inside* a yaml, via `defaults: - override /sim: dummy_discrete`.
+  Asserts the result actually is the dummy sim, not a silent fallback to
+  habitat -- this is the exact class of bug this demo folder exists to catch.
+composables: []
+overrides:
+  - +experiment=discrete_dummy
+  - +training=rpp
+assert_sim_target: longnav.env.env_base.DummyEnvActor
+assert_policy_head_type: discrete

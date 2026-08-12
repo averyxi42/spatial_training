@@ -33,7 +33,8 @@ def collate_trajectories(trajectory_list: list[dict], device='cpu'):
     
     # Pre-calculate lengths for mask creation
     # Assumes 'actions' is always present and represents the timeline length
-    lengths = [len(t['actions']) for t in trajectory_list]
+    action_length_key = 'actions' if 'actions' in trajectory_list[0] else 'actions_continuous'
+    lengths = [len(t[action_length_key]) for t in trajectory_list]
     max_len = max(lengths)
     batch_size = len(trajectory_list)
 
@@ -48,7 +49,7 @@ def collate_trajectories(trajectory_list: list[dict], device='cpu'):
         try:
             for arr in arrays:
                 t = torch.tensor(arr, device=device)
-                if key in ['rewards', 'values', 'old_logprobs', 'logprobs', 'ref_logprobs']:
+                if key in ['rewards', 'values', 'old_logprobs', 'old_log_prob', 'logprobs', 'ref_logprobs', 'rollout_logprobs', 'actions_continuous']:
                     t = t.float() # Ensure float32
                 elif key in ['actions']:
                     t = t.long()  # Ensure int32 for pointer
@@ -72,14 +73,17 @@ def collate_trajectories(trajectory_list: list[dict], device='cpu'):
             
         batch[key] = padded
     
-    batch['old_log_prob'] = batch['old_logprobs'].gather(2, batch['actions'].unsqueeze(-1)).squeeze(-1)
+    if 'old_logprobs' in batch and 'actions' in batch:
+        batch['old_log_prob'] = batch['old_logprobs'].gather(2, batch['actions'].unsqueeze(-1)).squeeze(-1)
+    elif 'old_log_prob' not in batch:
+        raise KeyError("Trajectory batch must include either ('old_logprobs' and 'actions') or 'old_log_prob'.")
     # 3. Create Response Mask
     # 1 for valid tokens, 0 for padding
     response_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
     for i, length in enumerate(lengths):
         response_mask[i, :length] = 1
     batch['response_mask'] = response_mask
-    return TensorDict(batch,batch_size=batch['old_log_prob'].shape[:2])
+    return TensorDict(batch,batch_size=response_mask.shape)
 
 def apply_hybrid_splitting(batch, dagger_percentile=0.3, only_failures=True, stop_action_id=0,max_dagger_steps=500):
     """

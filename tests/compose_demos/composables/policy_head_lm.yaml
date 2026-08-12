@@ -1,0 +1,3 @@
+description: "Discrete action head (backbone's native LM output layer)."
+overrides:
+  - policy_head@vlm.policy_head=lm_head

@@ -1,0 +1,9 @@
+description: >
+  The real eval entrypoint's flagship combo:
+  `+checkpoint=longnav +dataset=hm3d_val +experiment=eval +resources=octo`.
+composables: []
+overrides:
+  - +checkpoint=longnav
+  - +dataset=hm3d_val
+  - +experiment=eval
+  - +resources=octo

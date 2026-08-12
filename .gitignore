@@ -17,3 +17,6 @@ _shards/
 data_test/
 panoramic_phase_free_videos/
 *.mp4
+
+# From continuous_action: RL scenario fixtures write rendered demos here.
+tests/compose_demos/output/
