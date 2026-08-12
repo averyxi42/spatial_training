@@ -270,6 +270,65 @@ all 60 numbers, let `beta` decide what fits, and *measure* what got through.
 * `save_pretrained` stores `q` (SFT resume needs it); the RL and eval paths must load
   without it.
 
+## `h` is already action-shaped, and what follows from that
+
+A **linear** ridge probe on `h` reaches R^2 0.6303 on the whole chunk. `h` is therefore not
+merely action-*related*; it is approximately an affine code for the action, and `c = h` at
+init. Four consequences, settled in review:
+
+**Asset.** This is an unusually good RL action space, and good in exactly the way the
+deprioritised DSRL option was bad: its geometry is approximately linear in the action rather
+than "60-D chunk-shaped noise with uncontrolled geometry". Gradients through the
+differentiable decoder behave, perturbations do not fall off a manifold cliff, and `sigma`
+has action units -- `sigma_0` at 1-3% of per-dim std means a 1-3% action perturbation, and
+the RL temperature `tau` is a quantity one can reason about.
+
+**Liability, and it is conceptual.** If `h ~= A` then `c` is not "go left around the chair",
+it is the chunk in a linear code, and perturbing it is trajectory dithering -- execution
+variation wearing the name intent. This does **not** hurt RL: dither is local action
+correction, and the failure we are targeting (settle is 2-4% of training targets and 21-70%
+of rollout ticks) is a state-distribution problem that local correction is the right tool
+for. An action-shaped `c` is a poor *intent* space and a good *correction* space.
+
+**So the mode/dither distinction is an instrument, not a gate.** Sample many `c ~ p` at one
+observation and average the decoded chunks: multimodal spread averages to a **creeping**
+chunk (the signature `FlowActionCodec` documents and refuses to produce by averaging ODE
+samples), unimodal dither averages to a normal one. Record which you got, because it
+interprets the RL result. Do not block on it.
+
+**Off-manifold `c` is useful up to the decoder's radius.** In a KL-anchored fine-tune from a
+strong BC init the usual failure is too little exploration, so samples outside the
+demonstration manifold are an asset -- but only where `D_psi(c)` stays coherent; past that
+they are invalid trajectories, not novel behaviour. The lever is already in the objective:
+training on `c ~ q` makes the decoder robust to exactly the perturbations RL will apply, and
+`sigma` can be inflated during SFT to widen the band deliberately.
+
+### Two things this changes
+
+* **Drop the KL-versus-mode-entropy diagnostic.** It assumed `c` encodes a discrete mode
+  choice. If `c` is action-shaped, the KL counts nats about a continuous action residual and
+  the comparison is between incommensurable quantities.
+* **A diagonal `sigma` in `h`'s basis explores off-manifold**, because `W_mu = I` leaves `c`
+  in whatever basis the readout MLP happened to produce. Fix, at the cost of one precompute
+  and **preserving exact parity**: emit `mu' = R h` for fixed orthogonal `R` and have the
+  head consume `R^T c'`. At `sigma = 0` that is `R^T R h = h`, so the bit-identity test still
+  passes, while the effective noise in `h`-space becomes `R^T diag(sigma') eps` with
+  covariance `R^T diag(sigma'^2) R` -- a **full-covariance** policy at diagonal cost, with
+  log-probs still diagonal in `c'` so no RL math changes. Take `R` from `h`'s PCA basis.
+  **Gated on measurement**: adopt only if `h`'s covariance spectrum is strongly anisotropic.
+
+## Staging: freeze first
+
+Run 1 freezes the backbone, LoRA **and** the decoder, and trains only the split and `q`. A
+few million parameters with no backbone gradients -- hours, not days. The ELBO then fits
+`sigma_p` jointly against the decoder's actual robustness radius and the `A`-residual, which
+is the hand-fitted fallback done properly through the objective.
+
+What it gives up: the decoder cannot adapt to noised `c`, so `sigma_p` is capped by existing
+robustness. That is the point -- this run answers "is there anything there, and how big" for
+a fraction of the cost, and the unfrozen run afterwards is the one that widens the band. Near
+zero spread here is itself a result: the decoder is brittle in `c`.
+
 ## Acceptance
 
 Two-sided. **Parity alone is the wrong gate: `beta -> inf` passes it perfectly** by

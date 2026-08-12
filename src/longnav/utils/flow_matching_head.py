@@ -256,6 +256,9 @@ from longnav.utils.ar_action_head import (  # constants shared with the AR head,
 )
 from longnav.utils.ar_action_head_v2 import ActionDecoderV2
 from longnav.utils.bin_codec import compose_chunk, decompose_chunk
+from longnav.utils.latent_intent import (  # the stochastic-intent delta; see docs/LATENT_RL.md
+    LatentConfig, LatentSplit, PosteriorEncoder, kl_shared_sigma, latent_diagnostics,
+)
 from longnav.utils.modality_embed import ModalityBatch
 from longnav.utils.turn_vectors import extract_turn_vectors
 from longnav.utils.vector_sft import (
@@ -708,9 +711,18 @@ class FlowActionCodec(nn.Module):
 
     def __init__(self, decoder: FlowActionDecoder,
                  num_inference_steps: int = NUM_INFERENCE_STEPS,
-                 action_scales: Sequence[float] = ACTION_SCALES):
+                 action_scales: Sequence[float] = ACTION_SCALES,
+                 latent: Optional[LatentSplit] = None):
         super().__init__()
         self.decoder = decoder
+        #: The stochastic intent variable `c`, or None for v3's deterministic behaviour. It
+        #: lives HERE rather than on the regressor because `denormalize(context) -> chunk`
+        #: is the rollout entry point, so putting the split behind it means the rollout,
+        #: every eval backend and the policy bridge pick it up with NO code change -- the
+        #: same reason this class occupies the normalizer slot at all. `latent_mode`
+        #: defaults to `mean`, which is bit-for-bit the deterministic path.
+        self.latent = latent
+        self.latent_mode = "mean"
         scales = torch.tensor([float(s) for s in action_scales], dtype=torch.float64)
         if scales.numel() != decoder.n_dims or bool((scales <= 0).any()):
             raise ValueError(f"action_scales must be {decoder.n_dims} positive floats")
@@ -764,12 +776,22 @@ class FlowActionCodec(nn.Module):
         return self.unscale(x0.double())
 
     def denormalize(self, context: torch.Tensor) -> torch.Tensor:
-        """(N, context_dim) -> (N, T, 3) anchor-relative chunk. The rollout entry point."""
+        """(N, context_dim) -> (N, T, 3) anchor-relative chunk. The rollout entry point.
+
+        `context` is `h`, the deterministic readout. With a latent installed it is mapped to
+        the intent `c` first -- always from the PRIOR, since there is no ground-truth chunk
+        at rollout time and the posterior does not exist outside SFT. `latent_mode="mean"`
+        reproduces the deterministic path exactly; `"sample"` is what an RL rollout uses.
+        """
         if self.decode not in self.DECODES:
             raise ValueError(f"decode must be one of {self.DECODES}, got {self.decode!r}")
         if self.decode == "context":
             return context
-        return compose_chunk(self.generate(context))
+        ctx = context
+        if self.latent is not None:
+            ctx = self.latent.draw(context.float(), mode=self.latent_mode,
+                                   generator=self.generator)["c"]
+        return compose_chunk(self.generate(ctx))
 
     def describe(self) -> str:
         """One line for the run log / `predict_*` tooling: the deploy-time knobs that change
@@ -817,6 +839,7 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         decoder_kwargs: Optional[Dict] = None,
         fm_cfg: Optional[FlowMatchingConfig] = None,
         dtype: torch.dtype = torch.bfloat16,
+        latent_cfg: Optional[LatentConfig] = None,
     ) -> "TurnFlowActionRegressor":
         loss_cfg = LossConfig(**{**loss_cfg.__dict__, "normalize_targets": False})
         target_shape = (context_dim,)   # sizes the readout MLP's projection only
@@ -824,12 +847,24 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         fm_cfg = fm_cfg or FlowMatchingConfig()
         decoder = cls.DECODER_CLS(context_dim=context_dim, n_ticks=n_ticks,
                                   **(decoder_kwargs or {}))
+        latent = None
+        if latent_cfg is not None and latent_cfg.enabled:
+            latent = LatentSplit(dim=context_dim, sigma0=latent_cfg.sigma0,
+                                 rotation=latent_cfg.rotation)
         model.normalizer = FlowActionCodec(
             decoder, num_inference_steps=fm_cfg.num_inference_steps,
-            action_scales=fm_cfg.action_scales,
+            action_scales=fm_cfg.action_scales, latent=latent,
         )
         model.n_ticks = int(n_ticks)
         model.fm_cfg = fm_cfg
+        model.latent_cfg = latent_cfg
+        # SFT-only, and deliberately NOT on the codec: the codec is what rollout and every
+        # eval backend load, and the posterior must not be reachable from there.
+        model.posterior = (
+            PosteriorEncoder(dim=context_dim, n_ticks=n_ticks,
+                             n_dims=decoder.n_dims, width=latent_cfg.posterior_width)
+            if latent is not None else None
+        )
         return model
 
     @property
@@ -920,11 +955,35 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         N, T, D = actions.shape
         K = cfg.k_samples
 
+        # ---- the latent intent. `context` is `h`; what the decoder consumes is `c`.
+        # Without a latent installed this block is inert and `c is h`, so a deterministic
+        # run is byte-identical to before this existed.
+        latent, kl, metrics_ctx = codec.latent, None, context.float()
+        if latent is None:
+            c = context.float()
+        else:
+            # The posterior sees `h` DETACHED: its parameters are discarded at RL and must
+            # not shape the trunk. It also sees `h` rather than the pooled state, so its
+            # information set matches the prior's -- see latent_intent's module docstring.
+            delta_mu = self.posterior(context.float().detach(), actions)
+            pieces = latent.draw(context.float(), mode="sample", delta_mu=delta_mu)
+            c = pieces["c"]
+            kl = kl_shared_sigma(delta_mu, pieces["log_sigma"])        # (N,) nats
+            # Metrics report the DEPLOYED path, which is the prior at its mean.
+            metrics_ctx = latent.decode(pieces["mu"])
+            with torch.no_grad():
+                latent_metrics = latent_diagnostics(pieces, delta_mu, kl, context.float())
+
         # ---- the K-sample expansion. One head forward on N*K rows; see the module
         # docstring. `repeat_interleave` (not `repeat`) so row order matches `sample_time`'s
         # and `sample_noise`'s layout, and so the gradient of each context vector receives
         # the average of its own K draws.
-        ctx_k = context.float().repeat_interleave(K, dim=0)           # (N*K, context_dim)
+        #
+        # `c` IS DRAWN ONCE PER ROW AND THEN EXPANDED, never drawn K times. The K draws are
+        # the flow's own (t, noise) integration samples; giving each of them a different
+        # intent would average the reconstruction over intents and change what the gradient
+        # reaching `sigma` means. Invisible if wrong.
+        ctx_k = c.repeat_interleave(K, dim=0)                         # (N*K, context_dim)
         act_k = actions.repeat_interleave(K, dim=0)                   # (N*K, T, 3)
         time = sample_time(N, K, alpha=cfg.time_alpha, beta=cfg.time_beta,
                            scale=cfg.time_scale, offset=cfg.time_offset,
@@ -935,6 +994,11 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
 
         per_draw = F.mse_loss(v_t, u_t, reduction="none").flatten(1).mean(dim=1)
         per_turn = per_draw.view(N, K).mean(dim=1)                    # average over K
+        if kl is not None:
+            # ELBO in shape only: `per_turn` is a velocity regression, not -log p(A|c), so
+            # `beta` is a bare exchange rate with no transferable scale and must be swept.
+            # The KL is still in nats, which is why the diagnostics on it mean something.
+            per_turn = per_turn + float(self.latent_cfg.beta) * kl
         total = per_turn.sum()
         denom = num_items_in_batch if num_items_in_batch is not None else per_turn.numel()
         denom = torch.as_tensor(denom, dtype=total.dtype, device=total.device).clamp(min=1)
@@ -949,7 +1013,10 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
             loss = loss + touch
 
         with torch.no_grad():
-            metrics = self._generation_metrics(context.float(), gt_diffs, targets)
+            metrics = self._generation_metrics(metrics_ctx, gt_diffs, targets)
+            if kl is not None:
+                metrics.update({k: v.detach() for k, v in latent_metrics.items()})
+                metrics["fm_loss_sum"] = per_draw.view(N, K).mean(dim=1).sum().detach()
             metrics["loss_sum"] = total.detach()
             metrics["n_turns"] = torch.tensor(N, device=dev)
             metrics["n_tokens"] = torch.tensor(
@@ -1143,6 +1210,11 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
 FLOW_METRIC_KEYS = ("sum_stop_pred", "sum_stop_gt", "sum_creep_pred", "sum_creep_gt",
                     "sum_pose_sq_err", "sum_pose_abs_err", "sum_flips", "n_flip_pairs")
 
+#: The CVAE diagnostics, drained the same way and absent unless a latent is installed. Named
+#: separately so a reader can see at a glance which keys exist only in a latent run.
+LATENT_METRIC_KEYS = ("sum_kl_nats", "sum_sigma", "sum_delta_mu_norm",
+                      "sum_delta_mu_over_sigma", "sum_active_dims", "sum_h_std_perdim")
+
 
 class FlowMatchingSFTTrainer(TurnVectorSFTTrainer):
     """`TurnVectorSFTTrainer` plus the band / composed-pose / flip statistics, all-reduced
@@ -1166,7 +1238,7 @@ class FlowMatchingSFTTrainer(TurnVectorSFTTrainer):
 
     def _accumulate(self, outputs: Dict[str, torch.Tensor]):
         super()._accumulate(outputs)
-        for key in FLOW_METRIC_KEYS:
+        for key in FLOW_METRIC_KEYS + LATENT_METRIC_KEYS:
             if key not in outputs:
                 continue
             v = outputs[key].detach().float()
@@ -1207,6 +1279,12 @@ class FlowMatchingSFTTrainer(TurnVectorSFTTrainer):
                 out[f"{prefix}near_zero_gt_{name}"] = g / rows
             if float(near_g[0]) > 0:
                 out[f"{prefix}near_zero_ratio_dx"] = float(near_p[0] / near_g[0])
+
+        # The CVAE diagnostics. Absent -- not zero -- when no latent is installed, so a
+        # deterministic run's log line is exactly what it always was.
+        for key in LATENT_METRIC_KEYS:
+            if key in sums:
+                out[f"{prefix}{key[4:]}"] = float(sums[key]) / rows
 
         if "sum_pose_sq_err" in sums:
             rmse = (sums["sum_pose_sq_err"] / rows).sqrt()

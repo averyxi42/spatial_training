@@ -75,6 +75,7 @@ import torch  # noqa: E402
 from transformers import AutoProcessor, TrainingArguments  # noqa: E402
 
 import train_vector_sft as base  # noqa: E402
+from longnav.utils.latent_intent import LatentConfig  # noqa: E402
 from longnav.utils.mixture import MixtureSpec, build_mixture  # noqa: E402
 from longnav.utils.model_metrics import attach_model_metrics  # noqa: E402
 from longnav.utils.flow_matching_head import (  # noqa: E402
@@ -97,19 +98,43 @@ def build_optimizer_param_groups(model, args):
     because the grouping is specific to this head having a second fresh module.
     """
     fresh = list(model.head.parameters()) + list(model.decoder.parameters())
+    # The latent split and the posterior are exactly as randomly-initialised as the head, so
+    # they belong on --head-lr with it. Leaving either out would SILENTLY FREEZE it, and a
+    # frozen split is indistinguishable from "the CVAE conversion did nothing".
+    _latent = getattr(model.normalizer, "latent", None)
+    if _latent is not None:
+        fresh += list(_latent.parameters())
+    _no_decay = []
+    _post = getattr(model, "posterior", None)
+    if _post is not None:
+        _nd = {id(q) for q in _post.no_decay_parameters()}
+        fresh += [q for q in _post.parameters() if id(q) not in _nd]
+        # delta_mu's output layer is zero-initialised, so weight decay on it is a standing
+        # pull back toward delta_mu = 0 -- i.e. toward sigma_p -> 0, the degenerate solution
+        # this design exists to avoid. A regulariser aimed at the failure mode.
+        _no_decay = [q for q in _post.no_decay_parameters() if q.requires_grad]
     # Same reason, and the same failure mode the base function documents: a module left out
     # of the groups is SILENTLY FROZEN, and for the modality encoders that is
     # indistinguishable from "the injection did not help" -- the experiment's conclusion.
     fresh += list(model.modality_embedder.parameters())
     fresh = [p for p in fresh if p.requires_grad]
-    fresh_ids = {id(p) for p in fresh}
+    fresh_ids = {id(p) for p in fresh} | {id(p) for p in _no_decay}
     other = [p for p in model.parameters() if p.requires_grad and id(p) not in fresh_ids]
-    groups = [{"params": other, "lr": args.lr, "weight_decay": args.weight_decay}]
+    # `other` is empty when --latent-freeze-trunk froze the backbone and adapters, which is
+    # the whole point of the staged run; an empty group is a footgun, not a configuration.
+    groups = ([{"params": other, "lr": args.lr, "weight_decay": args.weight_decay}]
+              if other else [])
     if fresh:
         groups.append({
             "params": fresh,
             "lr": args.head_lr if args.head_lr is not None else args.lr,
             "weight_decay": args.weight_decay,
+        })
+    if _no_decay:
+        groups.append({
+            "params": _no_decay,
+            "lr": args.head_lr if args.head_lr is not None else args.lr,
+            "weight_decay": 0.0,
         })
     return groups
 
@@ -185,6 +210,33 @@ def parse_args():
                         "design document's literal recipe and is expected to train badly -- "
                         "see flow_matching_head's ACTION SCALING note")
 
+    pre.add_argument("--latent-cvae", action="store_true",
+                     help="convert the deterministic readout into a stochastic INTENT: "
+                          "h -> (mu, log sigma), c ~ N(mu + delta_mu(h, A), sigma^2), with "
+                          "a KL to the prior. Off is v3 exactly -- no split, no posterior, "
+                          "no KL term. See docs/LATENT_RL.md")
+    pre.add_argument("--latent-beta", type=float, default=1.0,
+                     help="KL weight. NOT in transferable units: the reconstruction term is "
+                          "a velocity regression rather than a log-likelihood, so this is a "
+                          "bare exchange rate and must be swept per architecture")
+    pre.add_argument("--latent-sigma0", type=float, default=0.02,
+                     help="initial sigma, as an ABSOLUTE value in h's units. Measure it: "
+                          "1-3%% of h's per-dim std (scripts/measure_h_stats.py). sigma is "
+                          "deliberately never floored during training -- it is the quantity "
+                          "the acceptance test reads, and a floor corrupts it")
+    pre.add_argument("--latent-posterior-width", type=int, default=256,
+                     help="posterior hidden width. Capacity here is capacity to "
+                          "over-migrate, so it acts as a rate limiter complementing beta")
+    pre.add_argument("--latent-freeze-trunk", action="store_true",
+                     help="freeze backbone, adapters, readout MLP and modality encoders, "
+                          "training only the split and the posterior. The cheap staged run: "
+                          "hours rather than days, and it answers whether sigma is usable "
+                          "at all before anything expensive is spent")
+    pre.add_argument("--latent-freeze-decoder", action="store_true",
+                     help="also freeze the velocity field, so sigma is fitted against the "
+                          "decoder's EXISTING robustness radius. Gives up the decoder "
+                          "adapting to noised c -- which is what widens the usable "
+                          "exploration band -- so it is a run-1 measurement, not the end state")
     pre.add_argument("--mixture-datasets", action="append", default=None,
                      metavar="NAME=PATH:RATIO",
                      help="MIX several corpora at a stated ratio, repeatable, e.g. "
@@ -255,6 +307,14 @@ def parse_args():
     finally:
         sys.argv = old_argv
 
+    # Namespaces merge attribute by attribute, so a flag declared on the pre-parser and not
+    # copied across is parsed and then silently dropped -- it reads as a no-op run.
+    args.latent_cvae = mine.latent_cvae
+    args.latent_beta = mine.latent_beta
+    args.latent_sigma0 = mine.latent_sigma0
+    args.latent_posterior_width = mine.latent_posterior_width
+    args.latent_freeze_trunk = mine.latent_freeze_trunk
+    args.latent_freeze_decoder = mine.latent_freeze_decoder
     args.init_modality_from = mine.init_modality_from
     args.init_from = mine.init_from
     args.mixture_datasets = mine.mixture_datasets
@@ -403,6 +463,10 @@ def main():
         model_cfg, loss_cfg, lora, n_ticks, processor,
         context_dim=args.context_dim, decoder_kwargs=args.decoder_kwargs,
         fm_cfg=args.fm_cfg, dtype=torch.bfloat16,
+        latent_cfg=LatentConfig(
+            enabled=bool(args.latent_cvae), sigma0=args.latent_sigma0,
+            beta=args.latent_beta, posterior_width=args.latent_posterior_width,
+        ),
     )
     # The rotation-flip deadband is a SPEED (rad/s), so the per-tick threshold needs this
     # corpus's tick duration -- v1 is 20 Hz (dt=0.05), v2 25 Hz (dt=0.04). Read it off the
@@ -444,7 +508,28 @@ def main():
         print(f"[init-modality-from] ignored: --resume-from {args.resume_from} restores the "
               "full training state, including the encoders")
 
+    # Freezing happens AFTER --init-from: `load_state_dict` writes into frozen tensors fine,
+    # but the optimizer groups are built by filtering on requires_grad, so lowering it before
+    # the warm start would be fine and lowering it after the optimizer exists would not.
+    if args.latent_cvae and (args.latent_freeze_trunk or args.latent_freeze_decoder):
+        frozen = []
+        if args.latent_freeze_trunk:
+            for name in ("backbone", "head", "modality_embedder"):
+                for q in getattr(model, name).parameters():
+                    q.requires_grad_(False)
+                frozen.append(name)
+        if args.latent_freeze_decoder:
+            for q in model.decoder.parameters():
+                q.requires_grad_(False)
+            frozen.append("decoder")
+        if is_main:
+            live = sum(q.numel() for q in model.parameters() if q.requires_grad)
+            print(f"[latent] froze {', '.join(frozen)}; {live/1e6:.2f}M parameters live")
+
     if is_main:
+        print("[latent]", LatentConfig(
+            enabled=bool(args.latent_cvae), sigma0=args.latent_sigma0,
+            beta=args.latent_beta, posterior_width=args.latent_posterior_width).describe())
         fm, dk = args.fm_cfg, args.decoder_kwargs
         decoder_params = sum(p.numel() for p in model.decoder.parameters())
         print("Model:", model.trainable_parameter_report())

@@ -1141,9 +1141,25 @@ class TurnVectorRegressor(nn.Module):
             checkpoint_dir / HEAD_WEIGHTS_FILE, map_location="cpu", weights_only=False
         )
         self.head.load_state_dict(blob["head"], strict=True)
-        self.normalizer.load_state_dict(blob["normalizer"], strict=True)
 
         fresh: List[str] = []
+        # The normalizer stays strict in both directions with ONE exception: a `LatentSplit`
+        # installed on a `FlowActionCodec` is fresh by construction when warm-starting from a
+        # deterministic checkpoint, which is the whole point of the CVAE conversion (see
+        # docs/LATENT_RL.md). Missing `latent.*` keys are reported as fresh rather than
+        # raising -- anything else missing still raises, because a normalizer that only
+        # mostly matches is a config mismatch and not a warm start.
+        report = self.normalizer.load_state_dict(blob["normalizer"], strict=False)
+        unexpected = list(report.unexpected_keys)
+        missing = [k for k in report.missing_keys if not k.startswith("latent.")]
+        if missing or unexpected:
+            raise RuntimeError(
+                "normalizer state_dict mismatch beyond the latent split: "
+                f"missing={missing} unexpected={unexpected}"
+            )
+        if len(report.missing_keys) > len(missing):
+            fresh.append("normalizer.latent")
+
         modality = blob.get("modality")
         if modality:
             self.modality_embedder.load_state_blob(modality)
