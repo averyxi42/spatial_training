@@ -24,12 +24,23 @@ Run against a stub carrying nothing but the accumulator state, which is what
 a multi-billion-parameter backbone.
 """
 
+import sys
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
 
-from longnav.utils.pose_frame import relative_se2
-from longnav.utils.vector_rollout import VectorRolloutPolicy
+# There is no `src/longnav/__init__.py`, so `longnav` is a NAMESPACE package and a bare
+# import resolves to whichever checkout is first on the path -- on this machine that is
+# another clone entirely. Put this repo's `src/` in front, as every other test does.
+_ROOT = Path(__file__).resolve().parents[1]
+for _p in (str(_ROOT), str(_ROOT / "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from longnav.utils.pose_frame import relative_se2  # noqa: E402
+from longnav.utils.vector_rollout import VectorRolloutPolicy  # noqa: E402
 
 
 class Accumulator:

@@ -10,10 +10,20 @@ So: gated, with the sums still accumulated either way. Turning the flag on must 
 exactly what was logged before, and turning it off must not disturb anything else.
 """
 
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
-from longnav.utils.flow_matching_head import FlowMatchingSFTTrainer
+# `longnav` is a namespace package (no `src/longnav/__init__.py`), so a bare import resolves
+# to whichever checkout is first on the path. Pin this one before importing.
+_ROOT = Path(__file__).resolve().parents[1]
+for _p in (str(_ROOT), str(_ROOT / "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from longnav.utils.flow_matching_head import FlowMatchingSFTTrainer  # noqa: E402
 
 PARENT = FlowMatchingSFTTrainer.__mro__[1]
 

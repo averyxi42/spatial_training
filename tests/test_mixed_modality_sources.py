@@ -18,10 +18,20 @@ carry the column is still held to matching it row for row (absent is defaulted, 
 not).
 """
 
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
-from longnav.utils.modality_embed import ModalityEmbedSpec
+# `longnav` is a namespace package (no `src/longnav/__init__.py`), so a bare import resolves
+# to whichever checkout is first on the path. Pin this one before importing.
+_ROOT = Path(__file__).resolve().parents[1]
+for _p in (str(_ROOT), str(_ROOT / "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from longnav.utils.modality_embed import ModalityEmbedSpec  # noqa: E402
 
 SPEC = ModalityEmbedSpec(
     token="<pose>", n_features=3, encoder="planar_se2",
