@@ -10,3 +10,10 @@ ray_object_spilling
 .env
 data/
 verl/
+
+# Generation/upload artifacts and the corpus symlink — none of these are source.
+/data
+_shards/
+data_test/
+panoramic_phase_free_videos/
+*.mp4
