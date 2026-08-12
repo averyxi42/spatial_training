@@ -793,6 +793,19 @@ class FlowActionCodec(nn.Module):
                                    generator=self.generator)["c"]
         return compose_chunk(self.generate(ctx))
 
+    def denormalize_from_latent(self, c: torch.Tensor,
+                                noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """`c` (already an intent, already in the decoder's basis) -> anchor-relative chunk.
+
+        The seam the spread probe needs and `denormalize` cannot provide: that method maps
+        `h -> c` itself, so it can never decode a `c` the caller drew, and it owns the base
+        noise, so it cannot hold the noise fixed across draws. Both are exactly what the
+        acceptance gate has to vary independently -- vary `c` at fixed noise, then vary
+        noise at fixed `c`. This is also the RL-time actuator: pass a pinned `noise` and the
+        map is deterministic and differentiable in `c`.
+        """
+        return compose_chunk(self.generate(c, noise=noise))
+
     def describe(self) -> str:
         """One line for the run log / `predict_*` tooling: the deploy-time knobs that change
         what the SAME weights produce."""
@@ -1167,6 +1180,15 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         meta["fm_context_dim"] = int(self.target_shape[0])
         meta["fm_decoder_kwargs"] = self.decoder.to_config()
         meta["fm_config"] = asdict(self.fm_cfg)
+        # WITHOUT THIS A LATENT CHECKPOINT CANNOT BE LOADED AT ALL: `from_pretrained` would
+        # build a codec with no split, and `load_trainable` would then reject the saved
+        # `latent.*` keys as unexpected. The weights themselves ride in the normalizer's
+        # state dict -- including `rotation`, which is a buffer -- so only the shape-deciding
+        # facts are recorded here.
+        latent = getattr(self.normalizer, "latent", None)
+        if latent is not None:
+            meta["fm_latent"] = {"dim": latent.dim, "sigma0": latent.sigma0,
+                                 "rotated": latent.rotation is not None}
         path.write_text(json.dumps(meta, indent=2))
 
     @classmethod
@@ -1183,10 +1205,23 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         model_cfg = ModelConfig(**{**migrate_model_config(meta["model"]), **overrides})
         loss_cfg = LossConfig(**meta["loss"])
         fm_cfg = FlowMatchingConfig(**meta.get("fm_config", {}))
+        # Absent for every checkpoint written before the latent existed, which is exactly the
+        # deterministic behaviour those checkpoints had. `rotation` is allocated as the
+        # identity purely so the buffer has the right shape for `load_trainable` to fill;
+        # the identity is orthogonal, so it also passes the constructor's own check.
+        latent_meta = meta.get("fm_latent")
+        latent_cfg = None
+        if latent_meta:
+            dim = int(latent_meta["dim"])
+            latent_cfg = LatentConfig(
+                enabled=True, sigma0=float(latent_meta["sigma0"]),
+                rotation=torch.eye(dim) if latent_meta.get("rotated") else None,
+            )
         model = cls.build(
             model_cfg, loss_cfg, lora=None, n_ticks=meta["fm_n_ticks"], processor=processor,
             context_dim=meta["fm_context_dim"],
             decoder_kwargs=meta.get("fm_decoder_kwargs"), fm_cfg=fm_cfg, dtype=dtype,
+            latent_cfg=latent_cfg,
         )
         model.train_content_len = meta.get("train_content_len")
         adapter_dir = checkpoint_dir / ADAPTER_SUBDIR
