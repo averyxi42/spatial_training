@@ -1157,6 +1157,13 @@ class FlowMatchingSFTTrainer(TurnVectorSFTTrainer):
     errors -- the ones to compare against the AR head's `free_rmse_*`.
     """
 
+    #: Emit the per-dimension motion-band breakdown (`stop_*`, `creep_*`, `near_zero_*`).
+    #: Off by default: ~30 keys per log line, built to compare a discrete head's codebook
+    #: occupancy against a continuous head's, which is not a question the current mixture
+    #: asks. The sums are still ACCUMULATED either way, so enabling this costs only the
+    #: logging and nothing downstream loses the ability to compute them.
+    emit_motion_bands: bool = False
+
     def _accumulate(self, outputs: Dict[str, torch.Tensor]):
         super()._accumulate(outputs)
         for key in FLOW_METRIC_KEYS:
@@ -1173,18 +1180,26 @@ class FlowMatchingSFTTrainer(TurnVectorSFTTrainer):
         rows = float(sums["n_rows"].clamp(min=1))
         names = DIM_NAMES
 
-        for key, label in (("sum_stop_pred", "stop_pred"), ("sum_stop_gt", "stop_gt"),
-                           ("sum_creep_pred", "creep_pred"), ("sum_creep_gt", "creep_gt")):
-            if key not in sums:
-                continue
-            for name, v in zip(names, sums[key].tolist()):
-                out[f"{prefix}{label}_{name}"] = v / rows
+        # OFF by default. These per-dimension motion-band breakdowns (`stop_*`, `creep_*`,
+        # `near_zero_*`) were built to compare a discrete head's codebook occupancy against a
+        # continuous head's, back when the near-zero mass was the thing in question. With the
+        # current mixture they are ~30 extra keys per log line that nobody reads, and they
+        # crowd out the metrics that are actually consulted (`turn_loss`, `rmse_*`,
+        # `pose_rmse_*`). Kept, not deleted -- set `emit_motion_bands = True` on the trainer
+        # (`--log-motion-bands`) to get them back for a head comparison.
+        if self.emit_motion_bands:
+            for key, label in (("sum_stop_pred", "stop_pred"), ("sum_stop_gt", "stop_gt"),
+                               ("sum_creep_pred", "creep_pred"), ("sum_creep_gt", "creep_gt")):
+                if key not in sums:
+                    continue
+                for name, v in zip(names, sums[key].tolist()):
+                    out[f"{prefix}{label}_{name}"] = v / rows
 
         # The comparable near-zero statistic. `stop_pred_*` alone is not comparable between a
         # discrete head (whose codebook has a centroid exactly on zero, so it clears
         # EXACT=1e-4 trivially) and a continuous one; the combined mass below the CREEP edge
         # is expressible by both. See the module docstring's section 6 discussion.
-        if "sum_stop_pred" in sums and "sum_creep_pred" in sums:
+        if self.emit_motion_bands and "sum_stop_pred" in sums and "sum_creep_pred" in sums:
             near_p = sums["sum_stop_pred"] + sums["sum_creep_pred"]
             near_g = sums["sum_stop_gt"] + sums["sum_creep_gt"]
             for name, p, g in zip(names, near_p.tolist(), near_g.tolist()):

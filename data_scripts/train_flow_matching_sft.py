@@ -75,6 +75,7 @@ import torch  # noqa: E402
 from transformers import AutoProcessor, TrainingArguments  # noqa: E402
 
 import train_vector_sft as base  # noqa: E402
+from longnav.utils.mixture import MixtureSpec, build_mixture  # noqa: E402
 from longnav.utils.model_metrics import attach_model_metrics  # noqa: E402
 from longnav.utils.flow_matching_head import (  # noqa: E402
     ACTION_SCALES, DEFAULT_DT_NATIVE, FlowMatchingConfig, FlowMatchingSFTTrainer,
@@ -114,7 +115,13 @@ def build_optimizer_param_groups(model, args):
 
 
 def parse_args():
-    pre = base.argparse.ArgumentParser(add_help=False)
+    # allow_abbrev=False is load-bearing, not tidiness. This parser runs BEFORE the base
+    # one and passes what it does not recognise through `parse_known_args`. With
+    # abbreviation on, any base flag that is a strict prefix of a flag declared here gets
+    # captured instead of passed through -- `--train-dataset` was silently swallowed by
+    # `--train-datasets`, which would have broken every existing single-dataset command
+    # with an error pointing at the wrong flag.
+    pre = base.argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     pre.add_argument("--decoder-d-model", type=int, default=128)
     pre.add_argument("--decoder-layers", type=int, default=4)
     pre.add_argument("--decoder-heads", type=int, default=4)
@@ -139,6 +146,18 @@ def parse_args():
                         "The head is ~2 orders of magnitude cheaper than the backbone here, "
                         "so this is nearly free variance reduction -- but at --max-turns 400 "
                         "the expanded head batch is 400*K sequences, so watch memory above 8")
+    f.add_argument("--eval-per-component", action="store_true",
+                   help="evaluate each --mixture-datasets component on its OWN "
+                        "validation split and log metrics as eval_<component>_*, "
+                        "instead of one blended number. A single eval set cannot say "
+                        "WHICH component regressed -- a run that forgets ObjectNav "
+                        "while improving PointNav looks flat")
+    f.add_argument("--log-motion-bands", action="store_true",
+                   help="emit the per-dimension stop_*/creep_*/near_zero_* band "
+                        "metrics. OFF by default: ~30 keys per log line, built to "
+                        "compare a discrete head's codebook occupancy against a "
+                        "continuous head's, which the current mixture does not ask. "
+                        "The sums are accumulated either way, so this is logging only")
     f.add_argument("--inference-steps", type=int, default=NUM_INFERENCE_STEPS,
                    help="Euler steps at deploy time (a knob, not a trained quantity)")
     f.add_argument("--metric-steps", type=int, default=None,
@@ -166,6 +185,39 @@ def parse_args():
                         "design document's literal recipe and is expected to train badly -- "
                         "see flow_matching_head's ACTION SCALING note")
 
+    pre.add_argument("--mixture-datasets", action="append", default=None,
+                     metavar="NAME=PATH:RATIO",
+                     help="MIX several corpora at a stated ratio, repeatable, e.g. "
+                          "--mixture-datasets objectnav=data/v2_25hz_obs2.5hz/formatted_pose:1 "
+                          "--mixture-datasets pointnav=/Projects/data/pointnav_hm3d_2p5hz_clamp/formatted_pose:1 "
+                          ". Ratios are UNNORMALISED weights and are independent of corpus "
+                          "size -- which is the point: concatenating a 39k-row corpus with a "
+                          "5k-row one trains 89%% the first whatever was intended, and the "
+                          "proportion drifts as a corpus grows. Sources are loaded "
+                          "separately and never concatenated, so they need not share an "
+                          "arrow schema; they must agree on the chunking parameters, which "
+                          "is checked up front. Named --mixture-* rather than --train-datasets so it "
+                          "cannot be confused with, or abbreviate to, --train-dataset")
+    pre.add_argument("--mixture-length", type=int, default=None,
+                     help="nominal examples per epoch when mixing (default: the sum of the "
+                          "source sizes). Sampling is with replacement, so this is a stream "
+                          "length, not a pass over the data -- use --max-steps as the budget")
+    pre.add_argument("--mixture-seed", type=int, default=0,
+                     help="keys the per-index draw, so every dataloader worker and every "
+                          "resume produce the same mixture")
+    pre.add_argument("--init-from", default=None,
+                     help="WARM START from a checkpoint: load ALL of its trained weights "
+                          "(LoRA adapter, readout head, velocity field, modality encoders) "
+                          "into this model, then train from step 0 with a fresh optimizer, "
+                          "scheduler, RNG and dataloader order. Distinct from --resume-from, "
+                          "which additionally restores that run's optimizer state, LR "
+                          "schedule and step counter -- i.e. continues it. Distinct from "
+                          "--init-modality-from, which borrows the encoders ALONE. Modules "
+                          "this run declares that the checkpoint has no entry for at all "
+                          "start fresh and are printed; everything shared loads strictly, "
+                          "so a shape drift (a different action_chunk_len gives the "
+                          "velocity field a different n_ticks) raises rather than silently "
+                          "reshaping. --resume-from wins if both are given")
     pre.add_argument("--init-modality-from", default=None,
                      help="warm start the MODALITY ENCODERS ONLY from another run's "
                           "checkpoint (e.g. a regression run's "
@@ -189,6 +241,14 @@ def parse_args():
                           "shared module, meaningless across heads)")
     mine, rest = pre.parse_known_args()
 
+    # `--train-dataset` is required by the base parser, so a pure --train-datasets run
+    # would fail to parse. Supply the FIRST source as its value rather than a placeholder:
+    # everything that reads `args.train_dataset` -- notably the `--eval-dataset` fallback --
+    # then gets a real, loadable path instead of something that only fails later.
+    if mine.mixture_datasets and not any(a == "--train-dataset" for a in rest):
+        first = MixtureSpec.parse(mine.mixture_datasets[0]).path
+        rest = [*rest, "--train-dataset", first]
+
     old_argv, sys.argv = sys.argv, [sys.argv[0], *rest]
     try:
         args = base.parse_args()
@@ -196,6 +256,15 @@ def parse_args():
         sys.argv = old_argv
 
     args.init_modality_from = mine.init_modality_from
+    args.init_from = mine.init_from
+    args.mixture_datasets = mine.mixture_datasets
+    args.mixture_length = mine.mixture_length
+    args.mixture_seed = mine.mixture_seed
+    # Every pre-parser flag must be copied across BY NAME. A flag added above and not
+    # listed here parses without error and is then silently discarded -- the run proceeds
+    # with the default and nothing says so.
+    args.eval_per_component = mine.eval_per_component
+    args.log_motion_bands = mine.log_motion_bands
     # Derived, never accepted: there is no context projection, so the readout MLP must emit
     # exactly one d_model-wide vector per prefix token.
     args.context_dim = mine.context_tokens * mine.decoder_d_model
@@ -271,12 +340,55 @@ def main():
     )
 
     # ---- data ----------------------------------------------------------------------
-    train_ds = base.load_split(args.train_dataset, args.train_split)
+    # Single dataset unless --train-datasets was given, so the default path is exactly
+    # the one it has always been -- same call, same object, no wrapper.
+    specs = []
+    if args.mixture_datasets:
+        specs = [MixtureSpec.parse(t, args.train_split) for t in args.mixture_datasets]
+        train_ds = build_mixture(specs, base.load_split, args.train_split,
+                                 length=args.mixture_length, seed=args.mixture_seed)
+        if is_main:
+            print(train_ds.describe())
+    else:
+        train_ds = base.load_split(args.train_dataset, args.train_split)
     eval_ds = None
     if args.eval_split:
-        eval_ds = base.load_split(
-            args.eval_dataset or args.train_dataset, args.eval_split, args.eval_max_samples
-        )
+        if args.eval_per_component and specs:
+            # One eval set per mixture component, keyed by the component's name. HF's
+            # Trainer evaluates a dict of datasets separately and prefixes each with its
+            # key, and `TurnVectorSFTTrainer.evaluate` already threads `metric_key_prefix`
+            # into `_drain_metrics`, so this needs nothing from the trainer -- the metrics
+            # come out as `eval_<component>_turn_loss`, `eval_<component>_rmse_dx`, ...
+            #
+            # Worth having because a single blended eval number cannot say WHICH component
+            # regressed: a mixture that quietly forgets ObjectNav while improving PointNav
+            # looks flat. That is exactly the failure a co-training run needs to see.
+            eval_ds = {}
+            for spec in specs:
+                try:
+                    eval_ds[spec.name] = base.load_split(
+                        spec.path, args.eval_split, args.eval_max_samples
+                    )
+                except (KeyError, ValueError, FileNotFoundError) as exc:
+                    # A component without the eval split is skipped by name rather than
+                    # failing the run -- but it is announced, because a silently missing
+                    # component is a metric that looks fine by being absent.
+                    if is_main:
+                        print(f"[eval] component {spec.name!r} has no {args.eval_split!r} "
+                              f"split ({type(exc).__name__}); it will not be evaluated")
+            if not eval_ds:
+                raise SystemExit(
+                    "--eval-per-component was given but no mixture component has a "
+                    f"{args.eval_split!r} split"
+                )
+            if is_main:
+                print("[eval] per component: "
+                      + ", ".join(f"{k} n={len(v)}" for k, v in eval_ds.items()))
+        else:
+            eval_ds = base.load_split(
+                args.eval_dataset or args.train_dataset, args.eval_split,
+                args.eval_max_samples,
+            )
     chunk_shape = base.infer_target_shape(train_ds, args.target_column)   # (T, 3)
     if chunk_shape[-1] != 3:
         raise ValueError(f"expected a 3-dim (dx,dy,dtheta) chunk, got shape {chunk_shape}")
@@ -306,6 +418,20 @@ def main():
     # the readout MLP, the velocity field, the adapter -- stays fresh, which is what makes
     # this a head comparison rather than a continuation of the regression run. `--resume-from`
     # restores a whole training state and wins if both are given.
+    # The whole model, on every rank and before the optimizer exists. This is the plain
+    # "load a checkpoint" case -- the same weights `load_trainable` restores on a resume and
+    # the same ones eval loads via `VectorRolloutPolicy.from_checkpoint` -- with the
+    # optimizer, schedule, step counter and dataloader order left fresh. That is what makes
+    # it a new run on new data rather than a continuation of the old one.
+    if args.init_from and not args.resume_from:
+        fresh = model.warm_start(args.init_from)
+        if is_main:
+            print(f"[init-from] loaded trainable weights from {args.init_from}")
+            print(f"[init-from] left at fresh init: {fresh or 'nothing'}")
+    elif args.init_from and args.resume_from and is_main:
+        print(f"[init-from] ignored: --resume-from {args.resume_from} restores the full "
+              "training state, including these weights")
+
     if args.init_modality_from and not args.resume_from:
         loaded = model.init_modality_from(args.init_modality_from)
         if is_main:
@@ -396,6 +522,8 @@ def main():
         data_config=data_cfg,
         eval_data_collator=eval_collator,
     )
+    # Off unless asked for; the band sums are accumulated regardless, so this is logging.
+    trainer.emit_motion_bands = bool(args.log_motion_bands)
     optim_cls, optim_kwargs = trainer.get_optimizer_cls_and_kwargs(training_args)
     optim_kwargs.pop("lr", None)
     trainer.optimizer = optim_cls(

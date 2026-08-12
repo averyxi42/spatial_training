@@ -487,12 +487,28 @@ class TurnVectorCollator:
         # Raw column width, which is not necessarily `n_features`: a spec may declare a
         # transform that changes it. Without a transform `raw_width == n_features` and this
         # is the reshape it always was.
-        modality = {
-            s.key: torch.as_tensor(ex[s.source_column], dtype=torch.float32).reshape(
+        # THE CONTRACT: no marker occurrences means no values are required. A source may
+        # express "this row has no pose" as an absent column, a `None`, or an empty list,
+        # and all three mean the same thing -- the marker is a modality like `<image>`, and
+        # a conversation that never writes it simply supplies nothing for it. That is what
+        # lets a mixture pair a pose-carrying corpus with a pose-free one.
+        #
+        # Enforcement is not weakened by any of this, because it lives one step later:
+        # `_modality_kwargs` compares the row count against the marker count actually found
+        # in `input_ids`. Zero rows against zero markers passes; zero rows against N markers
+        # still fails, and so does N rows against zero. `ModalityEmbedder` agrees -- "a key
+        # with zero rows and zero occurrences is fine".
+        #
+        # Note `check_compatible` cannot catch a mismatch here: it requires only the three
+        # columns the collator reads, and the pose column is named by the model's spec.
+        modality = {}
+        for s in self.modality_specs:
+            raw = ex.get(s.source_column)
+            if raw is None:
+                raw = []
+            modality[s.key] = torch.as_tensor(raw, dtype=torch.float32).reshape(
                 -1, s.raw_width
             )
-            for s in self.modality_specs
-        }
 
         n_total_turns = len(turns)
         start = 0
@@ -1367,7 +1383,30 @@ class TurnVectorSFTTrainer(Trainer):
 
     @torch.no_grad()
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        """Manual eval loop with all-reduced sums, reported in original target units."""
+        """Manual eval loop with all-reduced sums, reported in original target units.
+
+        A DICT of eval datasets is evaluated one component at a time, each under its own
+        `eval_<name>_` prefix -- the same contract `transformers.Trainer` offers, which this
+        override otherwise bypasses (it hands whatever it is given straight to
+        `get_eval_dataloader`, and a dict then fails with `KeyError: 0` on the first fetch).
+        That matters for a mixture: one blended number cannot say WHICH component regressed,
+        and a run that forgets ObjectNav while improving PointNav reads as flat.
+        """
+        target = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if isinstance(target, dict):
+            merged = {}
+            for name, ds in target.items():
+                merged.update(self.evaluate(
+                    eval_dataset=ds, ignore_keys=ignore_keys,
+                    metric_key_prefix=f"{metric_key_prefix}_{name}",
+                ))
+            # `_maybe_log_save_evaluate` and any `metric_for_best_model` want a bare
+            # `<prefix>_loss`; without it a dict eval silently has no scalar to track.
+            losses = [v for k, v in merged.items() if k.endswith("_loss")]
+            if losses and f"{metric_key_prefix}_loss" not in merged:
+                merged[f"{metric_key_prefix}_loss"] = sum(losses) / len(losses)
+            self.log(merged)
+            return merged
         dataloader = self.get_eval_dataloader(eval_dataset)
         model = self._wrap_model(self.model, training=False)
         was_training = model.training
