@@ -285,3 +285,15 @@ episode_labels_table["everything"] = sum([episode_labels_table[key] for key in e
 episode_labels_table['sample400_a'] = episode_labels_table['sample400'][:200]
 episode_labels_table['sample400_b'] = episode_labels_table['sample400'][200:]
 episode_labels_table['sample_debug'] = episode_labels_table['sample400_success'][:10] + episode_labels_table['sample400_fail'][:10]
+
+
+# --- Harness-uid forms, added alongside the originals -------------------------------------
+# `<name>__uid` selects the same episodes addressed the way `objectnav_eval` addresses them
+# (`<scene>:<episode_id>#<occurrence>`), which is what the continuous ObjectNav env actor
+# consumes. The originals are untouched: `env.habitat.HabitatEnvActor` matches
+# `f"{scene_id}_{eps.episode_id}"` against them, and replacing them would make every existing
+# discrete run filter to zero episodes without raising. See `longnav/episode_uids.py` for how
+# they were generated and verified, and for the one typo'd label carried forward on purpose.
+from longnav.episode_uids import EPISODE_UID_TABLE as _EPISODE_UID_TABLE  # noqa: E402
+
+episode_labels_table.update(_EPISODE_UID_TABLE)

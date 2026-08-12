@@ -97,7 +97,17 @@ class ContinuousObjectNavEnvActor:
 
     # -- env-actor interface ------------------------------------------------------------
     def assign_shard(self, episodes: Optional[List[str]] = None) -> None:
-        """Take a slice of the split by uid. `None` means everything this actor can see."""
+        """Take a slice of the split. `None` means everything this actor can see.
+
+        ACCEPTS BOTH UID CONVENTIONS, because the two repos mean different things by
+        `episode_id` and the difference is silent. `longnav.constants.episode_labels_table`
+        labels look like `mv2HUxq3B53_55`, meaning *index 55 in that scene's JSON*, because
+        habitat-lab's `from_json` overwrites `episode_id` with `str(i)`. `objectnav_eval`
+        preserves the real id -- and in HM3D val every episode carries `episode_id == "0"` --
+        so its uid for the same episode is `mv2HUxq3B53:0#56`. Matching only on our own uid
+        would leave every longnav-labelled shard empty, and an empty shard reads as "this
+        actor is already exhausted" rather than as an error.
+        """
         self._shard = None if episodes is None else list(episodes)
         self._episodes = None
         self._cursor = 0
@@ -197,12 +207,55 @@ class ContinuousObjectNavEnvActor:
         )
         episodes = list(source.load())
         if self._shard is not None:
-            wanted = set(self._shard)
-            episodes = [e for e in episodes if e.uid in wanted]
+            episodes = self._select(episodes, self._shard)
         self._episodes = episodes
         rng = np.random.default_rng(self.seed)
         self._order = list(rng.permutation(len(episodes)))
         self._cursor = 0
+
+
+    def _select(self, episodes: List[Any], wanted: List[str]) -> List[Any]:
+        """Resolve a shard against harness uids, and RAISE on anything unresolved.
+
+        DELIBERATELY DOES NOT TRANSLATE longnav labels. The two repos mean different things
+        by `episode_id`: `longnav.constants.episode_labels_table` uses `mv2HUxq3B53_55`,
+        meaning index 55 in that scene's JSON, while a harness uid is
+        `scene:episode_id#occurrence` where the occurrence counts appearances of that
+        `scene:episode_id` pair in load order. Those coincide only when every episode in the
+        scene carries the same id -- true for most of HM3D val and NOT true everywhere, so
+        deriving one from the other positionally resolves to the WRONG EPISODE in some
+        scenes, silently, and the run reports a sample101 number over a set that is not
+        sample101.
+
+        `scripts/episode_set_from_longnav.py` in habitat_physical_nav already does this
+        translation and VERIFIES each index against the raw JSON's `start_position` rather
+        than assuming it. Run that once, pass its output here, and there is nothing to get
+        wrong. Re-deriving it in this file would be a second implementation of exactly the
+        mapping that needs checking.
+        """
+        by_uid = {e.uid: e for e in episodes}
+        out, missing = [], []
+        for label in wanted:
+            hit = by_uid.get(label)
+            if hit is None:
+                missing.append(label)
+            else:
+                out.append(hit)
+        if missing:
+            looks_longnav = sum("_" in m and ":" not in m for m in missing)
+            hint = ""
+            if looks_longnav:
+                hint = (
+                    " -- these look like longnav labels (`scene_index`). Translate them "
+                    "first with habitat_physical_nav/scripts/episode_set_from_longnav.py, "
+                    "which checks each index against the raw JSON instead of assuming the "
+                    "index and the uid occurrence agree; they do not in every scene."
+                )
+            raise KeyError(
+                f"{len(missing)} of {len(wanted)} shard labels matched no episode in "
+                f"{self.episodes_path} (e.g. {missing[:3]}){hint}"
+            )
+        return out
 
     def _next_admissible_episode(self):
         """The next episode the robot can actually reach, skipping the rest with a reason.
