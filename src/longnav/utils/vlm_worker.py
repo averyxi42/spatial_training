@@ -120,13 +120,20 @@ class VLMWorker:
         init_seed = self.policy_head_config.get('action_head_init_seed')
         if init_seed is not None:
             torch.manual_seed(init_seed)
-        self.model.action_head = ContinuousActionHead(
-            input_dim=hidden_size,
-            action_dim=self.policy_head_config['action_space_dim'],
-            init_log_std=self.policy_head_config['gaussian_init_log_std'],
-            min_log_std=self.policy_head_config['gaussian_min_log_std'],
-            max_log_std=self.policy_head_config['gaussian_max_log_std'],
-            dtype=getattr(torch, self.dtype) if isinstance(self.dtype, str) else self.dtype,
+        dtype = getattr(torch, self.dtype) if isinstance(self.dtype, str) else self.dtype
+        # Dispatch on the config's own `_target_`, which `gaussian_head` already sets to
+        # `ContinuousActionHead` -- so that path resolves to exactly the class it always
+        # built, constructed by a classmethod that reproduces exactly the call that used to
+        # be inlined here, AFTER the same `torch.manual_seed` above. A config without
+        # `_target_` (anything predating the field) also lands on ContinuousActionHead.
+        target = self.policy_head_config.get('_target_')
+        if target in (None, "longnav.utils.vlm_worker.ContinuousActionHead"):
+            head_cls = ContinuousActionHead
+        else:
+            from hydra.utils import get_class
+            head_cls = get_class(target)
+        self.model.action_head = head_cls.from_policy_head_config(
+            self.policy_head_config, input_dim=hidden_size, dtype=dtype,
         ).to(self.model.device)
 
     def tokenize_inputs(self,messages,images):
@@ -574,6 +581,22 @@ class ContinuousActionHead(nn.Module):
         log_std = torch.clamp(self.log_std, self.min_log_std, self.max_log_std)
         log_std = log_std.view(1, 1, -1).expand_as(mu)
         return {"mu": mu, "log_std": log_std}
+
+    @classmethod
+    def from_policy_head_config(cls, cfg, input_dim: int, dtype):
+        """Exactly the construction `_ensure_continuous_action_head` used to inline.
+
+        Exists so head selection can dispatch on `_target_` without the Gaussian path
+        changing at all -- same arguments, same order, same defaults.
+        """
+        return cls(
+            input_dim=input_dim,
+            action_dim=cfg['action_space_dim'],
+            init_log_std=cfg['gaussian_init_log_std'],
+            min_log_std=cfg['gaussian_min_log_std'],
+            max_log_std=cfg['gaussian_max_log_std'],
+            dtype=dtype,
+        )
     
 class VLMWrapper(nn.Module):
     """

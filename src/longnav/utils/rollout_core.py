@@ -58,6 +58,33 @@ def substitute_convo_template(conversation_template: List[Dict], substitutions: 
         
     return new_conversation
 
+
+def reduce_gaussian_logprob(log_prob: np.ndarray, mode: str = "sum") -> np.ndarray:
+    """Collapse a diagonal Gaussian's per-dimension log-prob to one number per step.
+
+    `sum` is the joint log-density and is the DEFAULT, so every existing continuous run is
+    byte-identical. It is also the only correct joint likelihood; the alternative exists for
+    a specific, measured reason:
+
+    a PPO ratio is `exp(sum of D log-ratios)`, whose variance grows with `D`. At the
+    Gaussian head's `D = 2` that is a non-issue. At the latent head's `D = 1024` the ratio
+    saturates the clip on nearly every sample and the gradient is whatever survives. `mean`
+    is the dimension-level analogue of the token-level ratios sequence-level RLHF uses: a
+    biased surrogate, chosen deliberately, and never silently -- it must be asked for in the
+    policy-head config.
+
+    Masking the inactive subspace instead is the third option and is NOT implemented here:
+    it needs the per-dimension KL from the SFT run to decide which dims carry information,
+    and inventing that set before it is measured would be guessing dressed as a feature.
+    """
+    if mode == "sum":
+        return np.sum(log_prob, axis=-1).astype(np.float32)
+    if mode == "mean":
+        return np.mean(log_prob, axis=-1).astype(np.float32)
+    raise ValueError(
+        f"logprob_reduction must be 'sum' or 'mean', got {mode!r}"
+    )
+
 class EpisodeRolloutMixin:
     def _pack_trajectory(self, buffer: List[Dict]) -> Dict[str, np.ndarray]:
         """
@@ -157,9 +184,26 @@ class EpisodeRolloutMixin:
                             self.policy_head_config['continuous_action_clip_high'],
                         )
                     log_prob = -0.5 * (((action - mu) / std) ** 2 + 2.0 * log_std + np.log(2.0 * np.pi))
-                    action_logprobs = np.sum(log_prob, axis=-1).astype(np.float32)
+                    action_logprobs = reduce_gaussian_logprob(
+                        log_prob, self.policy_head_config.get('logprob_reduction', 'sum')
+                    )
                     action_to_env = action.astype(np.float32).reshape(-1)
                     action_id = action_to_env
+                    # THE ACTUATOR SEAM. A head may declare that its action is not what the
+                    # environment executes -- the latent head's action is a 1024-d intent and
+                    # the robot needs a chunk of poses, decoded by the flow head on THIS side
+                    # because the decoder holds trained weights and the env process has none.
+                    # `action_id` keeps the sampled action, so what is stored for the PPO
+                    # ratio stays the thing the log-prob was computed over. No existing head
+                    # defines `decode_action`, so this is identity for every current path.
+                    # `run_episode` executes INSIDE the VLM worker, so the head is local at
+                    # `self.model.action_head`. Resolved defensively: test stubs stand in for
+                    # the worker without a `model` at all, and they must keep behaving
+                    # exactly as they did before this hook existed.
+                    _head = getattr(getattr(self, "model", None), "action_head", None)
+                    _decode = getattr(_head, "decode_action", None)
+                    if _decode is not None:
+                        action_to_env = _decode(action_to_env)
                     vlm_logs |= {
                         'mean/action_l2': float(np.linalg.norm(action_to_env)),
                         'mean/action_abs_mean': float(np.mean(np.abs(action_to_env))),
