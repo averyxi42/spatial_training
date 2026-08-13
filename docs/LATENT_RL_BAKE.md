@@ -1,7 +1,56 @@
 # The pre-RL bake: recipe, evidence, and what to watch
 
-Status: recipe fixed, not yet launched. Branch `latent_rl`. Companion to `LATENT_RL.md`
-(the design) and `LATENT_RL_ENV.md` (the RL environment and policy head).
+Status: **CONCLUDED 2026-08-13 — the programme is paused, and this document is its record.**
+Branch `latent_rl`. Companion to `LATENT_RL.md` (the design) and `LATENT_RL_ENV.md` (the RL
+environment and policy head). RL proceeds via flow-SDE instead (`FLOW_SDE_RL.md`); the
+comparison below is pre-committed so this arm is measured, not starved.
+
+## How it ended: the bake never beat the pilot, and the probe picked the worst checkpoint
+
+Both bakes were stopped early — v1 at step 752 (all twelve per-component eval metrics regressing,
+accelerating), v2 at step 2000 (deliberately, after the closed-loop results below). Checkpoints
+500/1000/1500/2000 of v2 are kept. The full trade curve, all measured identically (spread probe:
+32 obs x 16 samples on `formatted_pose` validation; closed-loop: sample101, 70 s parity,
+`--latent-mode mean`, dataset navmesh):
+
+| checkpoint | spread (tau=1) | creep | offline evals | closed-loop oracle | oSPL_fix |
+|---|---|---|---|---|---|
+| v3 deterministic baseline | n/a | n/a | best | **0.663** | **0.348** |
+| latent pilot ck1000 (shipped) | 0.906 | 0.881 | — | 0.545 | 0.257 |
+| v2 ck500 | 1.562 | 0.891 | best of v2 | — | — |
+| **v2 ck1000** | 1.288 | 0.884 | good | **0.436** [CI 0.343-0.533] | 0.211 |
+| v2 ck1500 | **3.385** | **0.545** | worst | **0.034** [CI 0.009-0.115] | — |
+
+Three conclusions, in decreasing order of importance:
+
+1. **Spread and competence decouple, so the spread probe CANNOT stand alone as a gate.** ck1500
+   had the best spread ever measured and the only genuinely mode-like sampling (creep 0.545
+   against ~0.88 everywhere else) — and it is catastrophic in closed loop: 2/59 oracle, median
+   closest approach 4.69 m, 57/59 episodes running the full step cap, tracking quality normal
+   (0.72-0.87). The policy retained locomotion and lost goal-seeking, exactly what its
+   `mae_dtheta` degradation (worst-moving offline metric) predicted. Past some point, rising
+   spread is the signature of a decoder whose outputs are no longer coherent trajectories, not of
+   a latent doing its job. The gate was always documented as two-sided; ck1500 is the measured
+   proof of WHY, with a 100x closed-loop penalty attached.
+2. **The conversion tax did not shrink with scale or care.** The pilot paid 0.663 -> 0.545; v2's
+   best checkpoint pays 0.663 -> 0.436. Consistent with the equilibrium account above: the
+   `phi(s*)` reconstruction cost is structural to injecting exploration noise upstream of the
+   decoder, and no amount of weight tuning removed it.
+3. **The dither-to-mode transition (ck1000 -> ck1500, creep 0.88 -> 0.55) was a cliff, not a
+   trade.** Nothing in the offline metrics scaled with the damage: rmse moved ~25% while oracle
+   success fell 13x.
+
+**The programme's real deliverable is the mechanism knowledge**, all of it verified against
+source or measurement in this document: the sigma relaxation oscillator; the LayerNorm gauge
+that rewards shrinking `h` invisibly to reconstruction; the `to_log_sigma` fan-in setting the
+takeoff rate (bias moved 0.006 nats in 500 steps while the weight went from exactly zero to std
+0.0037); the structural `phi(s*)` tax; and the spread/competence decoupling.
+
+**Pre-committed comparison (unchanged):** when a flow-SDE RL number exists, the latent arm runs
+from **v2 ck1000** (0.436 closed-loop, dither-type sampling, dead-dim masking on) under matched
+scenes, budgets, seeds and reward. If the latent arm wins that comparison despite its weaker
+start, a v3 bake with the structural fixes (detach `hf`, probe normalised by `h_std.detach()`,
+pinned sigma) is justified; otherwise nothing further is.
 
 The pilot is `dump/pose_injection/run_reinitdiv_clean` (1500 steps, frozen trunk). This
 document is the long run built from it, and — equally important — the list of things that
