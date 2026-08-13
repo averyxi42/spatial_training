@@ -229,14 +229,44 @@ pilot. Each needs a decision only if its monitor fires.
 
 ## Monitors, and what each one means
 
-| quantity | healthy | what a move means |
+**Every threshold below is in TRUE units, i.e. the logged value times 20.** An earlier version
+of this table stated four of them against logged values and one against a number the metric
+cannot reach; all five are corrected here.
+
+| quantity | healthy (true units) | what a move means |
 |---|---|---|
-| `kl_raw` | stays ~0.5 nats | a rise = the posterior woke; train/deploy mismatch |
-| `sigma` (x20 the logged value) | 0.4-0.6x `h_std` | collapse = no exploration; inflation = term buying scale |
-| `h_std_perdim` | stable | rising = the term is inflating `h` instead of improving the decoder |
-| `dadc_clipfrac` | ~0 | 1.0 = the clamp binds, diversity gradient is a constant, term is dead |
-| `div_w` | fixed at 0.05 | any movement means the controller is on; it should not be |
+| **`sigma / h_std_perdim`** | **0.4-0.6** | **the only gauge-invariant scalar here, and the one to watch.** It is the latent's noise-to-signal: the observation's share of `c`'s variance is `1/(1+r^2)`, so r=0.7 is 67%, r=1.4 is 34%, r=2 is 20%. Multiply by `tau` for what RL actually sees |
+| `delta_mu_over_sigma` | <~0.15 | **the train/deploy mismatch gauge** — how far `q` sits from `p` in units of sigma. Use this, NOT `kl_raw` |
+| `kl_raw` | ~10-30 nats total | free bits is a **per-dimension** 0.01-nat floor, so the "10.24-nat allowance" is just 1024 dims sitting on it. Read `kl_raw/1024` against 0.01: the pilot ran 0.011, i.e. marginally active. **Not** a mismatch gauge |
+| `dadc_clipfrac` | ~0 | **maximum possible logged value is 0.05** (a count over N turns drained by N*20). 0.05 = fully clipped. A table saying "1.0 = clamp binds" describes an unreachable state |
+| `div_w` | equals `--latent-diversity` | logged value is the true weight / 20. Movement means the controller is on; it should not be |
+| `h_std_perdim` | **not a gate** | gauge-dependent: `h -> h/k` with a `k`x sharper decoder is behaviourally identical, and v1 fell 60% with rmse flat. Only its ratio to `sigma` means anything |
 | per-component eval | all three tracked | a component regressing under a blended number is the failure `--eval-per-component` exists to catch |
+
+### v1 outcome: stopped at step 752, and what it taught
+
+Run `run_bake_latent_v1` (`--latent-diversity 1.0`) was stopped because **all twelve
+per-component eval metrics regressed monotonically and were accelerating** (e.g. pointnav
+`mae_dtheta` 0.0204 -> 0.0248 -> 0.0307 at steps 250/500/750), while the spread probe on its
+ck500 read far above what we need. Probe, identical settings, 32 observations x 16 samples on
+`formatted_pose` validation:
+
+| checkpoint | ratio vs noise (tau=1) | tau=2 | vary-`c` head std | noise-arm head std | `c` share of heading variance |
+|---|---|---|---|---|---|
+| **bake v1 ck500** | **1.920** | 2.232 | 0.348 | **0.181** | **78.7%** |
+| pilot ck1000 (shipped) | 0.906 | 1.243 | 0.305 | 0.336 | 45.1% |
+| pilot ck1500 | 0.830 | 1.193 | 0.279 | 0.336 | 45.1% |
+
+Two things worth keeping. First, the pilot ck1000 measurement (0.906) is close to the 0.854
+recorded above, so probe settings are comparable across runs and this table can be extended.
+Second, v1's gain came from **both** arms — more variation from `c` and roughly half the
+variation from flow noise. The second is the RL-relevant one, since `z_0` is environment noise
+the policy cannot select on.
+
+**The lesson is that the pilot's weight was not transferable.** The pilot ran frozen, where the
+only route to spread was growing `sigma`. Unfrozen, the gauge `h -> h/k` with a sharper decoder
+is a second and cheaper route that reconstruction cannot see, so the same weight buys about
+twice the spread — and charges precision for it. v2 runs at 0.3.
 
 **Every latent metric in the training log is 20x too small.** They are per-turn sums divided
 by `n_rows = turns * n_ticks`. An earlier conclusion that `sigma` was 6-120x `h_std` came from
