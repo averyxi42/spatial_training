@@ -181,11 +181,61 @@ and do not:
 
 * `kl_shared_sigma` is `sum dmu^2 / (2 sigma^2)` — monotonically *decreasing* in `sigma`. The
   KL does not restrain growth, it mildly rewards it. (It is inert anyway under free bits.)
-* `--latent-diversity-clamp` clamps the *ratio*, and the ratio is smallest exactly when
-  `sigma` is largest. **The clamp cannot bind during an excursion** — `dadc_clipfrac` stayed 0
-  through a 79x one. It guards the opposite failure.
+* `--latent-diversity-clamp` clamps the *ratio*. It does NOT bind while `sigma` is large (the
+  ratio is smallest exactly then), but it **does** bind during the sensitivity spike that
+  precedes takeoff: in v1 at step 76, raw `dadc_clipfrac` was 0.02727 against the 0.05
+  ceiling, i.e. **54.5% of pairs clipped**, over a narrow window (steps ~70-86). An earlier
+  version of this document claimed the clamp "cannot bind" on the strength of sampling every
+  ninth step and seeing zeros. It binds, hard, and for clipped pairs the diversity gradient is
+  exactly zero — so the clamp is a partial brake acting at the spike, not an inert guard.
 
 Reconstruction is the only opposing force and it only acts after the excursion.
+
+### Correction: what actually drives the takeoff (external review, verified in code)
+
+The "constant gradient on `log sigma` => single-rate exponential" story above is geometrically
+right but **dynamically wrong, refuted by our own numbers**: induction runs at 0.018 nats/step
+(0.002 -> 0.0125 over ~100 steps) and takeoff at 0.49 nats/step (0.0125 -> 79.4 over 18), a
+**27x acceleration**. No single rate fits both, and the LR ramp cannot close the gap. Three
+corrections, each checked against the source:
+
+1. **`h` is NOT detached in the diversity block** (`hf = context.float()`,
+   `flow_matching_head.py:1104`). The diversity gradient therefore flows into the backbone,
+   which can satisfy the term by moving `h` — not merely by growing `sigma`.
+2. **The decoder LayerNorms the context.** `ctx_tok = context.view(N, C, d)` is a reshape with
+   no projection (`:665`) into a `norm_first=True` encoder (`:578`), so the first operation
+   touching a context token is a LayerNorm. The decode is therefore ~invariant to token
+   *scale* — which is why rmse held flat through a 60% `h_std` collapse — but a perturbation
+   `sigma*eps` arriving through that LayerNorm has effective size `~sigma / std(token)`.
+   **Shrinking `h` at fixed `sigma` inflates `D` mechanically, with no decoder weight change
+   at all.** So the `h_std` decline is not drift along a direction reconstruction is
+   indifferent to; it is a direction the objective actively rewards and reconstruction cannot
+   see. `sigma/h_std` is not merely the convenient invariant — it is the only scale the
+   decoder can physically perceive.
+3. **The rate is set by the log-sigma head's fan-in, not by `w * lr`.** Under Adam a
+   persistent gradient saturates near +-`lr` per parameter, so the bias alone gives 1e-4
+   nats/step — 5000x too slow for the observed takeoff. The observed rate is reachable only
+   through `to_log_sigma.weight`'s 1024 coordinated entries projected back through `h`. `w`
+   enters through the Adam SNR (signal ∝ `w`, noise largely `w`-independent), which is why a
+   20x smaller weight still produced a ~20x slower takeoff even though Adam normalises
+   magnitude away.
+
+The overshoot is **integrator windup into a dead zone**: past saturation the diversity
+gradient vanishes, and at very large `sigma` the reconstruction gradient does too (the flow
+loss plateaus at its unconditional value), so `log sigma` coasts on momentum. Predicted lag of
+10-20 steps from D-crash to `sigma`-peak; **measured 20 in v1**. There is no universal
+overshoot constant — it is `exp(slope x lag)`, and both are history-dependent.
+
+**`rmse` never sees `sigma`.** `metrics_ctx = latent.decode(pieces["mu"])` (`:1072`) — metrics
+report the deployed mean path. So "reconstruction pulls `sigma` back" is inferred, not
+observed; the restoring force lives in `fm_loss_sum`, which is the series to read.
+
+**`z_0` is shared across the whole batch**, not just within a pair (`:1115-1116`,
+`randn(1,T,D).expand(N,...)`). Sharing within the pair is the point; sharing across rows is
+incidental and means the diversity gradient's `z_0` noise does not batch-average. Per-row
+`z_0` (still shared within the pair) is free variance reduction — but by (3) it would *raise*
+the Adam SNR and therefore **speed up** the takeoff, so it must not be done before the damping
+is in.
 
 ### Consequences, and levers if this needs fixing
 
