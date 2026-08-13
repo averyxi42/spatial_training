@@ -300,14 +300,32 @@ measured after a 30-hour bake. Here it is measurable with **no training at all**
    - **3b. The rollout seam.** Assert per-step `|rollout_logprob − old_log_prob|` is under a
      tolerance in nats. This is the only check that sees rollout-side dropout, because it is the
      only one comparing a *sampled* quantity against a recompute.
-     **The tolerance must be measured, not mined.** `rollout_logprobs` is written into the
-     trajectory dict (`rollout_core.py:255`) but the dict is never persisted — `dump/rl_training/
-     */dbg/result_*.pkl` holds episode outcomes only (`success`, `spl`, `distance_to_goal`,
-     `pos_rots`, `oracle_action`), and the tensors are consumed by the update. Every past RL run
-     was also **discrete**, so even persisted they would be per-token log-probs over a six-way
-     vocab rather than a 600-term sum — the wrong magnitude to extrapolate from. Budget a short
-     dedicated rollout with a continuous head, dumping both columns, before the flow-SDE code
-     depends on this number.
+     **The floor is real, small, and already measured — but only at low dimension.**
+     Training-run trajectory dicts are not persisted (`dump/rl_training/*/dbg/result_*.pkl` holds
+     episode outcomes only), but `tests/forward/fixtures/continuous_dummy_rpp/
+     component_a_traj_batch.pt` stores a real continuous-head `traj_batch` carrying both columns.
+     Measured there, at `action_dim = 2`, over 112 valid steps:
+
+     | | value |
+     |---|---|
+     | mean `\|rollout_logprob − old_log_prob\|` | 0.095 nats |
+     | median / p95 / max | 0.106 / 0.211 / 0.211 |
+     | mean `\|old_log_prob\|` | 11.03 |
+     | relative | ~1.9% |
+     | signed mean / std | +0.064 / 0.105, **86% one-sided** |
+
+     So the kv-cache-vs-full-forward equivalence is numerically good, as the framework's design
+     intends, and a tolerance-based version of this check is sound.
+
+     **But the gap has a significant systematic component** (signed mean ~6.5 standard errors from
+     zero), so it does **not** extrapolate as zero-mean noise. At 600 terms, `sqrt(dim)` scaling
+     gives ~1.6 nats and linear scaling ~19 nats — and a floor of 19 nats is a ratio floor of
+     `e^19`, which would swamp any PPO clip range and make the check useless. **Measure at the real
+     dimension before relying on it**; extending `tests/forward/scenarios/continuous_dummy_rpp.yaml`
+     to the chunk dimension is the cheap way, since the fixture machinery already exists.
+
+     Note this floor does **not** contaminate the PPO ratio itself: that compares `log_prob`
+     against `old_log_prob`, both full forwards. It applies only to this rollout-seam check.
    - **3c. The training seam.** Mean `|log ratio|` at step zero under the same calibrated
      tolerance, catching train-mode dropout in the training forward.
 4. **fp32 accumulation, as a launch gate.** A bf16 sum of 600 log-prob terms carries ~2 decimal

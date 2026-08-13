@@ -93,7 +93,7 @@ gauge** — a widening gap means lower `a` or lower `N`.
 
 The spec has no knowledge of our framework, so these remain ours to carry:
 
-- **Their test 8.2 is impossible as written here.** It asks that `logprob_new == logprob_old`
+- **Their test 8.2 is sound in concept but needs a tolerance here, not an equality.** It asks that `logprob_new == logprob_old`
   exactly when theta is unchanged. In this framework `old_log_prob` is recomputed by a **full
   forward** while the rollout used a **kv cache** (`rollout_core.py:354-355`), and the training
   forward adds unmerged LoRA and gradient checkpointing. Their check needs our tolerance treatment
@@ -103,7 +103,9 @@ The spec has no knowledge of our framework, so these remain ours to carry:
   zero.
 - **fp32 accumulation** over the log-prob sum.
 - **The three continuous-head exclusions** (`use_ref` at `rollout_core.py:389`,
-  `train/rollout_kl_divergence` at `vlm_worker.py:972`, and trajectory tensors never persisted).
+  `train/rollout_kl_divergence` at `vlm_worker.py:972`, and training-run trajectory tensors not
+  persisted -- though `tests/forward/fixtures/continuous_dummy_rpp/` does store a real continuous
+  `traj_batch` with both log-prob columns, which is where the seam tolerance was measured).
   Their instrument panel assumes these diagnostics exist; here two of them are gated off.
 - **`z_0` is unusually large for us.** They keep `z_0` as the policy's real deployed stochasticity,
   which is reasonable when it is modest. Ours measures **0.737 rad terminal heading std, with
