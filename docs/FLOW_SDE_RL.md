@@ -195,6 +195,46 @@ head it is the last chain element reshaped. `actions_continuous` stores the flat
 preserves the invariant that site's comment already states — *what is stored for the PPO ratio
 stays the thing the log-prob was computed over.*
 
+## The deploy-time sampler must ALSO be the SDE
+
+The harness today evaluates with the deterministic ODE. **It must not, once RL has run.**
+
+The peer property above holds because `v` is a valid flow-matching velocity field: the ODE and the
+SDE share marginals *for such a field*. RL modifies `v` under no such constraint — after training
+it is a drift function, not the velocity field of any probability path. So the shared-marginal
+property **holds at initialisation and is not preserved by training**, and the ODE's and SDE's
+marginals may diverge arbitrarily. Training the SDE and evaluating the ODE therefore deploys a
+policy that was never optimised, and the gap grows with how much RL moved `v`.
+
+Deploy with the SDE at the *same* schedule used for training. Consequences to accept, both benign:
+the eval path needs the SDE sampler, and eval stays stochastic — which it already is, since `z_0`
+is drawn fresh every step. Consequence to watch: pre- and post-RL evaluations must use the same
+sampler, or the comparison measures the sampler change rather than the learning.
+
+## Denoising steps: all of them, and the same count as deployment
+
+`T = 10`, matching `num_inference_steps` in the checkpoint's `fm_config`. All 10 transitions carry
+gradient; `z_0` does not, as above.
+
+**Denoising reduction — collecting at fewer steps than inference uses — is rejected**, though it is
+standard in this literature (Flow-GRPO). Euler discretisation error already perturbs the
+shared-marginal property; fewer steps worsens it, so the collection policy measurably is not the
+inference policy. Flow-GRPO pairs the technique with a KL-to-reference anchor, and `use_ref` is
+dead code for continuous heads here (`rollout_core.py:389`) — so adopting it would mean taking the
+technique without the mitigation it is designed to be used with. If it is ever revisited, revive
+`use_ref` first.
+
+**Training only the last K steps (DPPO-style) is also rejected**, for a different reason. It is
+coherent — an exact policy gradient for the MDP that treats `z_{T-K}` as state — and it cuts ratio
+variance proportionally. But early steps (`t` near 1, high noise) set coarse structure and *which
+mode* the sample lands in, while late steps refine detail. Restricting gradient to late steps buys
+variance reduction by surrendering mode control, which is the exact capability that distinguishes
+this design from an action-space Gaussian. Given that up, the action-space Gaussian is simpler and
+should be preferred instead.
+
+**The variance lever is per-step clipping, not step reduction** — it bounds each transition's
+contribution while leaving gradient flowing to every step, so early-step mode control survives.
+
 ## Failure modes designed for, not discovered
 
 1. **Dropout in the velocity field will silently corrupt the PPO ratio.** `old_log_prob` is
