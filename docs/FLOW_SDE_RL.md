@@ -65,6 +65,14 @@ of `z_0` and into `c`, 0.737 -> 0.17.)
 
 ## The policy
 
+**RL here is a peer of SFT, not a layer bolted on top of it.** The probability-flow ODE and its
+corresponding SDE share marginals at every `t` by construction, so sampling the chain reproduces
+exactly the action distribution the SFT model already defines — the same prior, the same velocity
+field, the same parameters, reached by a stochastic path instead of a deterministic one. RL
+therefore **initialises at the SFT policy itself**, and the conversion costs nothing. That is the
+whole difference from the latent, where RL acted on `c` — a variable SFT never had — and obtaining
+it required inserting a bottleneck that changed the model class and charged `phi(s*)` forever.
+
 Convert the probability-flow ODE to an SDE so each denoising step has a tractable Gaussian
 transition, and **treat the whole chain as one action**:
 
@@ -87,6 +95,18 @@ absorbed. The SDE framing is motivation only; the invariant that matters is that
 and `chain_log_prob` use the *identical* transition density, which the round-trip test in
 Validation asserts. A convention mismatch between them is a silent wrong-ratio bug of exactly the
 class failure mode 1 describes.
+
+**`sigma_t` is bounded above by fidelity, not just by taste.** It is the dial that sets how much
+of the policy's stochasticity the policy actually owns: `z_0` contributes unit variance per dim
+and the injected noise contributes ~`sum_t sigma_t^2`, and only the latter is part of the action.
+Larger `sigma_t` therefore hands RL a larger share — but the shared-marginal property above holds
+for the *exact* score, and ours is recovered from an approximate velocity field
+(`dx = [v + (sigma^2/2)*score]dt + sigma dW`). The larger `sigma_t`, the more the sampler leans on
+that approximation and the further its marginals drift from the ODE's. Past some point the sampler
+stops reproducing the SFT distribution **before RL has done anything**. The usable range is where
+injected noise dominates `z_0` yet fidelity holds, which is exactly what the pre-training sweep in
+Validation measures — so that sweep fixes the schedule, bounds the policy's share of the
+randomness, and checks the peer property empirically rather than by appeal to the theorem.
 
 A second, distinct cost: PPO's clip acts on the **joint** ratio, and joint KL upper-bounds
 marginal KL — so the trust region is conservative, and a clip range calibrated on a
