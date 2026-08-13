@@ -298,10 +298,16 @@ measured after a 30-hour bake. Here it is measurable with **no training at all**
      eval-pin lives *inside* the head's methods (the `LatentIntentHead` precedent) and is
      caller-independent.
    - **3b. The rollout seam.** Assert per-step `|rollout_logprob − old_log_prob|` is under a
-     tolerance in nats. `rollout_logprobs` is already stored (`rollout_core.py:255`) for every past
-     continuous-head run, so **the tolerance is calibratable from existing logs today** — the
-     historical gap is the numeric floor (kv-cache vs full forward). Rollout-side dropout shows up
-     here at the scale of the whole 600-term log-prob; nothing else does.
+     tolerance in nats. This is the only check that sees rollout-side dropout, because it is the
+     only one comparing a *sampled* quantity against a recompute.
+     **The tolerance must be measured, not mined.** `rollout_logprobs` is written into the
+     trajectory dict (`rollout_core.py:255`) but the dict is never persisted — `dump/rl_training/
+     */dbg/result_*.pkl` holds episode outcomes only (`success`, `spl`, `distance_to_goal`,
+     `pos_rots`, `oracle_action`), and the tensors are consumed by the update. Every past RL run
+     was also **discrete**, so even persisted they would be per-token log-probs over a six-way
+     vocab rather than a 600-term sum — the wrong magnitude to extrapolate from. Budget a short
+     dedicated rollout with a continuous head, dumping both columns, before the flow-SDE code
+     depends on this number.
    - **3c. The training seam.** Mean `|log ratio|` at step zero under the same calibrated
      tolerance, catching train-mode dropout in the training forward.
 4. **fp32 accumulation, as a launch gate.** A bf16 sum of 600 log-prob terms carries ~2 decimal
@@ -344,6 +350,15 @@ exploration winning despite its weaker start.
   `if self.rl_algo_config.use_ref and self.policy_head_config['type'] != "continuous"`. Not needed
   to launch, but if the first runs drift destructively off the SFT policy, restoring it is real
   work rather than a config flag.
+
+  **This is a pattern, not an isolated gap.** `vlm_worker.py:972` gates
+  `train/rollout_kl_divergence` the same way — and that metric is *exactly* the rollout-vs-recompute
+  discrepancy that validation 3b needs, already computed and logged for discrete heads. Two
+  diagnostics are silently unavailable to the continuous path, so assume there are more and check
+  before relying on any metric's presence. Dropping the `!= "continuous"` guard at `:972` would give
+  3b for free as a logged metric rather than a bespoke script, **but verify first that
+  `compute_full_kl_penalty` means anything on a summed Gaussian log-prob** — it is written for
+  categorical logits and may not transfer.
 - **Pinning `sigma` state-independently.** Note for the record that the latent's `sigma` became
   strongly state-dependent by training: `to_log_sigma.bias` moved only 0.006 nats in 500 steps
   (1.3e-5/step, under the 1e-4 `head_lr`), while `to_log_sigma.weight` went from *exactly zero* to
