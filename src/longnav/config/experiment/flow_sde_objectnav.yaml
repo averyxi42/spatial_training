@@ -1,0 +1,65 @@
+# @package _global_
+# Flow-SDE chain-head RL on continuous ObjectNav. Design: docs/FLOW_SDE_RL.md.
+# Launch with: +experiment=flow_sde_objectnav +training=hapo +resources=quad
+#
+# The conversation templates reproduce the SFT nopose format BYTE-FOR-BYTE (read from
+# data/v2_25hz_obs2.5hz/formatted_nopose row 0): the goal turn, then numbered
+# "Observation N:" turns, assistant text always the literal **____** placeholder (actions
+# live in vector space, never in text). $step is supplied by rollout_core; a mismatched
+# template puts h off-distribution from step 0 and no error will say so.
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+vlm:
+  attn_impl: sdpa
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000
+    gap: 10
+    sde_n: 3
+    # From the doc's bounds: large enough that deliberate exploration is not drowned by the
+    # checkpoint's own z_0 scatter, small enough that the marginal stays near the ODE's.
+    # First-run value; the ode-eval curve is the arbiter and this is the knob to move.
+    sde_noise_a: 0.15
+
+sim:
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1/train
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175            # 70 s of sim time at gap 10 -- the sample101 parity budget
+  success_distance: 1.0
+  navmesh: dataset          # reward geodesics on the smooth mesh; SCREENING runs on the
+                            # robot-footprint mesh regardless (objectnav_continuous.py)
+  minimal_logging: false    # per-episode MP4 + summary via the amortized flush hook
+
+rollout:
+  max_steps: 175
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+
+training:
+  # The backbone must BE the SFT policy: load the cotrain-v3 LoRA adapter, not a fresh one.
+  checkpoint: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000/adapter
+  load_optim: false
+  load_sched: false
+  # HAPO base (+training=hapo), with the chain-head exceptions:
+  rl_config:
+    entropy_bonus: 0.0      # nonzero RAISES for a chain head -- schedule-fixed entropy

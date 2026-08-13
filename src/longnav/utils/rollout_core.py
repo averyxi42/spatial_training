@@ -314,7 +314,11 @@ class EpisodeRolloutMixin:
                     action_text = ",".join([f"{x:.3f}" for x in np.asarray(action_id).reshape(-1)])
                 else:
                     action_text = self.rollout_config['action_space'][action_id]
-                messages = substitute_convo_template(self.rollout_config['convo_turn_template'],{"action":action_text})
+                # `step` is the index of the observation the appended turn introduces:
+                # "Observation 0:" lives in the start template, so after acting on
+                # observation k this turn carries observation k+1. Templates that need SFT
+                # turn numbering ("Observation $step:") read it; older templates ignore it.
+                messages = substitute_convo_template(self.rollout_config['convo_turn_template'],{"action":action_text,"step":step_count+1})
                 # print(f"sim step{step_count}")
                 done = state_dict['done']
                 step_count += 1
