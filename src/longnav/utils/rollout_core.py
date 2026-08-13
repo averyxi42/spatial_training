@@ -158,7 +158,39 @@ class EpisodeRolloutMixin:
                 # print(f"vlm step{step_count}")
                 # print("done")
                 #except for the first turn, all messages follow the exact same template.
-                if self.policy_head_config['type'] == "continuous":
+                # THE CHAIN-HEAD BRANCH, dispatched on capability, and it must come BEFORE
+                # `policy_out["mu"]`: a chain head returns `{"h"}` and has no mu, so the only
+                # guard against a KeyError is this ordering (docs/FLOW_SDE_RL.md, branch
+                # sites). Sampling, density and actuation all live in the head -- sampler and
+                # scorer share one transition function there -- this branch only stores what
+                # they return. `sde_positions` rides the trajectory dict beside
+                # `actions_continuous`; the collator pads any key it finds.
+                _chain_head = getattr(getattr(self, "model", None), "action_head", None)
+                _sample_chain = getattr(_chain_head, "sample_chain_np", None)
+                sde_positions = None
+                if self.policy_head_config['type'] == "continuous" and _sample_chain is not None:
+                    if self.rollout_config.get('use_oracle_action'):
+                        # An oracle action is a CHUNK; no unique chain ends at it, and any
+                        # bridge-sampled chain's density is not the marginal -- credit would
+                        # be silently wrong, not approximate. Hard error by design.
+                        raise RuntimeError(
+                            "use_oracle_action is incompatible with a chain-action head: "
+                            "an oracle chunk does not determine a denoising chain "
+                            "(docs/FLOW_SDE_RL.md, failure mode 3)."
+                        )
+                    chain, sde_positions, _chain_lp, action_to_env = _sample_chain(
+                        np.asarray(policy_out["h"], dtype=np.float32).reshape(-1))
+                    action_logprobs = np.float32(_chain_lp)
+                    # The action IS the chain: stored whole so the ratio is over exactly
+                    # what acted. The executed chunk is derived from it (decode_action on
+                    # the same seam as every other head), never stored in its place.
+                    action_id = chain
+                    vlm_logs |= {
+                        'mean/action_l2': float(np.linalg.norm(action_to_env)),
+                        'mean/action_abs_mean': float(np.mean(np.abs(action_to_env))),
+                        'mean/chain_logprob': float(_chain_lp),
+                    }
+                elif self.policy_head_config['type'] == "continuous":
                     mu = policy_out["mu"]
                     log_std = policy_out["log_std"]
                     std = np.exp(log_std)
@@ -262,6 +294,13 @@ class EpisodeRolloutMixin:
                     }
                     if self.policy_head_config['type'] == "continuous":
                         trajectory_dict["actions_continuous"] = np.asarray(action_id, dtype=np.float32)
+                        if sde_positions is not None:
+                            # (n,) int64 per step -> collates to (B, S, n). At n = 1 the
+                            # (S, 1) tensor DOES trigger rl_core's dim()==3/trailing-1
+                            # squeeze and collates to (B, S); the head's scorer reshapes by
+                            # its own `sde.n`, so both ranks read back correctly -- but no
+                            # other consumer may assume this key's rank.
+                            trajectory_dict["sde_positions"] = np.asarray(sde_positions, dtype=np.int64)
                     else:
                         trajectory_dict["actions"] = action_id
                         trajectory_dict["rollout_probs"] = action_probs
@@ -372,10 +411,28 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
                 else:
                     raise ValueError("No stored model inputs found for postprocessing.")
                 if self.policy_head_config['type'] == "continuous":
-                    actions_continuous = torch.as_tensor(self.rl_trajectory['actions_continuous'], dtype=policy_stats['mu'].dtype, device=policy_stats['mu'].device)
-                    if actions_continuous.dim() == 2:
-                        actions_continuous = actions_continuous.unsqueeze(0)
-                    old_log_prob = self._continuous_log_prob(actions_continuous, policy_stats['mu'], policy_stats['log_std']).squeeze(0).float().cpu()
+                    # Chain head first: `policy_stats` is `{"h"}` here, so both the dtype
+                    # anchor (`policy_stats['mu'].dtype`) and `_continuous_log_prob` below
+                    # would KeyError -- same ordering constraint as the sampling branch.
+                    _head = getattr(getattr(self, "model", None), "action_head", None)
+                    _chain_lp = getattr(_head, "chain_log_prob_batch", None)
+                    if _chain_lp is not None:
+                        hh = policy_stats['h']
+                        actions_continuous = torch.as_tensor(
+                            self.rl_trajectory['actions_continuous'],
+                            dtype=torch.float32, device=hh.device)
+                        if actions_continuous.dim() == 2:
+                            actions_continuous = actions_continuous.unsqueeze(0)
+                        sde_positions = torch.as_tensor(
+                            np.asarray(self.rl_trajectory['sde_positions']),
+                            device=hh.device).reshape(1, actions_continuous.shape[1], -1)
+                        old_log_prob = _chain_lp(hh, actions_continuous,
+                                                 sde_positions).squeeze(0).float().cpu()
+                    else:
+                        actions_continuous = torch.as_tensor(self.rl_trajectory['actions_continuous'], dtype=policy_stats['mu'].dtype, device=policy_stats['mu'].device)
+                        if actions_continuous.dim() == 2:
+                            actions_continuous = actions_continuous.unsqueeze(0)
+                        old_log_prob = self._continuous_log_prob(actions_continuous, policy_stats['mu'], policy_stats['log_std']).squeeze(0).float().cpu()
                     self.rl_trajectory['old_log_prob'] = old_log_prob.numpy()
                 else:
                     logits = policy_stats['logits']
@@ -425,8 +482,19 @@ class RLActor(RLWorker):
         old_values = traj_batch.get('values',None)
         rollout_log_probs = traj_batch.get('rollout_logprobs',None)
         ref_logprobs = traj_batch.get('ref_logprobs',None)
-    
-        return super().train_rl_step(embeds_inputs, actions=actions, old_log_prob=old_log_prob, advantages=advantages, returns=returns, old_values=old_values, rollout_log_probs=rollout_log_probs, ref_log_probs=ref_logprobs, actions_continuous=actions_continuous)
+        sde_positions = traj_batch.get('sde_positions', None)
+
+        # NOTE on the chain head's `old_log_prob`: the postprocess value is passed through
+        # unchanged, but `rl_loss` re-anchors it to the FIRST training epoch's own
+        # `log_prob.detach()` (see the chain branch there). Postprocess, an extra no-grad
+        # forward taken here, and the grad-enabled epoch forward were measured as different
+        # numeric regimes -- the epoch forward's `h` sits a stable 25% from the other two
+        # after `_setup_training`, which the chain density amplifies to 40-90 nats and every
+        # ratio pins at the clip. Grad and no-grad epoch forwards are bitwise identical, so
+        # epoch-1's own detached log-prob IS the correct anchor, costs nothing, and makes
+        # the epoch-1 ratio exactly 1 by construction. The postprocess value is kept as the
+        # rollout-seam gauge (docs/FLOW_SDE_RL.md, validation 3b/3c).
+        return super().train_rl_step(embeds_inputs, actions=actions, old_log_prob=old_log_prob, advantages=advantages, returns=returns, old_values=old_values, rollout_log_probs=rollout_log_probs, ref_log_probs=ref_logprobs, actions_continuous=actions_continuous, sde_positions=sde_positions)
     
     def train_dagger_step(self, embeds_inputs_np, embeds_inputs_meta, traj_batch):
         """

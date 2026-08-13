@@ -919,9 +919,47 @@ class VLMTrainingMixin:
         policy_stats,vpreds, = self.ddp_model(**forward_kwargs)
         return policy_stats,vpreds
     
-    def rl_loss(self, log_probs, actions, advantages, response_mask, old_log_prob, returns, old_values, vpreds, rollout_log_probs=None, ref_log_probs=None, policy_stats=None, actions_continuous=None):        
+    def rl_loss(self, log_probs, actions, advantages, response_mask, old_log_prob, returns, old_values, vpreds, rollout_log_probs=None, ref_log_probs=None, policy_stats=None, actions_continuous=None, sde_positions=None):
         from verl.trainer.ppo.core_algos import compute_value_loss,compute_entropy_loss
-        if self.policy_head_config['type'] == "continuous":
+        # `rl_loss` runs on the WORKER (`self.model`), not the wrapper (`self.vlm`) -- the
+        # same resolution note as the actuator seam. getattr-chained so head-less test stubs
+        # keep working.
+        _chain_head = getattr(getattr(self, "model", None), "action_head", None)
+        _chain_lp = getattr(_chain_head, "chain_log_prob_batch", None)
+        _is_chain = (self.policy_head_config['type'] == "continuous" and _chain_lp is not None)
+        if _is_chain:
+            # Chain head: the action is the stored denoising chain; density recomputed
+            # through the shared transition function under current theta. `policy_stats` is
+            # `{"h"}` here, so this must precede any `['mu']` read. fp32 and eval-pinning
+            # live inside the head (docs/FLOW_SDE_RL.md, failure modes 1 and 5).
+            if policy_stats is None or actions_continuous is None or sde_positions is None:
+                raise ValueError(
+                    "chain-head RL loss requires policy_stats['h'], actions_continuous "
+                    "(the stored chains) and sde_positions.")
+            hh = policy_stats['h']
+            log_prob = _chain_lp(hh, actions_continuous.to(hh.device),
+                                 sde_positions.to(hh.device))
+            # THE CHAIN ANCHOR. `old_log_prob` arrives from postprocess_episode, whose
+            # forward regime measurably differs from the training epochs' (h shifts a
+            # stable ~25% across `_setup_training`; the chain density amplifies that to
+            # 40-90 nats and pins every ratio at the clip -- observed, not hypothesised).
+            # Grad and no-grad epoch forwards are bitwise identical, so the FIRST epoch's
+            # own detached log_prob is the exact in-regime anchor: epoch-1 ratio is 1 by
+            # construction, later epochs measure genuine within-batch movement. Keyed by
+            # the chains' bytes; the actor is persistent so the cache survives across the
+            # per-epoch train_rl_step calls. The postprocess value stays visible as
+            # chain/rollout_seam_gap -- the diagnostic it was better suited to be.
+            import hashlib
+            fp = hashlib.md5(np.ascontiguousarray(
+                actions_continuous.detach().cpu().numpy()).tobytes()).hexdigest()
+            if getattr(self, "_chain_anchor_fp", None) != fp:
+                self._chain_anchor_fp = fp
+                self._chain_anchor = log_prob.detach()
+                self._chain_seam_gap = float(
+                    (log_prob.detach() - old_log_prob.to(log_prob.device)
+                     .reshape(log_prob.shape)).abs().mean())
+            old_log_prob = self._chain_anchor.to(log_prob.device)
+        elif self.policy_head_config['type'] == "continuous":
             if policy_stats is None or actions_continuous is None:
                 raise ValueError("Continuous RL loss requires policy_stats and actions_continuous.")
             mu = policy_stats['mu']
@@ -942,6 +980,27 @@ class VLMTrainingMixin:
         pg_loss,metrics = self.policy_loss_fn(old_log_prob=old_log_prob.to(log_prob.device),log_prob=log_prob,advantages=advantages.to(log_prob.device),response_mask=response_mask,config = self.rl_algo_config)
         metrics['loss/pg_loss'] = pg_loss.detach().item()
         metrics['return'] = torch.amax(returns).detach().item()
+        if _is_chain:
+            # THE INSTRUMENT PANEL for the chain ratio (docs/FLOW_SDE_RL.md). Full cadence,
+            # every step -- the every-Nth-step sampling artifact has bitten three times.
+            # `|log ratio|` at epoch 0 is validation 3c's training-seam check made permanent;
+            # the max is the single-step blowup detector no mean can see.
+            with torch.no_grad():
+                lr_ = (log_prob - old_log_prob.to(log_prob.device))[response_mask]
+                metrics['chain/abs_log_ratio_mean'] = lr_.abs().mean().item()
+                metrics['chain/abs_log_ratio_max'] = lr_.abs().max().item()
+                metrics['chain/log_prob_mean'] = log_prob[response_mask].mean().item()
+                if hasattr(self, "_chain_seam_gap"):
+                    # |postprocess old - training-context anchor|: the rollout-seam gauge,
+                    # produced for free by the anchor recompute in RLActor.train_rl_step.
+                    metrics['chain/rollout_seam_gap'] = self._chain_seam_gap
+                metrics['chain/h_absmean'] = hh.float().abs().mean().item()
+                if hasattr(self, "_chain_anchor_h"):
+                    metrics['chain/h_absmean_anchor'] = self._chain_anchor_h
+                # determinism of the scorer on ITS OWN inputs, in-context
+                metrics['chain/lp_selfdiff'] = float(
+                    (_chain_lp(hh, actions_continuous.to(hh.device),
+                               sde_positions.to(hh.device)) - log_prob).abs().max())
         if self.rl_algo_config.value_head is not None:
             value_loss,vf_clipfrac = compute_value_loss(vpreds,returns.to(log_prob.device),old_values.to(log_prob.device),response_mask,self.rl_algo_config.value_head.cliprange_value)
             loss = pg_loss + value_loss
@@ -955,7 +1014,18 @@ class VLMTrainingMixin:
         else:
             loss = pg_loss
 
-        if self.rl_algo_config.entropy_bonus is not None:
+        if _is_chain and self.rl_algo_config.entropy_bonus:
+            # Deliberate, with the reason in the message: under a fixed sigma_t schedule the
+            # chain's entropy is a CONSTANT with zero gradient, so a bonus silently buys
+            # nothing -- and making sigma learnable to fix that reintroduces the unopposed-
+            # entropy blowup documented in LATENT_RL_BAKE.md (sigma hit 3541). A bonus of
+            # exactly 0 (the schema default) is inert and allowed; anything else is a
+            # config error, not a preference.
+            raise ValueError(
+                "entropy_bonus is meaningless for a chain-action head: chain entropy is "
+                "fixed by the sigma_t schedule and carries no gradient. Set "
+                "entropy_bonus: null or 0 (docs/FLOW_SDE_RL.md, failure mode 2).")
+        if self.rl_algo_config.entropy_bonus is not None and not _is_chain:
             if self.policy_head_config['type'] == "continuous" and policy_stats is not None:
                 entropy = self._continuous_entropy(policy_stats['log_std']).mean()
             else:
@@ -1066,7 +1136,7 @@ class VLMTrainingMixin:
             self.optimizer.zero_grad()
         return metrics
             
-    def train_rl_step(self,embeds_inputs,actions=None,old_log_prob=None,advantages=None,returns=None,old_values=None,rollout_log_probs=None,ref_log_probs=None,actions_continuous=None):
+    def train_rl_step(self,embeds_inputs,actions=None,old_log_prob=None,advantages=None,returns=None,old_values=None,rollout_log_probs=None,ref_log_probs=None,actions_continuous=None,sde_positions=None):
         '''
         Docstring for train_rl_step
         
@@ -1087,6 +1157,7 @@ class VLMTrainingMixin:
                 'rl': {
                     'actions': actions,
                     'actions_continuous': actions_continuous,
+                    'sde_positions': sde_positions,
                     'old_log_prob': old_log_prob,
                     'advantages': advantages,
                     'returns': returns,

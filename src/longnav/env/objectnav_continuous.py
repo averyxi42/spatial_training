@@ -90,10 +90,18 @@ class ContinuousObjectNavEnvActor:
         self._task = None
         self._executor = None
         self._screener = None
+        self._screen_pf = None
+        self._screen_pf_scene: Optional[str] = None
         self._episode = None
         self._steps = 0
         self._prev_geodesic = float("inf")
         self._skipped: Dict[str, int] = {}
+        # Per-episode cache backing `flush_logs_to_disk`. The rollout scheduler fires that
+        # as a Ray remote after each episode (rollout_core.py:705), so video encoding runs
+        # inside this actor while the scheduler dispatches elsewhere -- the write cost is
+        # amortized across the fleet exactly as it is for the discrete actor.
+        self.minimal_logging = bool(kwargs.get("minimal_logging", False))
+        self._cache: Dict[str, list] = {"rgb": [], "info": [], "reward": []}
 
     # -- env-actor interface ------------------------------------------------------------
     def assign_shard(self, episodes: Optional[List[str]] = None) -> None:
@@ -115,8 +123,100 @@ class ContinuousObjectNavEnvActor:
     def is_exhausted(self) -> bool:
         return self._episodes is not None and self._cursor >= len(self._order)
 
-    def flush_logs_to_disk(self):
-        return None
+    def flush_logs_to_disk(self, clear_steps: bool = True):
+        """Write this episode's video, summary and wandb payload; ship to the logger actor.
+
+        Mirrors the discrete actor's contract -- `vid/episode_video`, `img/thumbnail` and
+        scalar keys in one payload row, `results_{pid}` jsonl on disk -- so
+        `logging_workers` wandb-wraps it identically and the oSR/oSPL growth curves land
+        beside the discrete runs' SR/SPL. The overlay text is continuous-appropriate
+        (distance, reward, commanded displacement) rather than the discrete action table.
+        """
+        import json as _json
+        import os
+        import time as _time
+
+        if self.logging_output_dir is None or not self._cache["info"]:
+            if clear_steps:
+                self._cache = {"rgb": [], "info": [], "reward": []}
+            return None
+        infos, rewards = self._cache["info"], self._cache["reward"]
+        first, last = infos[0], infos[-1]
+        ep_label = str(first.get("episode_label", f"ep_{_time.time():.0f}"))
+        scene = str(first.get("scene_id", "unknown_scene")).replace("/", "_")
+        save_dir = os.path.join(self.logging_output_dir, scene,
+                                f"{ep_label}.{os.getpid()}@{_time.time():.0f}")
+        os.makedirs(save_dir, exist_ok=True)
+
+        n = max(len(rewards), 1)
+        episode_logs: Dict[str, Any] = {
+            "episode_label": ep_label, "scene_id": first.get("scene_id"),
+            "goal": self._episode.object_category if self._episode else None,
+            "n_steps": len(rewards),
+            "success": bool(last.get("success", False)),
+            "oracle_success": bool(last.get("oracle_success", False)),
+            "ospl_fix": float(last.get("ospl_fix", 0.0)),
+            "min_m": last.get("min_m"), "start_m": last.get("start_m"),
+            "path_length_m": last.get("path_length_m"),
+            "escaped": bool(last.get("escaped", False)),
+            "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
+            "collision_rate": float(np.mean([bool(i.get("collided")) for i in infos])),
+            "worker_pid": os.getpid(), "timestamp": _time.time(),
+        }
+        if not self.minimal_logging and self._cache["rgb"]:
+            try:
+                episode_logs |= self._write_video(save_dir)
+            except Exception as e:      # video failure must never kill a training episode
+                print(f"[objectnav_continuous] video write failed: {e}")
+        seq = {
+            "distance_to_goal": [i.get("distance_to_goal") for i in infos],
+            "positions": [i.get("pos_rots", [None] * 3)[:3] for i in infos],
+            "reward": rewards,
+        }
+        def _ser(o):
+            if isinstance(o, np.integer): return int(o)
+            if isinstance(o, np.floating): return float(o)
+            if isinstance(o, np.ndarray): return o.tolist()
+            return str(o)
+        with open(os.path.join(save_dir, "sequence.json"), "w") as f:
+            _json.dump(seq, f, default=_ser)
+        with open(os.path.join(save_dir, "summary.json"), "w") as f:
+            _json.dump(episode_logs, f, default=_ser, indent=2)
+        with open(os.path.join(self.logging_output_dir, f"results_{os.getpid()}"), "a") as f:
+            f.write(_json.dumps(episode_logs, default=_ser) + "\n")
+        if clear_steps:
+            self._cache = {"rgb": [], "info": [], "reward": []}
+        if self.logger_actor is not None:
+            import ray
+            try:
+                ray.get(self.logger_actor.log_row.remote(row=episode_logs), timeout=1.0)
+            except Exception as e:
+                print(f"[objectnav_continuous] logger ack issue: {e}")
+        return os.path.join(save_dir, "summary.json")
+
+    def _write_video(self, save_dir: str) -> Dict[str, str]:
+        """One MP4 per episode with a continuous-status overlay, plus a thumbnail."""
+        import os
+        from habitat.utils.visualizations import utils as vut
+        from PIL import Image
+
+        infos = self._cache["info"]
+        frames = []
+        for idx, (rgb, info) in enumerate(zip(self._cache["rgb"], infos)):
+            r = self._cache["reward"][idx] if idx < len(self._cache["reward"]) else 0.0
+            text = [
+                f"episode: {infos[0].get('episode_label')} step: {idx}",
+                f"goal: {self._episode.object_category if self._episode else '?'}",
+                f"distance_to_goal: {info.get('distance_to_goal')}",
+                f"reward: {r:+.3f}  commanded_m: {info.get('commanded_m', 0.0):.2f}",
+            ]
+            frames.append(vut.overlay_text_to_image(np.ascontiguousarray(rgb), text))
+        vut.images_to_video(images=frames, output_dir=save_dir, video_name="video",
+                            fps=4, quality=4, verbose=False)
+        thumb = os.path.join(save_dir, "thumbnail.jpg")
+        Image.fromarray(frames[-1]).save(thumb, quality=85)
+        return {"vid/episode_video": os.path.join(save_dir, "video.mp4"),
+                "img/thumbnail": thumb}
 
     def reset(self):
         self._load_episodes()
@@ -127,17 +227,30 @@ class ContinuousObjectNavEnvActor:
         self._executor.reset()
         self._steps = 0
         self._prev_geodesic = float(start["distance_to_goal"])
-        return self._render(), {
+        # Oracle bookkeeping, so every episode emits the STOP-INDEPENDENT metrics the
+        # project actually reads (docs/SAMPLE101_EVALS.md): with no stop head, `success`
+        # measures the termination rule, while oracle_success / ospl_fix measure
+        # navigation. These are what make wandb growth curves comparable -- loosely --
+        # against the discrete runs' SR/SPL.
+        self._start_geodesic = self._prev_geodesic
+        self._min_geodesic = self._prev_geodesic
+        self._path_at_min = 0.0
+        rgb = self._render()
+        info = {
+            "episode_label": episode.uid,
+            "scene_id": getattr(episode, "scene_id", None) or self._scene_id,
+            "distance_to_goal": self._finite(self._prev_geodesic),
+            "pos_rots": self._pos_rots(),
+            "screen": screen,
+            "skipped_so_far": dict(self._skipped),
+        }
+        self._cache = {"rgb": [rgb], "info": [info], "reward": []}
+        return rgb, {
             "obs": {"instr_or_goal": episode.object_category},
             "reward": 0.0,
             "done": False,
             "is_exhausted": self.is_exhausted(),
-            "info": {
-                "episode_label": episode.uid,
-                "distance_to_goal": self._finite(self._prev_geodesic),
-                "screen": screen,
-                "skipped_so_far": dict(self._skipped),
-            },
+            "info": info,
         }
 
     def step(self, action, supplementary_logs: Optional[Dict[str, Any]] = None):
@@ -165,27 +278,56 @@ class ContinuousObjectNavEnvActor:
             reward -= self.collision_penalty
         self._prev_geodesic = geodesic
 
+        if np.isfinite(geodesic) and geodesic < self._min_geodesic:
+            self._min_geodesic = float(geodesic)
+            self._path_at_min = float(self._task.path_tracker.length)
+
         reached = bool(np.isfinite(geodesic) and geodesic <= self.success_distance)
         escaped = not np.isfinite(geodesic)
         done = bool(reached or escaped or self._steps >= self.max_steps)
-        return self._render(), {
+        info_extra: Dict[str, Any] = {}
+        if done:
+            # Emitted once, on the terminal step, so a per-episode reduction upstream
+            # (last-info wins) reads them directly. `ospl_fix` is the RECOMPUTED oracle
+            # SPL -- the task layer's own OracleSPL is documented broken
+            # (docs/SAMPLE101_EVALS.md) and is deliberately not consulted here.
+            oracle = bool(self._min_geodesic <= self.success_distance)
+            s0 = self._start_geodesic
+            info_extra = {
+                "oracle_success": oracle,
+                "ospl_fix": (s0 / max(s0, self._path_at_min)) if oracle and s0 > 0 else 0.0,
+                "min_m": self._finite(self._min_geodesic),
+                "start_m": self._finite(s0),
+                "path_length_m": float(self._task.path_tracker.length),
+            }
+        rgb = self._render()
+        info = {
+            "episode_label": self._episode.uid,
+            "scene_id": getattr(self._episode, "scene_id", None) or self._scene_id,
+            "distance_to_goal": self._finite(geodesic),
+            "success": reached,
+            "escaped": escaped,
+            "steps": self._steps,
+            "collided": collided,
+            "stuck": collided,        # discrete-actor key parity: collision_rate reads it
+            "pos_rots": self._pos_rots(),
+            **info_extra,
+            # How far the chunk asked the base to move this step. Paired with the
+            # reward it separates "the policy commanded nothing" from "the policy
+            # commanded a move the controller could not execute".
+            "commanded_m": float(execution.ticks[-1].commanded_displacement)
+            if execution.ticks else 0.0,
+            "end_lag_m": float(execution.end_lag),
+        }
+        self._cache["rgb"].append(rgb)
+        self._cache["info"].append(info)
+        self._cache["reward"].append(float(reward))
+        return rgb, {
             "obs": {"instr_or_goal": self._episode.object_category},
             "reward": reward,
             "done": done,
             "is_exhausted": self.is_exhausted(),
-            "info": {
-                "distance_to_goal": self._finite(geodesic),
-                "success": reached,
-                "escaped": escaped,
-                "steps": self._steps,
-                "collided": collided,
-                # How far the chunk asked the base to move this step. Paired with the
-                # reward it separates "the policy commanded nothing" from "the policy
-                # commanded a move the controller could not execute".
-                "commanded_m": float(execution.ticks[-1].commanded_displacement)
-                if execution.ticks else 0.0,
-                "end_lag_m": float(execution.end_lag),
-            },
+            "info": info,
         }
 
     # -- construction, done lazily inside the actor process ------------------------------
@@ -270,13 +412,23 @@ class ContinuousObjectNavEnvActor:
             episode = self._episodes[self._order[self._cursor]]
             self._cursor += 1
             self._ensure_scene(episode)
-            if self._screener is None:
-                # Screened against the robot's own pathfinder -- the one every distance in
-                # this env is measured on -- with the same success threshold the reward uses,
-                # so an episode that starts already inside it is skipped rather than handing
-                # the policy a success it did not navigate to.
+            pf = self._screening_pathfinder()
+            if self._screener is None or self._screener.robot_pathfinder is not pf:
+                # Screened against the ROBOT's reachability even when rewards are measured
+                # on the dataset mesh. Under `navmesh="dataset"` the sim's pathfinder holds
+                # the shipped point-agent mesh -- connected, unfragmented, and an OVERSTATED
+                # answer to "where can a 0.28 m robot go" (16/30 val_mini goals sit on a
+                # different island of the robot mesh). Screening against it would admit
+                # episodes the robot cannot complete, which enter training as zero-progress
+                # rollouts and teach the policy that some goals simply pay nothing. So the
+                # screen runs on a second, robot-footprint pathfinder; the reward keeps the
+                # dataset mesh, whose geodesic is smooth -- the robot mesh's island snapping
+                # injects multi-metre distance jumps (docs/SAMPLE101_EVALS.md), which a
+                # per-step progress REWARD amplifies far more than an eval metric does.
                 self._screener = EpisodeScreener(
-                    robot_pathfinder=self._robot_sim.sim.pathfinder,
+                    robot_pathfinder=pf,
+                    dataset_pathfinder=(self._robot_sim.sim.pathfinder
+                                        if self.navmesh_choice == "dataset" else None),
                     success_distance=self.success_distance,
                 )
             screen = self._screener.screen(episode)
@@ -336,6 +488,43 @@ class ContinuousObjectNavEnvActor:
         )
 
     # -- small helpers -------------------------------------------------------------------
+    def _screening_pathfinder(self):
+        """The pathfinder that answers "can the robot reach this goal", per scene.
+
+        With `navmesh="robot"` the sim's own pathfinder already is the robot mesh. With
+        `navmesh="dataset"` a second pathfinder is recomputed for the robot footprint and
+        cached per scene -- rebuilt on scene switch, because a screener holding the previous
+        scene's mesh would screen every episode against the wrong building."""
+        if self.navmesh_choice != "dataset":
+            return self._robot_sim.sim.pathfinder
+        if self._screen_pf_scene != self._scene_id:
+            import habitat_sim
+            from objectnav_eval.navmesh import (ROBOT_NAVMESH_HEIGHT,
+                                                ROBOT_NAVMESH_RADIUS)
+            pf = habitat_sim.nav.PathFinder()
+            settings = habitat_sim.NavMeshSettings()
+            settings.set_defaults()
+            settings.agent_radius = ROBOT_NAVMESH_RADIUS
+            settings.agent_height = ROBOT_NAVMESH_HEIGHT
+            if not self._robot_sim.sim.recompute_navmesh(pf, settings) or not pf.is_loaded:
+                raise RuntimeError(
+                    f"robot-footprint navmesh recompute failed for {self._scene_id}; "
+                    "refusing to screen on the point-agent mesh instead, which would "
+                    "silently admit unreachable episodes into training."
+                )
+            self._screen_pf, self._screen_pf_scene = pf, self._scene_id
+        return self._screen_pf
+
+    def _pos_rots(self) -> List[float]:
+        """Discrete-actor `pos_rots` parity: 7 floats, position then quaternion.
+
+        PLANAR CONTROL FRAME, not habitat world -- `[X, Y, 0]` plus a yaw-about-+z
+        quaternion from theta. The consumer plots `[:3]` as the trajectory and stores the
+        rest; nothing downstream inverts frames, so the planar one is the honest choice."""
+        x, y, th = self._robot_sim.get_2d_pose()
+        return [float(x), float(y), 0.0,
+                float(np.cos(th / 2)), 0.0, 0.0, float(np.sin(th / 2))]
+
     def _render(self) -> np.ndarray:
         obs = self._robot_sim.get_obs()
         rgb = obs[self.sensor_uuid]

@@ -82,6 +82,49 @@ class LatentHeadConfig:
 
 # --- value head config (optional, auxiliary; no ConfigStore group needed - see plan) ---
 @dataclass
+class FlowSDEHeadConfig:
+    """The denoising chain as the action. See docs/FLOW_SDE_RL.md.
+
+    `type: continuous` for the same reason the latent head's is: the branch sites dispatch
+    on head CAPABILITY (`sample_chain_np` / `chain_log_prob_batch`), never on a type string,
+    so the validator at vlm_worker.py:59, the wrapper and every existing path are untouched.
+    The natural checkpoint is the DETERMINISTIC one -- RL initialises at the strongest SFT
+    policy; that asymmetry over the latent head is the point of the design.
+    """
+
+    _target_: str = "longnav.utils.flow_sde_policy.FlowSDEHead"
+    type: str = "continuous"
+    # The SFT checkpoint carrying the readout MLP and the velocity field. No default.
+    checkpoint_dir: Optional[str] = None
+    # Ticks executed per policy step; the chunk tail is discarded as everywhere else.
+    gap: int = 10
+    # Stochastic denoising steps per chunk, of the checkpoint's K (=num_inference_steps).
+    # 3 for the first runs: exploration at low chain-ratio variance. Sweeping n at fixed lr
+    # measures step size, not exploration -- scale lr ~ 1/n (docs/FLOW_SDE_RL.md).
+    sde_n: int = 3
+    # THE exploration scale, sigma_t = a * sqrt(t/(1-t)). No default by design: its usable
+    # range is bounded above by fidelity and below by the checkpoint's own z_0 scatter
+    # (0.737 rad on cotrain-v3), and it must come from the noise sweep.
+    sde_noise_a: Optional[float] = None
+    # Keep stochastic positions away from the 1/t score singularity.
+    sde_exclude_last: int = 1
+    # Seeds the head's private sampling stream; None = fresh draws (normal training).
+    sde_seed: Optional[int] = None
+    # NO CLIPPING, same reason as the latent head: the "action" is the 660-float chain and
+    # clipping its latents is meaningless.
+    continuous_action_clip_low: float = float("-inf")
+    continuous_action_clip_high: float = float("inf")
+    # entropy_bonus MUST stay null in the algo config: chain entropy is fixed by the
+    # sigma_t schedule and rl_loss raises rather than silently adding a zero-gradient
+    # constant. Present-but-unused keys below keep Gaussian-head config lookups from
+    # KeyError, as on the latent head.
+    logprob_reduction: str = "sum"
+    gaussian_init_log_std: float = -0.5
+    gaussian_min_log_std: float = -20.0
+    gaussian_max_log_std: float = 2.0
+
+
+@dataclass
 class ValueHeadConfig:
     _target_: str = "longnav.utils.vlm_worker.ValueHead"
     learning_rate: float = 5e-4  # Often higher than Adapter LR
@@ -96,3 +139,4 @@ class ValueHeadConfig:
 cs.store(name="lm_head", group="policy_head", node=LMHeadConfig())
 cs.store(name="gaussian_head", group="policy_head", node=GaussianHeadConfig())
 cs.store(name="latent_head", group="policy_head", node=LatentHeadConfig())
+cs.store(name="flow_sde_head", group="policy_head", node=FlowSDEHeadConfig())

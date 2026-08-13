@@ -72,8 +72,9 @@ class RLAlgoConfig:
     distance_clip_percentile: Optional[float] = 0.95
     distance_pad_mode: Optional[str] = "replicate"
     distance_pad_val: Optional[float] = None
-    # Value & Entropy
-    entropy_bonus: float = 0.0
+    # Value & Entropy. Optional so a chain-action head can set it to null explicitly --
+    # chain entropy is schedule-fixed and rl_loss raises on a NONZERO bonus there.
+    entropy_bonus: Optional[float] = 0.0
 
     # Ref KL Control
     use_ref: bool = True
