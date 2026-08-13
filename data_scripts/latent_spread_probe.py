@@ -80,7 +80,7 @@ def terminal(chunk: torch.Tensor):
 
 
 @torch.no_grad()
-def probe_one(model, h: torch.Tensor, n_samples: int, seed: int):
+def probe_one(model, h: torch.Tensor, n_samples: int, seed: int, sigma_scale: float = 1.0):
     """`h` is ONE observation's readout, (1, dim). Returns the three comparisons.
 
     Both arms decode the same number of chunks; the only difference is which source of
@@ -98,7 +98,14 @@ def probe_one(model, h: torch.Tensor, n_samples: int, seed: int):
 
     # ARM A -- vary c, freeze the flow noise. This is the RL policy's action space.
     gc = torch.Generator(device=dev).manual_seed(seed + 1)
-    c = latent.draw(hk.float(), mode="sample", generator=gc)["c"]
+    pieces = latent.draw(hk.float(), mode="mean")
+    # sigma_scale is the RL-time exploration temperature tau, applied here rather than by
+    # retraining: sigma_rl = tau * sigma_p. Sweeping it answers two things at once -- how much
+    # spread tau can buy, and where the decoder stops producing coherent chunks, since c is
+    # being pushed outside the range SFT ever sampled.
+    eps = torch.randn(pieces["centre"].shape, device=dev, dtype=pieces["centre"].dtype,
+                      generator=gc)
+    c = latent.decode(pieces["centre"] + sigma_scale * pieces["sigma"] * eps)
     chunk_c = codec.denormalize_from_latent(c, noise=fixed_noise.expand(n_samples, T, D))
 
     # ARM B -- freeze c at the prior mean, vary the flow noise. This is what gets frozen out.
@@ -131,6 +138,8 @@ def main():
                     help="distinct observations to probe; spread is reported as the mean "
                          "over them, since a single observation says nothing")
     ap.add_argument("--samples", type=int, default=24, help="draws per observation, per arm")
+    ap.add_argument("--sigma-scale", type=float, nargs="+", default=[1.0],
+                    help="exploration temperatures tau to sweep (sigma_rl = tau * sigma_p)")
     ap.add_argument("--target-column", default="action_chunks")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
@@ -155,14 +164,32 @@ def main():
 
     collator = TurnVectorCollator(
         processor=processor, data=DataConfig(target_column=args.target_column),
-        train=False, modality_specs=tuple(model.modality_specs),
+        train=False, modality_specs=tuple(model.model_cfg.modality_specs),
     )
-    per_obs = []
+    hs = []
     for i, row in enumerate(rows):
         h = collect_h(model, ds[int(row)], collator, args.device)
-        if h is None:
-            continue
-        per_obs.append(probe_one(model, h, args.samples, args.seed + 100 * i))
+        if h is not None:
+            hs.append((i, h))
+    results = {}
+    for tau in args.sigma_scale:
+        per_obs = [probe_one(model, h, args.samples, args.seed + 100 * i, sigma_scale=tau)
+                   for i, h in hs]
+        results[tau] = {k: float(np.mean([p[k] for p in per_obs])) for k in per_obs[0]}
+    print(f"\n{'tau':>8s}{'disp std (m)':>16s}{'head std (rad)':>17s}"
+          f"{'ratio vs noise':>17s}{'path len (m)':>15s}{'creep':>8s}")
+    for tau, r in results.items():
+        ratio = r["vary_c_head_std_rad"] / max(r["vary_noise_head_std_rad"], 1e-9)
+        print(f"{tau:8.1f}{r['vary_c_disp_std_m']:16.5f}{r['vary_c_head_std_rad']:17.5f}"
+              f"{ratio:17.3f}{r['vary_c_pathlen_mean_m']:15.4f}{r['creep_ratio']:8.3f}")
+    ref = next(iter(results.values()))
+    print(f"\nreference arm (vary flow noise): head std {ref['vary_noise_head_std_rad']:.5f} rad, "
+          f"path {ref['vary_noise_pathlen_mean_m']:.4f} m")
+    if args.out:
+        Path(args.out).write_text(json.dumps({str(k): v for k, v in results.items()}, indent=2))
+        print(f"wrote {args.out}")
+    return
+    per_obs = []
 
     if not per_obs:
         raise SystemExit("no observations yielded a readout; check --dataset/--split")

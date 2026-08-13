@@ -104,6 +104,9 @@ def build_optimizer_param_groups(model, args):
     _latent = getattr(model.normalizer, "latent", None)
     if _latent is not None:
         fresh += list(_latent.parameters())
+    _pred = getattr(model, "chunk_predictor", None)
+    if _pred is not None:
+        fresh += list(_pred.parameters())
     _no_decay = []
     _post = getattr(model, "posterior", None)
     if _post is not None:
@@ -227,6 +230,47 @@ def parse_args():
     pre.add_argument("--latent-posterior-width", type=int, default=256,
                      help="posterior hidden width. Capacity here is capacity to "
                           "over-migrate, so it acts as a rate limiter complementing beta")
+    pre.add_argument("--latent-aux-weight", type=float, default=0.0,
+                     help="weight on an auxiliary `c -> chunk` regression. The flow term "
+                          "alone gives the latent no reason to exist: it already reaches low "
+                          "loss with the residual in its base noise, which is posterior "
+                          "collapse under an expressive decoder. 0.0 = objective unchanged")
+    pre.add_argument("--latent-decoder", default="flow", choices=("flow", "deterministic"),
+                     help="`deterministic` REPLACES the flow objective with the c->chunk "
+                          "regression, so `c` is the only source of variation in the decode. "
+                          "Not the same as pinning the flow's base noise, which would make it "
+                          "a regressor wearing an ODE rather than a flow with less noise")
+    pre.add_argument("--latent-diversity", type=float, default=0.0,
+                     help="weight on the mode-seeking RATIO ||dA||/||dc||, clamped. The "
+                          "normalisation is the point: unnormalised output spread is solved "
+                          "by inflating sigma rather than by making the decoder responsive "
+                          "to c, which is the degenerate outcome already measured")
+    pre.add_argument("--latent-diversity-clamp", type=float, default=1.0)
+    pre.add_argument("--latent-diversity-probe", type=float, default=0.001,
+                     help="absolute probe step in h units. Fixed, NOT sigma-scaled: a "
+                          "learned prior makes ||c1-c2|| gameable, and shrinking sigma "
+                          "raises the ratio toward the local Jacobian norm")
+    pre.add_argument("--latent-diversity-target", type=float, default=0.0,
+                     help="target dA/dc; the weight is adapted to hit it. A fixed weight "
+                          "cannot hold a fixed share of a moving objective -- measured at "
+                          "200x and at 0.14% with the same term")
+    pre.add_argument("--latent-diversity-lr", type=float, default=0.02)
+    pre.add_argument("--latent-sigma-floor", type=float, default=0.0,
+                     help="hard lower bound on sigma. Free bits removes the only upward "
+                          "pressure on it, so without this reconstruction drives it to zero")
+    pre.add_argument("--latent-diversity-steps", type=int, default=3,
+                     help="Euler steps for the diversity decode only; it estimates a "
+                          "sensitivity, not a deployment-accuracy solve")
+    pre.add_argument("--latent-free-bits", type=float, default=0.0,
+                     help="nats per dim below which the KL stops penalising. The standard "
+                          "remedy for a latent that empties under an expressive decoder; "
+                          "0.01 admits ~10 nats over 1024 dims")
+    pre.add_argument("--latent-kl-warmup", type=int, default=0,
+                     help="linear anneal of beta from 0 over N steps, so the decoder cannot "
+                          "learn to route around a latent that is still uninformative")
+    pre.add_argument("--latent-reinit-decoder", action="store_true",
+                     help="keep the warm-started backbone and readout but re-initialise the "
+                          "velocity field, so decoder and posterior learn together")
     pre.add_argument("--latent-freeze-trunk", action="store_true",
                      help="freeze backbone, adapters, readout MLP and modality encoders, "
                           "training only the split and the posterior. The cheap staged run: "
@@ -313,6 +357,18 @@ def parse_args():
     args.latent_beta = mine.latent_beta
     args.latent_sigma0 = mine.latent_sigma0
     args.latent_posterior_width = mine.latent_posterior_width
+    args.latent_diversity = mine.latent_diversity
+    args.latent_diversity_clamp = mine.latent_diversity_clamp
+    args.latent_diversity_probe = mine.latent_diversity_probe
+    args.latent_sigma_floor = mine.latent_sigma_floor
+    args.latent_diversity_target = mine.latent_diversity_target
+    args.latent_diversity_lr = mine.latent_diversity_lr
+    args.latent_diversity_steps = mine.latent_diversity_steps
+    args.latent_free_bits = mine.latent_free_bits
+    args.latent_kl_warmup = mine.latent_kl_warmup
+    args.latent_reinit_decoder = mine.latent_reinit_decoder
+    args.latent_aux_weight = mine.latent_aux_weight
+    args.latent_decoder = mine.latent_decoder
     args.latent_freeze_trunk = mine.latent_freeze_trunk
     args.latent_freeze_decoder = mine.latent_freeze_decoder
     args.init_modality_from = mine.init_modality_from
@@ -466,6 +522,16 @@ def main():
         latent_cfg=LatentConfig(
             enabled=bool(args.latent_cvae), sigma0=args.latent_sigma0,
             beta=args.latent_beta, posterior_width=args.latent_posterior_width,
+            aux_weight=args.latent_aux_weight, decoder_kind=args.latent_decoder,
+            diversity_weight=args.latent_diversity,
+            diversity_clamp=args.latent_diversity_clamp,
+            diversity_steps=args.latent_diversity_steps,
+            diversity_probe=args.latent_diversity_probe,
+            sigma_floor=args.latent_sigma_floor,
+            diversity_target=args.latent_diversity_target,
+            diversity_lr=args.latent_diversity_lr,
+            free_bits=args.latent_free_bits, kl_warmup_steps=args.latent_kl_warmup,
+            reinit_decoder=args.latent_reinit_decoder,
         ),
     )
     # The rotation-flip deadband is a SPEED (rad/s), so the per-tick threshold needs this

@@ -95,12 +95,14 @@ class LatentIntentHead(nn.Module):
         Returns only the first `gap` rows. The chunk is cumulative anchor-relative poses, so
         truncating it is a prefix of the same trajectory, not a rescaling of it.
 
-        THE DECODER IS FORCED INTO EVAL MODE FOR THE DURATION. Pinning the base noise is not
-        by itself enough: the velocity field carries dropout (0.1 by default), and RL calls
-        `model.train()` on the whole wrapper, so during training the same `c` would decode
-        differently on every call. `old_log_prob` would then describe an action that was
-        never executed -- a wrong PPO ratio that stays perfectly finite. Same reasoning, and
-        the same remedy, as `_generation_metrics`' `decoder.eval()`.
+        The base noise is drawn FRESH each call unless a diagnostic seed was pinned: `z_0` is
+        environment stochasticity, not part of the action, and the PPO ratio is over `c`
+        alone.
+
+        The decoder is still forced into eval mode for the duration, for an unrelated reason:
+        the velocity field carries dropout (0.1 by default) and RL calls `model.train()` on
+        the whole wrapper, so training-mode dropout would perturb the deployed decode with
+        noise the SFT rollout never had. Same remedy as `_generation_metrics`.
         """
         dev = self.codec.action_scales.device
         c = torch.as_tensor(np.asarray(action, dtype=np.float32), device=dev).reshape(1, -1)
@@ -125,21 +127,22 @@ class LatentIntentHead(nn.Module):
                 "velocity field are all TRAINED, and a freshly initialised latent head is "
                 "not a policy -- it is noise with the right shape."
             )
+        # NOT REQUIRED, and it must not be the default. In latent RL the ACTION IS `c`:
+        # the policy is `pi(c|o)`, a diagonal Gaussian whose log-prob is exact, and the
+        # decoder, the controller and the physics are all the ENVIRONMENT -- which is allowed
+        # to be stochastic. `z_0` therefore needs no more special treatment than the
+        # simulator's own randomness, and pinning it would select one arbitrary slice of the
+        # policy: measured at 2.4x the ensemble's mean path length. Left available only as a
+        # diagnostic, for isolating dA/dc.
         seed = cfg.get("pin_flow_noise_seed")
-        if seed is None:
-            raise ValueError(
-                "latent_head requires `pin_flow_noise_seed`. Without a pinned base noise the "
-                "same `c` decodes to a different chunk on every call, so `old_log_prob` "
-                "describes an action that was never executed and the PPO ratio is wrong "
-                "while staying finite. This is not a default worth having."
-            )
         readout, codec, ctx_dim = load_latent_stack(ckpt, dtype=dtype)
         if int(cfg.get("action_space_dim", ctx_dim)) != ctx_dim:
             raise ValueError(
                 f"action_space_dim={cfg['action_space_dim']} but the checkpoint's latent is "
                 f"{ctx_dim}-dimensional. The action IS `c`; these cannot disagree."
             )
-        codec.pin_flow_noise(int(seed))
+        if seed is not None:
+            codec.pin_flow_noise(int(seed))
         head = cls(
             readout=readout, codec=codec, gap=int(cfg["gap"]),
             min_log_std=float(cfg.get("gaussian_min_log_std", -20.0)),

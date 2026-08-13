@@ -134,6 +134,23 @@ def load_flow_policy(
     return VectorRolloutPolicy(model, processor, cfg)
 
 
+def seed_latent(policy: VectorRolloutPolicy, seed: Optional[int]) -> None:
+    """Seed the LATENT stream only, leaving the ODE base-noise stream alone.
+
+    With `seed_sampling` fixed to a common value and this one varied, `z_0` is identical
+    across runs while `c` differs -- common random numbers, which removes `z_0` from the
+    between-run variance without pinning it to a single atypical draw.
+    """
+    codec = policy.model.codec
+    if seed is None:
+        codec.latent_generator = None
+        return
+    device = codec.action_scales.device
+    gen = torch.Generator(device=device if device.type == "cuda" else "cpu")
+    gen.manual_seed(int(seed))
+    codec.latent_generator = gen
+
+
 def seed_sampling(policy: VectorRolloutPolicy, seed: Optional[int]) -> None:
     """Reseed the codec's fallback noise generator, or clear it if `seed is None`.
 

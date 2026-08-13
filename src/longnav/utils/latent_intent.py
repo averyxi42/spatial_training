@@ -76,7 +76,7 @@ class LatentSplit(nn.Module):
     """
 
     def __init__(self, dim: int = 1024, sigma0: float = 0.02,
-                 rotation: Optional[torch.Tensor] = None):
+                 rotation: Optional[torch.Tensor] = None, sigma_floor: float = 0.0):
         super().__init__()
         if dim <= 0:
             raise ValueError(f"dim must be positive, got {dim}")
@@ -84,6 +84,7 @@ class LatentSplit(nn.Module):
             raise ValueError(f"sigma0 must be positive, got {sigma0}")
         self.dim = int(dim)
         self.sigma0 = float(sigma0)
+        self.sigma_floor = float(sigma_floor)
 
         self.to_mu = nn.Linear(dim, dim)
         self.to_log_sigma = nn.Linear(dim, dim)
@@ -128,6 +129,8 @@ class LatentSplit(nn.Module):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
         mu, log_sigma = self(h)
+        if self.sigma_floor > 0.0:
+            log_sigma = log_sigma.clamp(min=math.log(self.sigma_floor))
         sigma = log_sigma.exp()
         centre = mu if delta_mu is None else mu + delta_mu
         if mode == "mean":
@@ -199,7 +202,20 @@ class PosteriorEncoder(nn.Module):
         yield self.out.bias
 
 
-def kl_shared_sigma(delta_mu: torch.Tensor, log_sigma: torch.Tensor) -> torch.Tensor:
+def kl_raw_per_dim(delta_mu: torch.Tensor, log_sigma: torch.Tensor) -> torch.Tensor:
+    """The UNCLAMPED per-dimension KL. What free bits hides.
+
+    `max(KL_i, lambda)` charges a constant below the floor, so a run using free bits reports
+    `1024 * lambda` nats whether the real information is that much or none at all -- and the
+    equilibrium is every dim sitting exactly at lambda, because a dim that rises above it
+    pays full price and is pushed back. Logging only the clamped value therefore makes
+    migration unobservable precisely in the runs designed to produce it.
+    """
+    return delta_mu.pow(2) / (2.0 * (2.0 * log_sigma).exp())
+
+
+def kl_shared_sigma(delta_mu: torch.Tensor, log_sigma: torch.Tensor,
+                   free_bits: float = 0.0) -> torch.Tensor:
     """Per-row `KL(q || p)` in NATS for `sigma_q = sigma_p`: `sum_i dmu_i^2 / (2 sigma_i^2)`.
 
     The general diagonal-Gaussian KL's `log(sigma_p/sigma_q)` and `sigma_q^2/sigma_p^2` terms
@@ -207,7 +223,19 @@ def kl_shared_sigma(delta_mu: torch.Tensor, log_sigma: torch.Tensor) -> torch.Te
     conditioned everywhere -- no `log sigma` in the loss, so no path to a `sigma -> 0`
     singularity through the KL.
     """
-    return (delta_mu.pow(2) / (2.0 * (2.0 * log_sigma).exp())).sum(dim=-1)
+    per_dim = delta_mu.pow(2) / (2.0 * (2.0 * log_sigma).exp())
+    if free_bits > 0.0:
+        # FREE BITS. Below `free_bits` nats a dimension is charged a constant, so it receives
+        # NO downward gradient: the KL stops discouraging migration instead of merely making
+        # it expensive. This is the standard remedy for a latent that empties out under an
+        # expressive decoder, and running without it is why the first attempt measured
+        # `active_dims = 0` -- every safeguard against collapse was off.
+        #
+        # It sets a soft per-dimension target rather than a floor: nothing forces a dim up,
+        # but once the reconstruction term has any use for it, nothing pushes it back down
+        # until it exceeds `free_bits`. At 1024 dims a value of 0.01 admits ~10 nats total.
+        per_dim = torch.clamp(per_dim, min=float(free_bits))
+    return per_dim.sum(dim=-1)
 
 
 def latent_diagnostics(pieces: Dict[str, torch.Tensor], delta_mu: torch.Tensor,
@@ -230,6 +258,9 @@ def latent_diagnostics(pieces: Dict[str, torch.Tensor], delta_mu: torch.Tensor,
     sigma = pieces["sigma"]
     n = float(delta_mu.shape[0])
     per_dim_kl = delta_mu.pow(2) / (2.0 * sigma.pow(2))
+    # Thresholds DECOUPLED from the free-bits floor. Counting dims above 0.01 nats while the
+    # objective clamps at 0.01 makes the metric measure the clamp rather than the model.
+    active_hi = (per_dim_kl.mean(dim=0) > 0.1).sum().float()
     ratio = (delta_mu.abs() / sigma.clamp_min(1e-12)).mean()
     h_std = h.std(dim=0).mean() if h.shape[0] > 1 else h.std()
     return {
@@ -242,7 +273,46 @@ def latent_diagnostics(pieces: Dict[str, torch.Tensor], delta_mu: torch.Tensor,
         # subspace to make a ratio-based method tractable at 1024 dims.
         "sum_active_dims": (per_dim_kl.mean(dim=0) > 0.01).sum().float() * n,
         "sum_h_std_perdim": h_std * n,
+        # The unclamped rate: the only number that distinguishes "1024 dims genuinely at the
+        # floor" from "1024 dims at zero, charged the floor".
+        "sum_kl_raw": per_dim_kl.sum(dim=-1).sum(),
+        "sum_active_hi": active_hi * n,
     }
+
+
+class ChunkPredictor(nn.Module):
+    """`c -> (T, 3)` with NO noise input. The decoder that cannot hoard variation.
+
+    Two uses, selected by `LatentConfig`:
+
+    * **auxiliary** (`aux_weight > 0`, flow decoder kept): a second, direct reason for `c` to
+      carry chunk information. The flow objective on its own has none -- it already reaches
+      low loss with the residual expressed through its base noise `z_0`, so the latent is
+      unnecessary and stays empty. This is textbook posterior collapse under an expressive
+      decoder, and an auxiliary reconstruction from the latent alone is the standard remedy
+      that does not touch the decoder.
+    * **replacement** (`decoder_kind="deterministic"`): the CVAE's decoder need not be the
+      flow head. With no stochastic channel at all, `c` must carry everything, structurally
+      rather than by fiat -- which is what pinning `z_0` was reaching for and could not
+      deliver, since a flow with a frozen base is a regressor wearing an ODE, not a flow.
+
+    The creeping objection does not apply here the way it does to averaging ODE samples.
+    Creeping comes from regressing to the CONDITIONAL MEAN; if `c` carries the mode then the
+    conditional given `c` is narrow and its mean is the correct answer. Making deterministic
+    decoding safe is the CVAE's entire purpose.
+    """
+
+    def __init__(self, dim: int, n_ticks: int, n_dims: int = 3, width: int = 512):
+        super().__init__()
+        self.n_ticks, self.n_dims = int(n_ticks), int(n_dims)
+        self.net = nn.Sequential(
+            nn.Linear(dim, width), nn.GELU(),
+            nn.Linear(width, width), nn.GELU(),
+            nn.Linear(width, self.n_ticks * self.n_dims),
+        )
+
+    def forward(self, c: torch.Tensor) -> torch.Tensor:
+        return self.net(c).reshape(c.shape[0], self.n_ticks, self.n_dims)
 
 
 @dataclass
@@ -262,6 +332,72 @@ class LatentConfig:
     posterior_width: int = 256
     #: Optional orthogonal (dim, dim) PCA basis; see `LatentSplit`. None keeps `h`'s basis.
     rotation: Optional[torch.Tensor] = None
+    #: Weight on the auxiliary `c -> chunk` regression. 0.0 keeps the objective exactly as it
+    #: was. Above zero, `c` gets a direct incentive to carry chunk information that does not
+    #: depend on the flow needing it -- the standard answer to a decoder expressive enough to
+    #: make the latent unnecessary.
+    aux_weight: float = 0.0
+    #: `flow` is the head as trained. `deterministic` REPLACES the flow objective with the
+    #: `ChunkPredictor` regression, leaving `c` as the only source of variation anywhere in
+    #: the decode. The flow decoder is left in the checkpoint untouched either way, so the
+    #: SFT and eval paths keep working.
+    decoder_kind: str = "flow"
+    aux_width: int = 512
+    #: Nats per dimension below which the KL stops penalising. See `kl_shared_sigma`.
+    free_bits: float = 0.0
+    #: Linear anneal of `beta` from 0 over this many steps. Prevents the decoder from
+    #: learning to route around a latent that is still uninformative early in training --
+    #: which is the collapse dynamic itself, and is why a from-scratch run would not by
+    #: itself have avoided it. Deliberately skipped in the first attempt, on the argument
+    #: that `q` starts AT `p` so there is nothing to anneal away; that reasoning was about
+    #: the initial KL and missed what warmup is actually for.
+    kl_warmup_steps: int = 0
+    #: Re-initialise the flow decoder while keeping the warm-started backbone and readout, so
+    #: the decoder and the posterior learn together rather than one arriving already expert
+    #: at expressing the residual through its own base noise.
+    reinit_decoder: bool = False
+    #: Weight on the MODE-SEEKING RATIO, the mechanism from MSGAN/DSGAN:
+    #:     -min( ||A(c1) - A(c2)|| / ||c1 - c2|| , clamp )
+    #: The division is not cosmetic. Unnormalised output spread has a trivial solution --
+    #: push `c1` and `c2` further apart -- so the model satisfies it by INFLATING SIGMA
+    #: rather than by making the decoder responsive to `c`, which is the degenerate outcome
+    #: already measured (sigma reached 6% of h_std with active_dims ~ 0). The ratio is scale
+    #: invariant, so the only way to score is genuine sensitivity: it is a finite-difference
+    #: estimate of ||dA/dc||, clamped so it cannot grow without bound.
+    diversity_weight: float = 0.0
+    diversity_clamp: float = 1.0
+    #: Euler steps for the diversity decode only. The full integration is differentiable but
+    #: costs a backward through every step; the ratio is a sensitivity estimate and does not
+    #: need the deployment-accuracy solve.
+    diversity_steps: int = 3
+    #: ABSOLUTE probe scale for the diversity ratio, in `h` units. The denominator must NOT
+    #: be `||c1 - c2||` when the prior is learned: MSGAN's ratio assumes a FIXED prior
+    #: (`z ~ N(0, I)`), so its denominator cannot be gamed. Ours is learned, and as
+    #: `||dc| -> 0` the finite difference converges to the LOCAL JACOBIAN NORM, which exceeds
+    #: the secant slope over a wide step -- so the optimiser raises the ratio by SHRINKING
+    #: sigma instead of by making the decoder responsive. Measured: sigma collapsed to 0.03%
+    #: of h_std while the raw ratio hit 25.9 and the clamp saturated on every sample.
+    #: A fixed probe makes the denominator a constant by construction.
+    diversity_probe: float = 0.001
+    #: Hard lower bound on sigma. Free bits zeroes the KL gradient below the floor, which
+    #: removes the `-beta d(mu)^2/sigma^3` term that was the ONLY upward pressure on sigma;
+    #: reconstruction then drives it to zero unopposed. With shared sigma there is no
+    #: `log(sigma_p/sigma_q)` barrier to fall back on -- that term was deleted by choosing a
+    #: shared scale in the first place. Free `sigma_q` is the principled repair; this is the
+    #: cheap guard, and it has the honest side effect of making the exploration scale CHOSEN
+    #: rather than emergent, which given the emergent value is 0.03% is arguably the point.
+    sigma_floor: float = 0.0
+    #: TARGET for dA/dc, with the weight adapted to hit it. A FIXED weight cannot hold a
+    #: fixed proportion when both terms move: calibrated against a warm decoder's
+    #: reconstruction (~0.10) the same weight is 10x too small against a re-initialised one
+    #: (~1.0), and the ratio itself drifts, so the term's share of the objective wanders by
+    #: orders of magnitude. Measured both ways here -- weight 1.0 made diversity 200x the
+    #: objective (loss went NEGATIVE, dA/dc ran to 728); weight 0.01 made it 0.14% and dA/dc
+    #: FELL 20x. A multiplier driven by the gap removes the guess: it is the same dual-variable
+    #: trick as a KL rate target, applied to the quantity we actually care about.
+    diversity_target: float = 0.0
+    diversity_lr: float = 0.02
+    diversity_weight_max: float = 1.0
 
     def describe(self) -> str:
         if not self.enabled:

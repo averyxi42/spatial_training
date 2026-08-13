@@ -1149,9 +1149,19 @@ class TurnVectorRegressor(nn.Module):
         # docs/LATENT_RL.md). Missing `latent.*` keys are reported as fresh rather than
         # raising -- anything else missing still raises, because a normalizer that only
         # mostly matches is a config mismatch and not a warm start.
-        report = self.normalizer.load_state_dict(blob["normalizer"], strict=False)
+        norm_blob = blob["normalizer"]
+        if getattr(self, "_reinit_decoder_on_warm_start", False):
+            # Keep the backbone, the readout and the codec's buffers; drop the velocity
+            # field, so it trains alongside the posterior instead of arriving already expert
+            # at expressing the residual through its own base noise.
+            norm_blob = {k: v for k, v in norm_blob.items() if not k.startswith("decoder.")}
+            fresh.append("normalizer.decoder (reinit)")
+        report = self.normalizer.load_state_dict(norm_blob, strict=False)
         unexpected = list(report.unexpected_keys)
-        missing = [k for k in report.missing_keys if not k.startswith("latent.")]
+        skip = ("latent.",) + (("decoder.",)
+                               if getattr(self, "_reinit_decoder_on_warm_start", False)
+                               else ())
+        missing = [k for k in report.missing_keys if not k.startswith(skip)]
         if missing or unexpected:
             raise RuntimeError(
                 "normalizer state_dict mismatch beyond the latent split: "

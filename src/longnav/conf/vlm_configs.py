@@ -57,10 +57,11 @@ class LatentHeadConfig:
     # Ticks executed per policy step. The rest of the chunk is discarded, as in training and
     # in the eval executor -- the remainder is superseded by the next observation.
     gap: int = 10
-    # Freezes the ODE base noise so `c -> chunk` is deterministic and differentiable. Required
-    # (the head raises without it): otherwise the same `c` decodes differently every call and
-    # `old_log_prob` describes an action that never executed.
-    pin_flow_noise_seed: Optional[int] = 0
+    # DIAGNOSTIC ONLY, and None is correct. The action is `c`; the decoder and the physics
+    # are the environment, so `z_0` is environment noise and the PPO ratio over `c` is exact
+    # without touching it. Pinning selects one arbitrary slice of the policy -- measured at
+    # 2.4x the ensemble's mean path length -- so it belongs in probes, not in rollouts.
+    pin_flow_noise_seed: Optional[int] = None
     # NO CLIPPING. The Gaussian head's +/-1.0 is right for a 2-d control vector and wrong for
     # a 1024-d latent: it would clamp `c`, and the log-prob would then be evaluated at the
     # clipped action under the unclipped Gaussian.

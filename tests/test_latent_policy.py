@@ -40,7 +40,7 @@ def _head(gap=GAP, sigma0=0.02, pin=0):
                                 n_context_tokens=8, n_heads=2, dim_ff=32, n_layers=1)
     codec = FlowActionCodec(decoder, num_inference_steps=3,
                             latent=LatentSplit(dim=DIM, sigma0=sigma0))
-    codec.pin_flow_noise(pin)
+    codec.pin_flow_noise(pin)   # None => fresh noise per decode, the rollout default
     return LatentIntentHead(readout=readout, codec=codec, gap=gap)
 
 
@@ -108,11 +108,13 @@ class TestActuator:
         shifted = head.decode_action(np.full(DIM, 3.0, dtype=np.float32))
         assert np.allclose(base, shifted, atol=1e-5)
 
-    def test_unpinned_noise_is_refused_at_construction(self):
-        cfg = {"checkpoint_dir": "x", "gap": GAP, "action_space_dim": DIM}
-        with pytest.raises(ValueError, match="pin_flow_noise_seed"):
-            LatentIntentHead.from_policy_head_config(cfg, input_dim=HIDDEN,
-                                                     dtype=torch.float32)
+    def test_unpinned_noise_gives_a_stochastic_environment_not_an_error(self):
+        """`z_0` is environment noise, not part of the action. The action is `c`, the policy
+        is `pi(c|o)` and its log-prob is exact regardless of what the decoder does -- so an
+        unpinned head is the CORRECT default, and each decode legitimately differs."""
+        head = _head(pin=None)
+        c = np.random.randn(DIM).astype(np.float32)
+        assert not np.array_equal(head.decode_action(c), head.decode_action(c))
 
     def test_a_deterministic_checkpoint_is_refused(self):
         decoder = FlowActionDecoder(context_dim=DIM, n_ticks=TICKS, d_model=DIM // 8,

@@ -257,7 +257,8 @@ from longnav.utils.ar_action_head import (  # constants shared with the AR head,
 from longnav.utils.ar_action_head_v2 import ActionDecoderV2
 from longnav.utils.bin_codec import compose_chunk, decompose_chunk
 from longnav.utils.latent_intent import (  # the stochastic-intent delta; see docs/LATENT_RL.md
-    LatentConfig, LatentSplit, PosteriorEncoder, kl_shared_sigma, latent_diagnostics,
+    ChunkPredictor, LatentConfig, LatentSplit, PosteriorEncoder, kl_shared_sigma,
+    latent_diagnostics,
 )
 from longnav.utils.modality_embed import ModalityBatch
 from longnav.utils.turn_vectors import extract_turn_vectors
@@ -740,6 +741,14 @@ class FlowActionCodec(nn.Module):
         #: settable seedable generator, matching the AR head's sample-decode pattern, so a
         #: rollout is reproducible. It must live on the same device as the context.
         self.generator: Optional[torch.Generator] = None
+        #: SEPARATE stream for the latent draw. `None` falls back to `self.generator`, which
+        #: is the historical behaviour -- one generator driving both `c` and the ODE's base
+        #: noise. Splitting them is what makes a controlled attribution possible: fix the
+        #: `z_0` stream across runs (common random numbers, so `z_0` contributes zero
+        #: BETWEEN-run variance) while varying the `c` stream. That is strictly better than
+        #: pinning `z_0` to a single tensor, which holds it at one arbitrary slice of the
+        #: policy -- measured at 2.4x the ensemble's mean path length.
+        self.latent_generator: Optional[torch.Generator] = None
 
     # -- the scaling, in both directions ------------------------------------------------
     def scale(self, diffs: torch.Tensor) -> torch.Tensor:
@@ -798,8 +807,10 @@ class FlowActionCodec(nn.Module):
         ctx = context
         noise = None
         if self.latent is not None:
-            ctx = self.latent.draw(context.float(), mode=self.latent_mode,
-                                   generator=self.generator)["c"]
+            ctx = self.latent.draw(
+                context.float(), mode=self.latent_mode,
+                generator=self.latent_generator or self.generator,
+            )["c"]
             if self.pinned_flow_noise is not None:
                 noise = self.pinned_flow_noise.to(ctx.device, torch.float32)
                 noise = noise.expand(ctx.shape[0], *noise.shape[1:])
@@ -828,6 +839,24 @@ class FlowActionCodec(nn.Module):
             1, self.decoder.n_ticks, self.decoder.n_dims,
             device=gen.device, dtype=torch.float32, generator=gen,
         ).to(dev)
+
+    def generate_differentiable(self, context: torch.Tensor, num_steps: int,
+                                noise: torch.Tensor) -> torch.Tensor:
+        """`generate` WITHOUT `torch.no_grad`, in SCALED space, for the diversity regulariser.
+
+        A separate method rather than a flag on `generate`, because every other caller wants
+        the no-grad path and a flag that silently retains a graph through `num_steps` decoder
+        forwards is a memory leak waiting to be introduced by a default.
+
+        Deliberately NOT unscaled. `action_scales` is (0.03, 0.03, 0.05), so a physical-space
+        distance compares metres against radians and silently weights heading against
+        translation by whatever those units happen to be. The scaled space is the one the
+        velocity field is trained in and the one where the three channels are commensurate.
+        """
+        dec = self.decoder
+        return euler_integrate(
+            lambda x_t, t: dec(context.float(), x_t, t), noise, int(num_steps)
+        )
 
     def denormalize_from_latent(self, c: torch.Tensor,
                                 noise: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -905,11 +934,16 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         latent = None
         if latent_cfg is not None and latent_cfg.enabled:
             latent = LatentSplit(dim=context_dim, sigma0=latent_cfg.sigma0,
-                                 rotation=latent_cfg.rotation)
+                                 rotation=latent_cfg.rotation,
+                                 sigma_floor=latent_cfg.sigma_floor)
         model.normalizer = FlowActionCodec(
             decoder, num_inference_steps=fm_cfg.num_inference_steps,
             action_scales=fm_cfg.action_scales, latent=latent,
         )
+        if latent_cfg is not None and latent_cfg.reinit_decoder:
+            # Applied AFTER build and therefore before `warm_start` loads anything, so the
+            # checkpoint's decoder weights are simply never read into this module.
+            model._reinit_decoder_on_warm_start = True
         model.n_ticks = int(n_ticks)
         model.fm_cfg = fm_cfg
         model.latent_cfg = latent_cfg
@@ -919,6 +953,15 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
             PosteriorEncoder(dim=context_dim, n_ticks=n_ticks,
                              n_dims=decoder.n_dims, width=latent_cfg.posterior_width)
             if latent is not None else None
+        )
+        # Present only when asked for, so a run without it has exactly the parameters, the
+        # optimizer groups and the checkpoint it always had.
+        needs_pred = latent is not None and (
+            latent_cfg.aux_weight > 0.0 or latent_cfg.decoder_kind == "deterministic"
+        )
+        model.chunk_predictor = (
+            ChunkPredictor(dim=context_dim, n_ticks=n_ticks, n_dims=decoder.n_dims,
+                           width=latent_cfg.aux_width) if needs_pred else None
         )
         return model
 
@@ -1023,7 +1066,8 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
             delta_mu = self.posterior(context.float().detach(), actions)
             pieces = latent.draw(context.float(), mode="sample", delta_mu=delta_mu)
             c = pieces["c"]
-            kl = kl_shared_sigma(delta_mu, pieces["log_sigma"])        # (N,) nats
+            kl = kl_shared_sigma(delta_mu, pieces["log_sigma"],
+                                 free_bits=self.latent_cfg.free_bits)      # (N,) nats
             # Metrics report the DEPLOYED path, which is the prior at its mean.
             metrics_ctx = latent.decode(pieces["mu"])
             with torch.no_grad():
@@ -1049,11 +1093,84 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
 
         per_draw = F.mse_loss(v_t, u_t, reduction="none").flatten(1).mean(dim=1)
         per_turn = per_draw.view(N, K).mean(dim=1)                    # average over K
+        # ---- the mode-seeking ratio. Two draws from the PRIOR (not the posterior -- the
+        # prior is what RL samples from), decoded under the SAME base noise so the numerator
+        # isolates dA/dc rather than picking up the flow's own stochasticity. Pinning here is
+        # a partial derivative, not a deployment choice: at rollout `z_0` is drawn fresh and
+        # treated as exogenous environment noise, since pinning it would select one arbitrary
+        # slice of the policy -- measured at 2.4x the ensemble's path length.
+        diversity = None
+        if latent is not None and self.latent_cfg.diversity_weight > 0.0:
+            hf = context.float()
+            mu_p, log_sig = latent(hf)
+            sig = log_sig.exp()
+            # SAMPLED FROM THE PRIOR, at the scale RL will actually explore at. A fixed small
+            # probe measures a near-local Jacobian instead, which is inflatable without any
+            # real spread -- a decoder can be hypersensitive locally while saturating or
+            # oscillating over a perturbation of the size we deploy. ||sigma*eps|| here is
+            # ~0.03-0.3 against a probe of 0.001, so the two differ by 30-300x.
+            c1 = latent.decode(mu_p + sig * torch.randn_like(mu_p))
+            c2 = latent.decode(mu_p + sig * torch.randn_like(mu_p))
+            steps = int(self.latent_cfg.diversity_steps)
+            z0 = torch.randn(1, T, D, device=dev, dtype=torch.float32)
+            z0 = z0.expand(N, T, D)
+            a1 = codec.generate_differentiable(c1, num_steps=steps, noise=z0)
+            a2 = codec.generate_differentiable(c2, num_steps=steps, noise=z0)
+            # DETACHED denominator: keeps the ratio interpretable (action change per unit of
+            # latent change) while removing the gradient path that let the model raise it by
+            # SHRINKING sigma -- which drove sigma to 0.03% of h_std and the ratio to 640.
+            # Gradient therefore flows only through the numerator, i.e. through genuine
+            # spread at the current sampling scale.
+            den = (c1 - c2).flatten(1).norm(dim=1).detach().clamp_min(1e-8)
+            raw = (a1 - a2).flatten(1).norm(dim=1) / den
+            diversity = raw.clamp(max=float(self.latent_cfg.diversity_clamp))
+            # Both are logged. A clamp that binds from step 0 makes the term a constant with
+            # ZERO gradient -- the arm would run to completion, cost a GPU, and change
+            # nothing, while every other metric looked normal.
+            self._last_raw_dadc = raw.detach()
+
+        aux = None
+        if getattr(self, "chunk_predictor", None) is not None:
+            # Predicted from the SAMPLED `c`, so the gradient reaches `delta_mu` and `sigma`
+            # rather than only the readout: the point is to make carrying chunk information
+            # in the latent worth something.
+            aux = F.mse_loss(self.chunk_predictor(c), actions, reduction="none")
+            aux = aux.flatten(1).mean(dim=1)
+            if self.latent_cfg.decoder_kind == "deterministic":
+                # The flow term is REPLACED, not added to. With no stochastic channel left in
+                # the decode, `c` is the only thing that can explain the chunk.
+                per_turn = aux
+            else:
+                per_turn = per_turn + float(self.latent_cfg.aux_weight) * aux
+        if diversity is not None:
+            w = float(self.latent_cfg.diversity_weight)
+            target = float(self.latent_cfg.diversity_target)
+            if target > 0.0 and self.training:
+                # Dual ascent on the weight: raise it while dA/dc is under target, lower it
+                # once over. Bounded both ways so a runaway ratio cannot drive the weight to
+                # zero and stall, nor a stubborn one drive it until reconstruction dies.
+                gap = target - float(diversity.mean().detach())
+                self._div_w = getattr(self, "_div_w", w) * math.exp(
+                    float(self.latent_cfg.diversity_lr) * (1.0 if gap > 0 else -1.0)
+                )
+                self._div_w = min(max(self._div_w, 1e-5),
+                                  float(self.latent_cfg.diversity_weight_max))
+                w = self._div_w
+            # Subtracted: we MAXIMISE sensitivity. Clamped above, so once the decoder is
+            # responsive enough the term stops pulling and reconstruction takes over again.
+            per_turn = per_turn - w * diversity
         if kl is not None:
             # ELBO in shape only: `per_turn` is a velocity regression, not -log p(A|c), so
             # `beta` is a bare exchange rate with no transferable scale and must be swept.
             # The KL is still in nats, which is why the diagnostics on it mean something.
-            per_turn = per_turn + float(self.latent_cfg.beta) * kl
+            beta = float(self.latent_cfg.beta)
+            warm = int(self.latent_cfg.kl_warmup_steps)
+            if warm > 0:
+                # Counted on forwards rather than read off the trainer: the model does not
+                # own a global step, and a linear ramp does not need one exactly.
+                self._kl_step = getattr(self, "_kl_step", 0) + (1 if self.training else 0)
+                beta = beta * min(1.0, self._kl_step / warm)
+            per_turn = per_turn + beta * kl
         total = per_turn.sum()
         denom = num_items_in_batch if num_items_in_batch is not None else per_turn.numel()
         denom = torch.as_tensor(denom, dtype=total.dtype, device=total.device).clamp(min=1)
@@ -1071,6 +1188,17 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
             metrics = self._generation_metrics(metrics_ctx, gt_diffs, targets)
             if kl is not None:
                 metrics.update({k: v.detach() for k, v in latent_metrics.items()})
+                if aux is not None:
+                    metrics["sum_aux_mse"] = aux.sum().detach()
+                if diversity is not None:
+                    metrics["sum_dadc"] = diversity.sum().detach()
+                    metrics["sum_dadc_raw"] = self._last_raw_dadc.sum()
+                    metrics["sum_div_w"] = torch.tensor(
+                        float(getattr(self, "_div_w", self.latent_cfg.diversity_weight)),
+                        device=dev) * N
+                    metrics["sum_dadc_clipfrac"] = (
+                        self._last_raw_dadc > float(self.latent_cfg.diversity_clamp)
+                    ).float().sum()
                 metrics["fm_loss_sum"] = per_draw.view(N, K).mean(dim=1).sum().detach()
             metrics["loss_sum"] = total.detach()
             metrics["n_turns"] = torch.tensor(N, device=dev)
@@ -1290,7 +1418,8 @@ FLOW_METRIC_KEYS = ("sum_stop_pred", "sum_stop_gt", "sum_creep_pred", "sum_creep
 #: The CVAE diagnostics, drained the same way and absent unless a latent is installed. Named
 #: separately so a reader can see at a glance which keys exist only in a latent run.
 LATENT_METRIC_KEYS = ("sum_kl_nats", "sum_sigma", "sum_delta_mu_norm",
-                      "sum_delta_mu_over_sigma", "sum_active_dims", "sum_h_std_perdim")
+                      "sum_delta_mu_over_sigma", "sum_active_dims", "sum_h_std_perdim", "sum_kl_raw", "sum_active_hi",
+                      "sum_aux_mse", "sum_dadc", "sum_dadc_raw", "sum_dadc_clipfrac", "sum_div_w")
 
 
 class FlowMatchingSFTTrainer(TurnVectorSFTTrainer):
