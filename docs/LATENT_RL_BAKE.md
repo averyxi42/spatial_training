@@ -147,6 +147,68 @@ produced `sigma`) and load-bearing in four places:
 only configuration with end-to-end evidence behind it. Stripping it is tidiness, and tidiness
 has been the more expensive mistake in this work.
 
+## `sigma` does not converge — it is a relaxation oscillator
+
+Observed on both runs, and the single most important dynamical fact about this objective.
+The bake took `sigma` from 0.0125 to **79.4** and back to ~1.4 in about 40 steps; the pilot
+peaked at **3541** at step 688 and returned to 0.663 by 1500. Step-to-step swings of 10x
+persist afterwards (over 40 consecutive steps: min 0.457, max 79.4, median 2.33).
+
+**Why the long flat phase then the explosion — they are one process.** The term is
+`D = ||A(mu + sigma*e1) - A(mu + sigma*e2)|| / ||sigma*(e1-e2)||_detached` and the parameter
+is `log sigma`. While the decoder is locally linear over the ball the numerator is
+`~ sigma*||J de||`, so:
+
+* `D ~ ||J de|| / ||de||`, **independent of `sigma`** — which is why `dadc` sat pinned at 0.36
+  for 60 steps looking inert;
+* `dD/d log sigma = sigma * dD/d sigma = D` — **a constant**.
+
+A constant gradient on `log sigma` makes `log sigma` grow linearly, i.e. `sigma` grows
+*exponentially* at a rate proportional to `w * lr`. Nothing triggers at the moment of
+"explosion"; it was always exponential and only became visible on a linear axis. Two
+corollaries that already cost time: at 1/20 weight the exponent is 20x smaller (which is what
+the mis-specified first launch looked like), and two exponentials at different rates diverge
+without bound even when plotted against *cumulative LR* — so a rate difference cannot be
+distinguished from a schedule difference by curve-matching.
+
+It ran faster than exponential because `D` itself rose 0.36 -> 1.70, and `D` is the gradient:
+a positive feedback loop. It terminates when `sigma` is large enough that the decoder
+saturates over the ball, the numerator stops tracking `sigma`, and `D` collapses (1.70 ->
+0.0002). Reconstruction then pulls `sigma` back. Hence oscillation, not convergence.
+
+**Nothing in the objective bounds `sigma` from above.** Two guards that look like they would
+and do not:
+
+* `kl_shared_sigma` is `sum dmu^2 / (2 sigma^2)` — monotonically *decreasing* in `sigma`. The
+  KL does not restrain growth, it mildly rewards it. (It is inert anyway under free bits.)
+* `--latent-diversity-clamp` clamps the *ratio*, and the ratio is smallest exactly when
+  `sigma` is largest. **The clamp cannot bind during an excursion** — `dadc_clipfrac` stayed 0
+  through a 79x one. It guards the opposite failure.
+
+Reconstruction is the only opposing force and it only acts after the excursion.
+
+### Consequences, and levers if this needs fixing
+
+`sigma` is the RL exploration scale (`sigma_rl = tau * sigma_p`), so an oscillating `sigma`
+means **checkpoint selection samples a phase, not a value**. The pilot's ck1000 had
+`sigma = 1.80` and ck1500 `0.663`, a 2.7x difference — very likely why measured spread peaked
+at ck1000 while `dA/dc` rose monotonically. **Record `sigma` alongside every scored
+checkpoint**; a parity or spread number without it is not interpretable.
+
+Not acted on for this bake (it is one step from the validated pilot, and the pilot shipped a
+usable checkpoint through the same oscillation). Ordered by how surgical:
+
+1. **Record and select on `sigma`** — zero risk, do this regardless.
+2. **A `sigma` ceiling**, mirroring the existing `sigma_floor` clamp in `LatentSplit` — one
+   line, bounds exploration scale without touching the objective's shape.
+3. **Lower LR or an EMA on `to_log_sigma`** — damps the oscillator, objective unchanged.
+4. **Decouple responsiveness from scale.** The root cause is that one term sets both. Measure
+   spread at a *fixed absolute* perturbation so the term trains decoder responsiveness only,
+   and set `sigma` by a separate explicit rule. This is the principled fix and the biggest
+   change.
+5. **A KL that bites** — with shared `sigma` it cannot. A non-shared `sigma_q`, or a prior at
+   fixed scale, restores a real penalty on growth.
+
 ## Risks recorded but not acted on
 
 Raised in review, deliberately left alone so the bake stays one step from the validated
