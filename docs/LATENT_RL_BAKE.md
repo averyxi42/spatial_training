@@ -48,7 +48,7 @@ The cost, stated plainly: at a single unselected draw the latent checkpoint scor
 --latent-cvae --latent-sigma0 0.002 --latent-beta 0.001
 --latent-free-bits 0.01 --latent-kl-warmup 300
 --latent-reinit-decoder
---latent-diversity 0.05 --latent-diversity-clamp 40.0
+--latent-diversity 1.0 --latent-diversity-clamp 40.0
 --max-steps 12000 --eval-per-component --eval-max-samples 64
 (no --latent-freeze-trunk, no --latent-diversity-target, no --latent-sigma-floor)
 ```
@@ -59,9 +59,28 @@ so the comparison stays honest.
 Changes from the pilot, and only these: **the trunk is unfrozen** (`h` was optimised as a
 point predictor for a deterministic decoder and cannot co-adapt to carry a stochastic `c`
 while frozen), **12000 steps instead of 1500**, **`--eval-per-component`** so the three
-components are separable and comparable against the baseline run, and **no diversity
-controller** — it destroys the x-axis of the parity/spread trade curve, and its own
-saturation is what produced the pilot's effective fixed weight of 0.05 anyway.
+components are separable and comparable against the baseline run, **no diversity controller**
+— it destroys the x-axis of the parity/spread trade curve, so we pin its saturation value
+instead — and **no `--latent-sigma-floor`**, which at 0.001 sits below `sigma0 = 0.002` and
+never binds once diversity is doing work.
+
+### The diversity weight is 1.0, and reading it off a log gives 0.05
+
+The first launch of this bake passed `--latent-diversity 0.05` and was killed at step 87. It
+ran the term at **1/20 strength**: `sigma` was flat at ~0.002 where the pilot was at 0.20 by
+step 80, and `sigma/h_std` was 0.005 against the pilot's 0.117.
+
+The pilot's controller ramped the weight from its 0.05 seed to the `diversity_weight_max`
+ceiling of **1.0 by step 148**, and held it there for 90% of the run. The training log prints
+`div_w: 0.05` at that ceiling, because `sum_div_w` is written as `_div_w * N` and drained over
+`n_rows = N * n_ticks` — the same x20 deflation every other latent metric carries (below).
+`--latent-diversity` is the true weight, undeflated. Copying the logged number into the flag
+costs exactly a factor of 20, and the failure is silent: every metric stays well-formed and
+only the growth *rate* of `sigma` gives it away.
+
+The deflation is deliberately **not** being fixed. The pilot's log is the only calibration
+reference this run has, and renormalising mid-family would make the two incomparable for the
+sake of tidiness — which this document already names as the more expensive mistake.
 
 ## What the diversity term is, precisely
 
