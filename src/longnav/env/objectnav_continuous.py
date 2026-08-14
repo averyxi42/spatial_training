@@ -60,9 +60,15 @@ class ContinuousObjectNavEnvActor:
         source_kwargs: Optional[Dict[str, Any]] = None,
         slack_penalty: float = 0.0,
         collision_penalty: float = 0.0,
-        seed: int = 0,
+        progress_reward_clip: float = 0.75,
+        success_reward: float = 0.0,
+        escape_penalty: float = 0.0,
+        reward_lost_steps: int = 25,
+        seed: Optional[int] = None,
         logging_output_dir: Optional[str] = None,
         logger_actor: Any = None,
+        video_tick_stride: int = 2,
+        video_realtime_factor: float = 1.0,
         **kwargs: Any,
     ):
         self.episodes_path = episodes
@@ -77,13 +83,75 @@ class ContinuousObjectNavEnvActor:
         self.source_kwargs = dict(source_kwargs or {})
         self.slack_penalty = float(slack_penalty)
         self.collision_penalty = float(collision_penalty)
-        #self.seed = int(seed)
-        # CRITICAL: need different seed per worker to sample properly, below is jank but more correct version:
-        np.random.seed(os.getpid())
-        self.seed = np.random.randint(0,100000)
-        
+        # Physical-consistency bound on the progress REWARD (metrics are untouched). The
+        # geodesic is queried from a navmesh snap of a physically simulated robot, and the
+        # snap occasionally relocates across a wall or floor: measured over 506 episodes
+        # of flow_sde_train_fixed_lr, 0.16% of steps carried a persistent >1 m single-step
+        # geodesic jump (max 6.7 m -- ~20x a normal step reward), touching 10% of
+        # episodes. No physical step can change the geodesic by more than the path length
+        # driven in gap*dt seconds (~<=0.6 m), so anything beyond the clip is a
+        # measurement artifact, not motion. 0 disables.
+        self.progress_reward_clip = float(progress_reward_clip)
+        # Terminal bonus on the reached step (the discrete standard's success term). At a
+        # tight success_distance the progress reward alone barely distinguishes "arrived"
+        # from "hovered nearby" -- the last 0.2 m pays ~0.2 -- so precision termination
+        # needs its own signal. 0 (default) is the pre-existing progress-only shape.
+        self.success_reward = float(success_reward)
+        # Penalty on the escaped terminal step. "Escaped" is the PHYSICAL fall detector
+        # from SFT data collection (continuous_demos.drive_failure: joint_z free-fall
+        # sustained fall_duration_s), never the geodesic -- under the earlier
+        # `not isfinite(geodesic)` proxy, 42% of the 250st run's "escapes" were spawn-snap
+        # failures with zero policy involvement. Unpenalized, a real escape ends the
+        # episode keeping all accumulated progress reward -- a free exit. Positive value =
+        # subtracted from the escaped step's reward. 0 keeps the old shape.
+        self.escape_penalty = float(escape_penalty)
+        # Sustained-blindness gate: reset-time DOA screening checks connectivity at the
+        # SPAWN SNAP, but an episode can go permanently unmeasurable the moment the robot
+        # moves (measured: 1S7LAXRdDqK:48 -- start_m finite at 6.89 m, then geodesic
+        # non-finite for the whole episode; the finite-hold froze reward at ~0 over a
+        # 44 m wander, 0/29 forever). N consecutive policy steps of non-finite geodesic
+        # ends the episode early with `reward_lost` flagged: transient snap dropouts span
+        # ticks, not tens of steps, so 25 steps (10 s of sim) is far above their scale.
+        # 0 disables.
+        self.reward_lost_steps = int(reward_lost_steps)
+        # The SFT rejection thresholds, verbatim; imported here so a stale fork of the
+        # numbers cannot drift from the corpus generator's.
+        from continuous_demos.drive_failure import DriveFailureConfig
+        self._fall_cfg = DriveFailureConfig()
+        self._fall_run = 0
+        self._max_fall_run = 0
+        # Per-worker seeding, the discrete env's `ep_seed` pattern (habitat.py:629-634):
+        # an explicit seed reproduces an exact episode stream (eval); None -- the RL
+        # default -- derives a distinct seed per worker process, so parallel actors do not
+        # all replay the same episode order.
+        if seed is None:
+            np.random.seed(os.getpid())
+            self.seed = int(np.random.randint(0, 100000))
+        else:
+            self.seed = int(seed)
+        self._rng = np.random.default_rng(self.seed)
+
+        # Video capture cadence. Frames are taken every `video_tick_stride` PHYSICS ticks
+        # (1/dt = 25 Hz base) through the executor's on_tick hook, JPEG-encoded in memory
+        # as they arrive (~40 KB/frame; raw 640x480 frames at stride 1 would be ~1.6 GB an
+        # episode). Written fps = realtime_factor / (dt * stride): 1.0 is realtime at any
+        # stride, bigger is faster playback.
+        self._video_tick_stride = int(video_tick_stride)
+        if self._video_tick_stride < 1:
+            raise ValueError(f"video_tick_stride must be >= 1, got {video_tick_stride}")
+        self._video_realtime_factor = float(video_realtime_factor)
+        if not self._video_realtime_factor > 0:
+            raise ValueError(
+                f"video_realtime_factor must be > 0, got {video_realtime_factor}")
+        self._video_frames: List[bytes] = []
+        self._video_meta: List[tuple] = []
+        self._video_tick = 0
+
         self.logging_output_dir = logging_output_dir
         self.logger_actor = logger_actor
+        # Metric routing: interleaved eval sets this to "eval_env/" for its episodes so
+        # ODE-eval rows never interleave with SDE-training rows on the same charts.
+        self._log_prefix = ""
 
         self._episodes: Optional[List[Any]] = None
         self._order: List[int] = []
@@ -120,12 +188,23 @@ class ContinuousObjectNavEnvActor:
         would leave every longnav-labelled shard empty, and an empty shard reads as "this
         actor is already exhausted" rather than as an error.
         """
-        self._shard = None if episodes is None else list(episodes)
+        new = None if episodes is None else list(episodes)
+        if self._episodes is not None and new == self._shard:
+            # The same shard handed back (the RL driver cycles one pool): keep the parsed
+            # episodes -- a full-split re-parse is minutes per actor -- and just deal a
+            # fresh permutation for the next pass.
+            self._reshuffle()
+            return
+        self._shard = new
         self._episodes = None
         self._cursor = 0
 
     def is_exhausted(self) -> bool:
         return self._episodes is not None and self._cursor >= len(self._order)
+
+    def set_log_prefix(self, prefix: str) -> None:
+        """Prefix for wandb metric keys of subsequent episodes ("" = training stream)."""
+        self._log_prefix = str(prefix or "")
 
     def flush_logs_to_disk(self, clear_steps: bool = True):
         """Write this episode's video, summary and wandb payload; ship to the logger actor.
@@ -143,6 +222,7 @@ class ContinuousObjectNavEnvActor:
         if self.logging_output_dir is None or not self._cache["info"]:
             if clear_steps:
                 self._cache = {"rgb": [], "info": [], "reward": []}
+                self._video_frames, self._video_meta = [], []
             return None
         infos, rewards = self._cache["info"], self._cache["reward"]
         first, last = infos[0], infos[-1]
@@ -157,17 +237,19 @@ class ContinuousObjectNavEnvActor:
             "episode_label": ep_label, "scene_id": first.get("scene_id"),
             "goal": self._episode.object_category if self._episode else None,
             "n_steps": len(rewards),
-            "success": bool(last.get("success", False)),
-            "oracle_success": bool(last.get("oracle_success", False)),
+            # int, not bool: wandb renders booleans in the run table only -- a bool metric
+            # never gets a chart, and oracle_success IS the headline growth curve.
+            "success": int(bool(last.get("success", False))),
+            "oracle_success": int(bool(last.get("oracle_success", False))),
             "ospl_fix": float(last.get("ospl_fix", 0.0)),
             "min_m": last.get("min_m"), "start_m": last.get("start_m"),
             "path_length_m": last.get("path_length_m"),
-            "escaped": bool(last.get("escaped", False)),
+            "escaped": int(bool(last.get("escaped", False))),
             "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
             "collision_rate": float(np.mean([bool(i.get("collided")) for i in infos])),
             "worker_pid": os.getpid(), "timestamp": _time.time(),
         }
-        if not self.minimal_logging and self._cache["rgb"]:
+        if not self.minimal_logging and self._video_frames:
             try:
                 episode_logs |= self._write_video(save_dir)
             except Exception as e:      # video failure must never kill a training episode
@@ -190,44 +272,135 @@ class ContinuousObjectNavEnvActor:
             f.write(_json.dumps(episode_logs, default=_ser) + "\n")
         if clear_steps:
             self._cache = {"rgb": [], "info": [], "reward": []}
+            self._video_frames, self._video_meta = [], []
         if self.logger_actor is not None:
             import ray
             try:
-                ray.get(self.logger_actor.log_row.remote(row=episode_logs), timeout=1.0)
+                # Media namespaces (vid/, img/) must stay as-is for the logger's
+                # detection; everything else takes the routing prefix.
+                _row = {k if k.startswith(("vid/", "img/")) else self._log_prefix + k: v
+                        for k, v in episode_logs.items()} if self._log_prefix else episode_logs
+                ray.get(self.logger_actor.log_row.remote(row=_row), timeout=1.0)
             except Exception as e:
                 print(f"[objectnav_continuous] logger ack issue: {e}")
         return os.path.join(save_dir, "summary.json")
 
+    @property
+    def _video_capture(self) -> bool:
+        return not self.minimal_logging and self.logging_output_dir is not None
+
+    def _encode_frame(self, rgb: np.ndarray) -> bytes:
+        from io import BytesIO
+        from PIL import Image
+
+        buf = BytesIO()
+        Image.fromarray(np.asarray(rgb, dtype=np.uint8)).save(
+            buf, format="JPEG", quality=88)
+        return buf.getvalue()
+
+    def _video_on_tick(self, record) -> None:
+        """Executor tick hook: capture every `video_tick_stride`-th physics tick.
+
+        The counter is per-episode and global across chunks, so the stride's phase never
+        resets at a chunk boundary and frame spacing stays exactly uniform. Overlay data is
+        resolved at WRITE time (metrics are per policy step by design -- a geodesic query
+        per tick is precisely what the task layer avoids), so the meta stores only which
+        policy step the tick belongs to and its sim time."""
+        # Physical fall tracking, EVERY tick regardless of video: the SFT rejection
+        # mechanism (continuous_demos.drive_failure), verbatim thresholds -- falling is
+        # joint_z velocity <= -fall_speed_mps (2.0, free fall past habitat's 0.2 m
+        # agent_max_climb), escaped is that sustained fall_duration_s (1.0 s; measured
+        # gap: longest healthy run 0.56 s, shortest true escape 1.6 s).
+        from continuous_demos.drive_failure import vertical_velocity_mps
+        if vertical_velocity_mps(self._robot_sim) <= -self._fall_cfg.fall_speed_mps:
+            self._fall_run += 1
+            self._max_fall_run = max(self._max_fall_run, self._fall_run)
+        else:
+            self._fall_run = 0
+
+        self._video_tick += 1
+        if self._video_tick % self._video_tick_stride:
+            return
+        if self._video_capture:
+            self._video_frames.append(self._encode_frame(self._render()))
+            self._video_meta.append((self._steps, float(record.sim_time)))
+
     def _write_video(self, save_dir: str) -> Dict[str, str]:
-        """One MP4 per episode with a continuous-status overlay, plus a thumbnail."""
+        """One MP4 per episode with a continuous-status overlay, plus a thumbnail.
+
+        Written fps = realtime_factor / (dt * stride): at the 25 Hz physics rate, stride 1
+        and factor 1.0 give a 25 fps video that plays in exact realtime; stride 5 gives a
+        5 fps video that STILL plays realtime, just at lower temporal resolution."""
         import os
+        from io import BytesIO
         from habitat.utils.visualizations import utils as vut
         from PIL import Image
 
-        infos = self._cache["info"]
+        infos, rewards = self._cache["info"], self._cache["reward"]
         frames = []
-        for idx, (rgb, info) in enumerate(zip(self._cache["rgb"], infos)):
-            r = self._cache["reward"][idx] if idx < len(self._cache["reward"]) else 0.0
+        for jpeg, (step_idx, sim_time) in zip(self._video_frames, self._video_meta):
+            # np.array (copy), NOT np.asarray: PIL exposes a READ-ONLY buffer, and cv2's
+            # overlay refuses to draw into it ("marked as readonly"); ascontiguousarray
+            # passes an already-contiguous readonly array through unchanged.
+            rgb = np.array(Image.open(BytesIO(jpeg)).convert("RGB"), dtype=np.uint8)
+            # A tick inside step k lands between infos[k] (pre-chunk) and infos[k+1]
+            # (post-chunk); overlay the freshest bound that exists.
+            k = min(step_idx + 1, len(infos) - 1)
+            info = infos[k]
+            r = rewards[k - 1] if 0 < k <= len(rewards) else 0.0
             text = [
-                f"episode: {infos[0].get('episode_label')} step: {idx}",
+                f"episode: {infos[0].get('episode_label')} step: {max(step_idx, 0)} "
+                f"t={sim_time:.2f}s",
                 f"goal: {self._episode.object_category if self._episode else '?'}",
                 f"distance_to_goal: {info.get('distance_to_goal')}",
                 f"reward: {r:+.3f}  commanded_m: {info.get('commanded_m', 0.0):.2f}",
             ]
             frames.append(vut.overlay_text_to_image(np.ascontiguousarray(rgb), text))
+        fps = self._video_realtime_factor / (self.dt * self._video_tick_stride)
         vut.images_to_video(images=frames, output_dir=save_dir, video_name="video",
-                            fps=4, quality=4, verbose=False)
+                            fps=fps, quality=4, verbose=False)
         thumb = os.path.join(save_dir, "thumbnail.jpg")
         Image.fromarray(frames[-1]).save(thumb, quality=85)
         return {"vid/episode_video": os.path.join(save_dir, "video.mp4"),
                 "img/thumbnail": thumb}
 
+    def list_episode_uids(self):
+        """All uids this actor can currently serve (loads the pool if needed). Used by
+        interleaved eval to draw the fixed eval set without a second parse."""
+        self._load_episodes()
+        return [e.uid for e in self._episodes]
+
     def reset(self):
         self._load_episodes()
-        episode, screen = self._next_admissible_episode()
-        self._episode = episode
-        self._ensure_scene(episode)
-        start = self._task.reset(episode.episode, snap_to_navmesh=True)
+        while True:
+            try:
+                episode, screen = self._next_admissible_episode()
+            except StopIteration:
+                # Shard exhausted DURING a skip loop (DOA tail at slice end): a raise
+                # from a ray remote would error the reset ref and cascade into the
+                # collection loop as a crash. Return a SENTINEL the rollout mixin
+                # recognizes and retires on instead -- exhaustion is a normal outcome
+                # of a finite eval slice, not an error.
+                rgb = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+                return rgb, {
+                    "obs": {"instr_or_goal": None},
+                    "reward": 0.0, "done": True, "is_exhausted": True,
+                    "exhausted_sentinel": True,
+                    "info": {"exhausted_sentinel": True,
+                             "skipped_so_far": dict(self._skipped)},
+                }
+            self._episode = episode
+            self._ensure_scene(episode)
+            start = self._task.reset(episode.episode, snap_to_navmesh=True)
+            if np.isfinite(float(start["distance_to_goal"])):
+                break
+            # Screening passes on the ROBOT-footprint mesh, but the REWARD is measured on
+            # the dataset mesh -- and the spawn's dataset-mesh snap can land disconnected
+            # from the goal (measured: 31/73 "escapes" in the 250st run were exactly this,
+            # dead on arrival at n_steps=1). An unmeasurable episode is a screening
+            # failure, not a rollout: skip it with a reason code, never serve it.
+            self._skipped["reward_mesh_disconnected"] = (
+                self._skipped.get("reward_mesh_disconnected", 0) + 1)
         self._executor.reset()
         self._steps = 0
         self._prev_geodesic = float(start["distance_to_goal"])
@@ -248,7 +421,14 @@ class ContinuousObjectNavEnvActor:
             "screen": screen,
             "skipped_so_far": dict(self._skipped),
         }
-        self._cache = {"rgb": [rgb], "info": [info], "reward": []}
+        self._cache = {"rgb": [], "info": [info], "reward": []}
+        self._fall_run = 0
+        self._max_fall_run = 0
+        self._blind_run = 0
+        self._video_frames, self._video_meta, self._video_tick = [], [], 0
+        if self._video_capture:
+            self._video_frames.append(self._encode_frame(rgb))
+            self._video_meta.append((-1, 0.0))   # pre-motion frame; overlays info[0]
         return rgb, {
             "obs": {"instr_or_goal": episode.object_category},
             "reward": 0.0,
@@ -266,7 +446,12 @@ class ContinuousObjectNavEnvActor:
                 "env must agree on ticks-per-step, or sim time and policy steps quietly mean "
                 "different things and two runs stop being comparable."
             )
-        execution = self._executor.execute(chunk, chunk_index=self._steps)
+        execution = self._executor.execute(
+            chunk, chunk_index=self._steps,
+            # The on_tick hook carries BOTH per-tick concerns: physical fall tracking
+            # (always) and video frames (when capture is on) -- see _video_on_tick.
+            on_tick=self._video_on_tick,
+        )
         self._steps += 1
 
         # One geodesic query per policy step, not per tick: the task layer keeps path length
@@ -276,34 +461,70 @@ class ContinuousObjectNavEnvActor:
 
         progress = (self._prev_geodesic - geodesic
                     if np.isfinite(geodesic) and np.isfinite(self._prev_geodesic) else 0.0)
+        if self.progress_reward_clip > 0:
+            progress = float(np.clip(progress, -self.progress_reward_clip,
+                                     self.progress_reward_clip))
         collided = self._collided(execution)
         reward = float(progress) - self.slack_penalty
         if collided:
             reward -= self.collision_penalty
-        self._prev_geodesic = geodesic
+        # Hold the last FINITE distance across snap dropouts: updating with inf would
+        # zero the progress on the resumption step too, silently unpaying (and
+        # unpunishing) all motion during the blind window. With the hold, the resumption
+        # step settles the accumulated delta, bounded by progress_reward_clip.
+        if np.isfinite(geodesic):
+            self._prev_geodesic = geodesic
+            self._blind_run = 0
+        else:
+            self._blind_run += 1
 
         if np.isfinite(geodesic) and geodesic < self._min_geodesic:
             self._min_geodesic = float(geodesic)
             self._path_at_min = float(self._task.path_tracker.length)
 
         reached = bool(np.isfinite(geodesic) and geodesic <= self.success_distance)
-        escaped = not np.isfinite(geodesic)
-        done = bool(reached or escaped or self._steps >= self.max_steps)
-        info_extra: Dict[str, Any] = {}
-        if done:
-            # Emitted once, on the terminal step, so a per-episode reduction upstream
-            # (last-info wins) reads them directly. `ospl_fix` is the RECOMPUTED oracle
-            # SPL -- the task layer's own OracleSPL is documented broken
-            # (docs/SAMPLE101_EVALS.md) and is deliberately not consulted here.
-            oracle = bool(self._min_geodesic <= self.success_distance)
-            s0 = self._start_geodesic
-            info_extra = {
-                "oracle_success": oracle,
-                "ospl_fix": (s0 / max(s0, self._path_at_min)) if oracle and s0 > 0 else 0.0,
-                "min_m": self._finite(self._min_geodesic),
-                "start_m": self._finite(s0),
-                "path_length_m": float(self._task.path_tracker.length),
-            }
+        # ESCAPE IS PHYSICAL, never a geodesic proxy: the SFT rejection rule (sustained
+        # free-fall of joint_z, drive_failure.py thresholds), accumulated per tick in
+        # _video_on_tick. A non-finite geodesic mid-episode is a navmesh-snap dropout --
+        # the robot is standing in the world with the metric momentarily blind (measured:
+        # under the old `escaped = not isfinite` rule, 42% of "escapes" were spawn-snap
+        # failures and an unknown share of the rest transient) -- so it costs a
+        # zero-progress step and the episode CONTINUES; success simply cannot fire while
+        # the metric is blind.
+        escaped = bool(self._fall_run >= self._fall_cfg.fall_duration_s / self.dt)
+        # PERMANENT blindness (not a dropout): the metric never came back, so nothing in
+        # this episode is learnable -- progress is structurally 0 and success cannot fire.
+        # End it rather than spend the budget collecting a flat all-negative trajectory
+        # that teaches "this state costs slack forever". Counted as truncation, not
+        # termination: the episode is unmeasurable, not absorbing.
+        reward_lost = bool(self.reward_lost_steps
+                           and self._blind_run >= self.reward_lost_steps)
+        done = bool(reached or escaped or reward_lost or self._steps >= self.max_steps)
+        # Budget-cap ending is TRUNCATION, not termination: the MDP continues, the
+        # episode doesn't. Consumers (GAE truncation bootstrap) treat it differently
+        # from reached/escaped, which are genuinely absorbing.
+        truncated = bool(done and not reached and not escaped)
+        if reached and self.success_reward:
+            reward += self.success_reward
+        if escaped and self.escape_penalty:
+            reward -= self.escape_penalty
+        # Emitted EVERY step, not only the terminal one: `_pack_trajectory` takes an
+        # episode's column set from its FIRST step's info, so terminal-only keys give a
+        # length-1 episode (instant escape / near-spawn goal at a tight success_distance)
+        # extra columns and `collate_trajectories` KeyErrors on the mixed batch (observed:
+        # first v2 cycle). Values are running statistics; on the terminal step they equal
+        # the old terminal-only emission exactly, so last-info-wins consumers are
+        # unchanged. `ospl_fix` is the RECOMPUTED oracle SPL -- the task layer's own
+        # OracleSPL is documented broken (docs/SAMPLE101_EVALS.md).
+        oracle = bool(self._min_geodesic <= self.success_distance)
+        s0 = self._start_geodesic
+        info_extra = {
+            "oracle_success": oracle,
+            "ospl_fix": (s0 / max(s0, self._path_at_min)) if oracle and s0 > 0 else 0.0,
+            "min_m": self._finite(self._min_geodesic),
+            "start_m": self._finite(s0),
+            "path_length_m": float(self._task.path_tracker.length),
+        }
         rgb = self._render()
         info = {
             "episode_label": self._episode.uid,
@@ -314,6 +535,15 @@ class ContinuousObjectNavEnvActor:
             "steps": self._steps,
             "collided": collided,
             "stuck": collided,        # discrete-actor key parity: collision_rate reads it
+            "truncated": truncated,
+            # Longest sustained fall so far, in seconds -- the escape detector's own
+            # statistic (drive_failure fall_run_s), so near-misses are visible even when
+            # no escape fires.
+            "fall_run_s": float(self._max_fall_run * self.dt),
+            # Blind-run length in policy steps, and whether it ended the episode. Emitted
+            # every step so the screening gap is visible as a rate, not just at the end.
+            "blind_run": int(self._blind_run),
+            "reward_lost": reward_lost,
             "pos_rots": self._pos_rots(),
             **info_extra,
             # How far the chunk asked the base to move this step. Paired with the
@@ -323,7 +553,6 @@ class ContinuousObjectNavEnvActor:
             if execution.ticks else 0.0,
             "end_lag_m": float(execution.end_lag),
         }
-        self._cache["rgb"].append(rgb)
         self._cache["info"].append(info)
         self._cache["reward"].append(float(reward))
         return rgb, {
@@ -364,26 +593,17 @@ class ContinuousObjectNavEnvActor:
         if self._shard is not None:
             episodes = self._select(episodes, self._shard)
         self._episodes = episodes
-        rng = np.random.default_rng(self.seed)
-        # SCENE-GROUPED order, never a flat permutation. A flat shuffle makes consecutive
-        # episodes land in different scenes, and every scene change costs a full simulator
-        # reconfigure PLUS a robot-footprint navmesh recompute -- ~30 s of pure overhead per
-        # episode, forever. Shuffle scenes, then episodes within a scene: same seed-determined
-        # coverage, one scene build per scene visit. (CLAUDE.md's task layer gives the same
-        # advice: drive the outer loop with episodes_by_scene.)
-        by_scene: Dict[str, List[int]] = {}
-        for i, e in enumerate(episodes):
-            by_scene.setdefault(e.uid.split(":", 1)[0], []).append(i)
-        scene_order = list(by_scene)
-        rng.shuffle(scene_order)
-        order: List[int] = []
-        for s in scene_order:
-            idx = by_scene[s]
-            rng.shuffle(idx)
-            order.extend(idx)
-        self._order = order
-        self._cursor = 0
+        self._reshuffle()
 
+    def _reshuffle(self) -> None:
+        """FLAT permutation over the shard, freshly drawn each pass -- the discrete env's
+        `shuffle=True` iterator semantics. No scene grouping: grouping trades sampling
+        uniformity for simulator-rebuild savings, and the rollout scheduler already
+        amortizes those. `self._rng` persists across passes, so pass k+1 is a NEW
+        permutation (an RL actor must not replay the identical order every cycle), while an
+        explicit `seed` still reproduces the whole stream."""
+        self._order = [int(i) for i in self._rng.permutation(len(self._episodes))]
+        self._cursor = 0
 
     def _select(self, episodes: List[Any], wanted: List[str]) -> List[Any]:
         """Resolve a shard against harness uids, and RAISE on anything unresolved.

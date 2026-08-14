@@ -76,11 +76,43 @@ class ContinuousObjectNavEnvConfig:
     # count -- the robot is always touching the floor.
     slack_penalty: float = 0.0
     collision_penalty: float = 0.0
-    seed: int = 0
+    # Clip on the per-step progress REWARD (never the metrics): navmesh snap of a physical
+    # robot occasionally relocates across a wall/floor, injecting multi-metre single-step
+    # geodesic jumps (measured 0.16% of steps, max 6.7 m). No physical step moves the
+    # geodesic more than the path driven in gap*dt (~0.6 m), so beyond this is artifact.
+    # 0 disables.
+    progress_reward_clip: float = 0.75
+    # Terminal bonus added to the reached step's reward (discrete-standard success term).
+    # 0 keeps the progress-only shape every run before 2026-08-21 used.
+    success_reward: float = 0.0
+    # Subtracted from the escaped terminal step's reward. Unpenalized escapes end the
+    # episode keeping all accumulated progress -- a free exit the policy drifts toward
+    # (measured: escape rate doubled over the sd04_noterm run). 0 keeps the old shape.
+    escape_penalty: float = 0.0
+    # End an episode after N consecutive policy steps with a NON-FINITE geodesic. DOA
+    # screening runs at the SPAWN SNAP, but an episode can lose the reward metric
+    # permanently once the robot moves (measured: 1S7LAXRdDqK:48 -- finite 6.89 m at
+    # spawn, blind thereafter; the finite-hold then froze progress at ~0 across 175
+    # steps and 44 m of wandering, 0/29 in every run that served it). Such an episode is
+    # unmeasurable, not hard: it contributes a flat all-negative trajectory and silently
+    # caps the pool's reachable success. Transient snap dropouts last ticks, so 25 steps
+    # (10 s of sim) sits far above their scale. 0 disables (pre-2026-08-14 behaviour).
+    reward_lost_steps: int = 25
+    # None (the RL default) = a distinct per-worker seed, the discrete env's ep_seed
+    # pattern; set an explicit int to reproduce an exact episode stream (eval).
+    seed: Optional[int] = None
     source_kwargs: Optional[Dict[str, Any]] = None
     # False = per-episode MP4 + thumbnail + sequence.json through the amortized
     # flush_logs_to_disk hook; True skips the video encode and writes scalars only.
     minimal_logging: bool = False
+    # Video temporal resolution: capture a frame every N physics ticks (1/dt = 25 Hz base,
+    # so stride 1 = 25 fps of sim time, stride 2 = 12.5 fps, stride 10 = one frame per
+    # policy step -- the old choppiness). Frames are JPEG-encoded in memory as captured.
+    # Default 2: smooth to the eye at half the render/encode/storage cost of stride 1.
+    video_tick_stride: int = 2
+    # Playback speed relative to sim time: written fps = factor / (dt * stride), so the
+    # default 1.0 plays exactly realtime at ANY stride; 2.0 twice realtime, 0.5 half.
+    video_realtime_factor: float = 1.0
 
 
 @dataclass
