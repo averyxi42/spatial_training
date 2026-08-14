@@ -78,6 +78,9 @@ class ContinuousObjectNavEnvConfig:
     collision_penalty: float = 0.0
     seed: int = 0
     source_kwargs: Optional[Dict[str, Any]] = None
+    # False = per-episode MP4 + thumbnail + sequence.json through the amortized
+    # flush_logs_to_disk hook; True skips the video encode and writes scalars only.
+    minimal_logging: bool = False
 
 
 @dataclass

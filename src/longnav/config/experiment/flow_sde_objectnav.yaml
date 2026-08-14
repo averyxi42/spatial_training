@@ -12,7 +12,7 @@ defaults:
   - override /sim: objectnav_continuous
 
 vlm:
-  attn_impl: sdpa
+  attn_impl: flash_attention_2
   policy_head:
     checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000
     gap: 10
@@ -63,3 +63,9 @@ training:
   # HAPO base (+training=hapo), with the chain-head exceptions:
   rl_config:
     entropy_bonus: 0.0      # nonzero RAISES for a chain head -- schedule-fixed entropy
+
+task:
+  # sample400_a in HARNESS-UID format (scene:episode_id#occurrence): the continuous env's
+  # assign_shard refuses longnav labels by design -- the two uid conventions silently
+  # disagree in some scenes, and episode_uids.py carries the verified translation.
+  subset_label: sample400_a__uid

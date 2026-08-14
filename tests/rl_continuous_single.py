@@ -21,7 +21,7 @@ cfg.resources.vlm_conda_env = None
 cfg.resources.habitat_conda_env = None
 cfg.sim = DummyContinuousEnvConfig()
 
-cfg.vlm.attn_impl = "sdpa"
+cfg.vlm.attn_impl = "flash_attention_2"
 cfg.vlm.save_outputs = True
 cfg.vlm.policy_head = GaussianHeadConfig(action_space_dim=2)
 

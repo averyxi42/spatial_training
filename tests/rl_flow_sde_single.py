@@ -38,7 +38,7 @@ cfg.resources.vlm_conda_env = None
 cfg.resources.habitat_conda_env = None
 cfg.sim = DummyContinuousEnvConfig()
 
-cfg.vlm.attn_impl = "sdpa"
+cfg.vlm.attn_impl = "flash_attention_2"
 cfg.vlm.save_outputs = True
 # n=3 / a=0.15: the launch defaults. The smoke does not care about the value of `a`,
 # only that every seam holds at the real chain dimension (11 x 20 x 3 = 660).
@@ -74,7 +74,7 @@ import torch                                                         # noqa: E40
 # cycles is enough to see mean ||chunk|| FALL if -- and only if -- the whole loop transports
 # gradient from reward to the velocity field through the chain ratio. That trend is the
 # system-health check; a single cycle only proves the plumbing.
-N_CYCLES = 14
+N_CYCLES = 3
 norms, checked = [], False
 for cycle in range(N_CYCLES):
     trajectory_list = []

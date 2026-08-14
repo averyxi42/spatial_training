@@ -1,6 +1,20 @@
 # import os
 import numpy as np
 import torch
+
+# peft's set_peft_model_state_dict calls _maybe_shard_state_dict_for_tp whenever
+# torch.distributed is initialized; that helper's FIRST LINE imports tensor-parallel
+# symbols this transformers version does not export, so the ImportError fires before the
+# helper's own "no TP plan, nothing to do" exit. We run pure DDP -- the helper is a
+# guaranteed no-op here -- so when the import is broken, replace it with one.
+try:
+    from transformers.integrations.tensor_parallel import EmbeddingParallel  # noqa: F401
+except ImportError:
+    import peft.utils.save_and_load as _peft_sl
+
+    def _no_tp_shard(model, state_dict, adapter_name=None, *a, **k):
+        return state_dict
+    _peft_sl._maybe_shard_state_dict_for_tp = _no_tp_shard
 import time
 import gc
 import copy
@@ -939,26 +953,19 @@ class VLMTrainingMixin:
             hh = policy_stats['h']
             log_prob = _chain_lp(hh, actions_continuous.to(hh.device),
                                  sde_positions.to(hh.device))
-            # THE CHAIN ANCHOR. `old_log_prob` arrives from postprocess_episode, whose
-            # forward regime measurably differs from the training epochs' (h shifts a
-            # stable ~25% across `_setup_training`; the chain density amplifies that to
-            # 40-90 nats and pins every ratio at the clip -- observed, not hypothesised).
-            # Grad and no-grad epoch forwards are bitwise identical, so the FIRST epoch's
-            # own detached log_prob is the exact in-regime anchor: epoch-1 ratio is 1 by
-            # construction, later epochs measure genuine within-batch movement. Keyed by
-            # the chains' bytes; the actor is persistent so the cache survives across the
-            # per-epoch train_rl_step calls. The postprocess value stays visible as
-            # chain/rollout_seam_gap -- the diagnostic it was better suited to be.
-            import hashlib
-            fp = hashlib.md5(np.ascontiguousarray(
-                actions_continuous.detach().cpu().numpy()).tobytes()).hexdigest()
-            if getattr(self, "_chain_anchor_fp", None) != fp:
-                self._chain_anchor_fp = fp
-                self._chain_anchor = log_prob.detach()
-                self._chain_seam_gap = float(
-                    (log_prob.detach() - old_log_prob.to(log_prob.device)
-                     .reshape(log_prob.shape)).abs().mean())
-            old_log_prob = self._chain_anchor.to(log_prob.device)
+            # NO re-anchoring: postprocess `old_log_prob` is correct BY CONSTRUCTION
+            # relative to the training forwards -- the framework aligns them (same cached
+            # embeds, same code path) and this was verified for the chain head at 0.0096
+            # nats over 180 terms. THE GUARANTEE HOLDS ONLY UNDER flash_attention_2, the
+            # implementation the framework's numerics were validated on: under sdpa,
+            # context-dependent kernel selection shifted `h` ~25% between forwards, the
+            # 1/sigma_step^2-amplified chain density turned that into 40-90 nats, every
+            # ratio pinned at the clip and every update silently zeroed. If
+            # chain/abs_log_ratio_mean is not ~0.01 nats at epoch 0, suspect attn_impl
+            # before anything else.
+            self._chain_seam_gap = float(
+                (log_prob.detach() - old_log_prob.to(log_prob.device)
+                 .reshape(log_prob.shape)).abs().mean())
         elif self.policy_head_config['type'] == "continuous":
             if policy_stats is None or actions_continuous is None:
                 raise ValueError("Continuous RL loss requires policy_stats and actions_continuous.")
@@ -1234,7 +1241,26 @@ class VLMTrainingMixin:
         # This updates self.model in-place, preserving optimizer references
         if os.path.exists(os.path.join(path, "adapter_model.bin")) or os.path.exists(os.path.join(path, "adapter_model.safetensors")):
              adapter_state_dict = load_peft_weights(path)
-             set_peft_model_state_dict(self.model, adapter_state_dict)
+             # An attached action_head must be INVISIBLE to the adapter load: peft iterates
+             # the current model's keys, and a head attached before load_checkpoint makes it
+             # expect head weights inside a backbone adapter file that rightly has none
+             # (KeyError 'base_model.model.action_head...'). Heads that load their own
+             # trained weights (flow_sde, latent) bring them from their own checkpoint_dir.
+             # `getattr(self.model, "action_head")` resolves through PeftModel's
+             # __getattr__ FORWARDING, so the owner may be a wrapped inner module --
+             # delattr on the wrapper raises AttributeError. Detach from whichever module
+             # actually registers it.
+             _head_owner = next((m for _, m in self.model.named_modules()
+                                 if "action_head" in getattr(m, "_modules", {})), None)
+             _detached_head = (_head_owner._modules["action_head"]
+                               if _head_owner is not None else None)
+             if _head_owner is not None:
+                 delattr(_head_owner, "action_head")
+             try:
+                 set_peft_model_state_dict(self.model, adapter_state_dict)
+             finally:
+                 if _head_owner is not None:
+                     _head_owner.action_head = _detached_head
              print(" -> Adapters and (maybe) Value Head loaded.")
         else:
              print(" -> ⚠️ No adapter weights found in checkpoint.")
