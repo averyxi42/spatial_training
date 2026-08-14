@@ -59,7 +59,8 @@ class LatentIntentHead(nn.Module):
     """
 
     def __init__(self, readout: nn.Module, codec: nn.Module, gap: int,
-                 min_log_std: float = -20.0, max_log_std: float = 2.0):
+                 min_log_std: float = -20.0, max_log_std: float = 2.0,
+                 tau: float = 1.0):
         super().__init__()
         if getattr(codec, "latent", None) is None:
             raise ValueError(
@@ -69,9 +70,28 @@ class LatentIntentHead(nn.Module):
             )
         if int(gap) < 1:
             raise ValueError(f"gap must be >= 1, got {gap}")
+        if not float(tau) > 0.0:
+            raise ValueError(f"tau must be > 0, got {tau}")
         self.readout = readout
         self.codec = codec
         self.gap = int(gap)
+        # Exploration temperature: sigma_rl = tau * sigma_phi, applied at the policy output
+        # so rollout sampling AND the training-side log-prob see the same distribution
+        # (docs/LATENT_RL.md "At RL time"). 1.0 = the checkpoint's own sigma, which is the
+        # evidenced setting: the vary-`c` attribution experiments ran at exactly that scale.
+        self.tau = float(tau)
+        # Deterministic-eval switch, set by RLActor.set_ode_sampling (the same toggle that
+        # flips the chain head to the pure ODE): rollout acts at `mu` instead of sampling.
+        # Plain attribute, not config -- eval cycles flip it on and off around each pass.
+        self.force_mean = False
+        # THE DECODER IS THE ENVIRONMENT, NOT THE POLICY. The action is `c`; the PPO ratio
+        # is the Gaussian over `c`; `z_0` and the decode are environment stochasticity
+        # (see from_policy_head_config). The velocity field therefore must not train here
+        # -- and it never receives gradient anyway (decode_action is no_grad and absent
+        # from rl_loss), so leaving it trainable would only make DDP error on unused
+        # parameters and put dead weight in the action_head optimizer group.
+        for p in self.codec.decoder.parameters():
+            p.requires_grad_(False)
         # Far wider than the Gaussian head's -5.0 default. `sigma` here is trained by the
         # ELBO and lands around 1% of `h`'s per-dim std (~1e-3), i.e. log_std ~ -6.9; the
         # discrete head's floor would clamp it and silently inflate exploration by ~500x.
@@ -84,6 +104,8 @@ class LatentIntentHead(nn.Module):
         flat = hidden_states.reshape(b * t, 1, hidden_states.shape[-1])
         h = self.readout(flat)                                   # (B*T, dim)
         mu, log_sigma = self.codec.latent(h.float())
+        if self.tau != 1.0:
+            log_sigma = log_sigma + float(np.log(self.tau))
         log_sigma = log_sigma.clamp(self.min_log_std, self.max_log_std)
         return {"mu": mu.reshape(b, t, -1), "log_std": log_sigma.reshape(b, t, -1)}
 
@@ -147,6 +169,7 @@ class LatentIntentHead(nn.Module):
             readout=readout, codec=codec, gap=int(cfg["gap"]),
             min_log_std=float(cfg.get("gaussian_min_log_std", -20.0)),
             max_log_std=float(cfg.get("gaussian_max_log_std", 2.0)),
+            tau=float(cfg.get("tau", 1.0)),
         )
         _ = input_dim   # accepted for signature parity with ContinuousActionHead
         return head

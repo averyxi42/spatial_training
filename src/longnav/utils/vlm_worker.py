@@ -1,5 +1,6 @@
 # import os
 import numpy as np
+import math
 import torch
 
 # peft's set_peft_model_state_dict calls _maybe_shard_state_dict_for_tp whenever
@@ -49,7 +50,7 @@ def compute_full_kl_penalty(log_probs: torch.Tensor, ref_log_probs: torch.Tensor
     return kl
 
 class VLMWorker:
-    def __init__(self, model_id="Qwen/Qwen3-VL-2B-Instruct",attn_impl='sdpa',dtype='float16', prefix = '<|im_start|>assistant\n**',postfix = '**<|im_end|>',save_outputs=False,load_model=True,offload_cache=False,use_sparse=False,bev_canvas_size=2000,save_pixels=False,policy_head=None):
+    def __init__(self, model_id="Qwen/Qwen3-VL-2B-Instruct",attn_impl='sdpa',dtype='float16', prefix = '<|im_start|>assistant\n**',postfix = '**<|im_end|>',save_outputs=False,load_model=True,offload_cache=False,use_sparse=False,bev_canvas_size=2000,save_pixels=False,policy_head=None,merge_adapter_dir=None):
         import transformers.modeling_flash_attention_utils as fa_utils
         def patched(position_ids, batch_size):
             return False
@@ -70,11 +71,13 @@ class VLMWorker:
         self.offload_cache = offload_cache
         self.use_sparse = use_sparse
         self.bev_canvas_size = bev_canvas_size
+        self.merge_adapter_dir = merge_adapter_dir
         if self.policy_head_config['type'] not in ["discrete", "continuous"]:
             raise ValueError(f"Unsupported action_space_type: {self.policy_head_config['type']}")
         
         self._is_merged = None
         self._is_lora = None
+        self.value_readout_offset = 0   # set by setup_training from value_head config
         # Warmup the CUDA allocator
         if load_model:
             self.load_model()
@@ -93,6 +96,7 @@ class VLMWorker:
         self.vis_keep_masks = []
         self.past_image_embeds = None #per batch list of image embed tensors of the form N_patch by N_hidden
         self.logit_indices = []
+        self.value_logit_indices = []
         torch.cuda.empty_cache()
 
     def load_model(self):
@@ -120,6 +124,18 @@ class VLMWorker:
                 low_cpu_mem_usage=True,
                 attn_implementation = self.attn_implementation).eval()
             self.device = self.model.device
+        if self.merge_adapter_dir:
+            # BAKE THE SFT ADAPTER INTO THE BASE. The base model then IS the SFT policy:
+            # the trainable LoRA that setup_training adds on top starts as a fresh
+            # zero-delta (peft inits B=0), so the policy at step 0 is unchanged -- and
+            # peft's stock `disable_adapter()` becomes an exact reference to the SFT
+            # policy, which is what makes rl_config.ref_kl correct for continuous heads
+            # (the discrete path's use_ref has referenced the base this way all along).
+            from peft import PeftModel
+            print(f"Merging SFT adapter into base: {self.merge_adapter_dir}")
+            self.model = PeftModel.from_pretrained(
+                self.model, self.merge_adapter_dir, is_trainable=False
+            ).merge_and_unload()
         self.model.config.use_cache = False
         self.model.to('cuda')
         self.vl_model = self.model.model
@@ -328,9 +344,10 @@ class VLMWorker:
             # Append Layer K's tensor to the Kth list
             for layer_idx, layer_tensor in enumerate(outputs.deepstack_visual_embeds):
                 self.outputs['deepstack_visual_embeds'][layer_idx].append(layer_tensor)
-    def _get_sparse_logit_indices(self):
+    def _get_sparse_logit_indices(self, indices=None):
+        indices = self.logit_indices if indices is None else indices
         ranks = self.seq_keep_mask.long().cumsum(dim=0)
-        logits_to_keep = ranks[self.logit_indices] - 1 # logit indices of the sparsified sequence
+        logits_to_keep = ranks[indices] - 1 # logit indices of the sparsified sequence
         return logits_to_keep
     
     def _pack_embeds(self):
@@ -354,7 +371,13 @@ class VLMWorker:
             "visual_pos_masks": visual_pos_masks.cpu(),
             "inputs_embeds": inputs_embeds.cpu(),
             "input_ids_reference": input_ids.cpu(),
-            "logits_to_keep": self._get_sparse_logit_indices().cpu()  
+            "logits_to_keep": self._get_sparse_logit_indices().cpu(),
+            # Separate critic readout, present only when configured: the value head reads
+            # these positions instead of the policy's. Text tokens by construction (small
+            # negative offsets land in "Action:"), so the sparse remap is always valid.
+            **({"value_logits_to_keep":
+                self._get_sparse_logit_indices(self.value_logit_indices).cpu()}
+               if self.value_readout_offset and self.value_logit_indices else {}),
         }
 
     def _pack_inputs(self):
@@ -416,6 +439,10 @@ class VLMWorker:
         self._accumulate_inputs(turn_inputs)
         # print(f"accumulate time: {time.time()-t}",end=" ")
         self.logit_indices.append(self.cumulative_inputs['input_ids'].shape[1]-1) #slice index for the hidden state predicting the last token in this turn.
+        if self.value_readout_offset:
+            _vi = self.cumulative_inputs['input_ids'].shape[1]-1 + self.value_readout_offset
+            assert _vi >= 0, f"value readout_offset {self.value_readout_offset} underflows turn"
+            self.value_logit_indices.append(_vi)
         turn_inputs = {k: v.to(self.device) for k, v in turn_inputs.items() if v is not None}
         t = time.time()
         if pos_id_kwargs is None or pos_id_kwargs['mode'] == "standard": # use fast pos id calculation
@@ -553,6 +580,76 @@ try:
 except ImportError:
     PEFT_AVAILABLE = False
 
+class DistributionalValueHead(nn.Module):
+    """Categorical value head trained with cross-entropy (HL-Gauss targets).
+
+    Regression critics chase a moving scalar with MSE, which is famously unstable under
+    nonstationary returns; a categorical critic predicts a DISTRIBUTION over a fixed
+    support and trains with cross-entropy, whose gradients are bounded and scale-free
+    (C51 / "Stop Regressing" HL-Gauss). The head emits logits over `n_bins` uniformly
+    spaced atoms on [v_min, v_max]; the scalar value is the softmax expectation.
+
+    Targets are HL-Gauss rather than two-hot: the return is smeared as a Gaussian with
+    sigma = hl_sigma_ratio * bin_width and integrated per bin, which distributes gradient
+    over neighbouring atoms and preserves the mean for in-range returns. Out-of-range
+    returns clamp to the support edge -- pick [v_min, v_max] generously from the reward
+    shape (progress telescopes to ~start_m, plus terminal bonuses/penalties).
+
+    Capability seams (dispatched via `is_distributional`, never a config string check at
+    the call site):
+      forward(hidden) -> logits (..., n_bins)   -- NOT squeezed
+      value(logits)   -> scalar expectation     -- what GAE and metrics consume
+      distributional_loss(logits, returns, mask) -> masked-mean cross-entropy
+    """
+
+    is_distributional = True
+
+    def __init__(self, input_dim: int, hidden_dims: List[int], n_bins: int = 51,
+                 v_min: float = -5.0, v_max: float = 15.0, hl_sigma_ratio: float = 0.75,
+                 dropout: float = 0.0, dtype: Any = torch.float32):
+        super().__init__()
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype)
+        if not (v_max > v_min):
+            raise ValueError(f"v_max must exceed v_min, got [{v_min}, {v_max}]")
+        if n_bins < 2:
+            raise ValueError(f"n_bins must be >= 2, got {n_bins}")
+        layers, curr = [], input_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(curr, h, dtype=dtype), nn.Mish(), nn.Dropout(dropout)]
+            curr = h
+        layers.append(nn.Linear(curr, n_bins, dtype=dtype))
+        self.mlp = nn.Sequential(*layers)
+        self.dtype = dtype
+        self.n_bins = int(n_bins)
+        edges = torch.linspace(v_min, v_max, n_bins + 1, dtype=torch.float32)
+        self.register_buffer("bin_edges", edges)
+        self.register_buffer("bin_centers", 0.5 * (edges[:-1] + edges[1:]))
+        self.hl_sigma = float(hl_sigma_ratio) * float(edges[1] - edges[0])
+
+    def forward(self, x):
+        return self.mlp(x)
+
+    def value(self, logits: torch.Tensor) -> torch.Tensor:
+        probs = torch.softmax(logits.float(), dim=-1)
+        return probs @ self.bin_centers.to(probs.device)
+
+    def targets(self, returns: torch.Tensor) -> torch.Tensor:
+        """HL-Gauss per-bin mass of N(return, hl_sigma), support-clamped. (..., n_bins)."""
+        g = returns.float().clamp(float(self.bin_edges[0]), float(self.bin_edges[-1]))
+        z = (self.bin_edges.to(g.device) - g.unsqueeze(-1)) / (self.hl_sigma * math.sqrt(2.0))
+        cdf = 0.5 * (1.0 + torch.erf(z))
+        p = cdf[..., 1:] - cdf[..., :-1]
+        return p / p.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    def distributional_loss(self, logits: torch.Tensor, returns: torch.Tensor,
+                            response_mask: torch.Tensor) -> torch.Tensor:
+        logp = torch.log_softmax(logits.float(), dim=-1)
+        ce = -(self.targets(returns) * logp).sum(dim=-1)
+        m = response_mask.to(ce.device).float()
+        return (ce * m).sum() / m.sum().clamp_min(1.0)
+
+
 class ValueHead(nn.Module):
     """
     A configurable MLP Value Head.
@@ -629,10 +726,11 @@ class VLMWrapper(nn.Module):
             embeds_inputs['inputs_embeds'].requires_grad_(True)
         embeds_inputs['deepstack_visual_embeds'] = [v.to(self.vlm.dtype) for v in embeds_inputs['deepstack_visual_embeds']]
         logits_to_keep = embeds_inputs.pop('logits_to_keep')
+        value_logits_to_keep = embeds_inputs.pop('value_logits_to_keep', None)
         embeds_inputs.pop('input_ids_reference')
         embeds_inputs['seq_keep_mask']='everything' # force keeping everything since seq is already sparse
         hidden = self.vlm.model.model.language_model(**embeds_inputs).last_hidden_state #TODO: fix this mess
-        return hidden,logits_to_keep
+        return hidden,logits_to_keep,value_logits_to_keep
     
     '''
     Forward pass that computes stats for the policy distribution and optionally value function.
@@ -641,11 +739,13 @@ class VLMWrapper(nn.Module):
     '''
     
     def _forward_embeds(self,embeds_inputs,compute_values=False,value_grad_scale=0.1):
-        hidden,logits_to_keep = self._forward_hidden(embeds_inputs)
+        hidden,logits_to_keep,value_logits_to_keep = self._forward_hidden(embeds_inputs)
+        if value_logits_to_keep is None:
+            value_logits_to_keep = logits_to_keep
         values = None
         policy_stats = {}
         if compute_values:
-            value_hidden = hidden[:,logits_to_keep].to(self.vlm.value_head.dtype)
+            value_hidden = hidden[:,value_logits_to_keep].to(self.vlm.value_head.dtype)
             if value_grad_scale<=0:
                 # 1. Fully Detached (Old way)
                 value_hidden = value_hidden.detach()
@@ -654,7 +754,9 @@ class VLMWrapper(nn.Module):
                 # Forward: Identity. Backward: Gradient * scale.
                 value_hidden = (value_hidden * value_grad_scale) + (value_hidden.detach() * (1 - value_grad_scale))
 
-            values = self.vlm.value_head(value_hidden).squeeze(-1)
+            values = self.vlm.value_head(value_hidden)
+            if not getattr(self.vlm.value_head, "is_distributional", False):
+                values = values.squeeze(-1)   # distributional heads emit bin logits
         if self.action_space_type == "continuous":
             policy_stats = self.vlm.action_head(hidden[:, logits_to_keep])
         else:
@@ -745,6 +847,7 @@ class VLMTrainingMixin:
         os.environ["LOCAL_RANK"] = "0"
         
         self.rl_algo_config=config.rl_config
+        self.train_config=config
         # 2. Initialize Accelerator
         print("creating accelerator")
         self.accelerator = Accelerator(
@@ -769,16 +872,60 @@ class VLMTrainingMixin:
             if self.policy_head_config['type'] == "continuous":
                 self._ensure_continuous_action_head()
             if config.rl_config.value_head is not None:
-                self.model.value_head = ValueHead(
-                    input_dim=hidden_size,
-                    hidden_dims=config.rl_config.value_head.hidden_dims,
-                    dropout=config.rl_config.value_head.dropout,
-                    dtype=getattr(torch,config.rl_config.value_head.dtype)
-                ).to(self.model.device)
+                vh_cfg = config.rl_config.value_head
+                if getattr(vh_cfg, "kind", "regression") == "distributional":
+                    self.model.value_head = DistributionalValueHead(
+                        input_dim=hidden_size,
+                        hidden_dims=vh_cfg.hidden_dims,
+                        n_bins=vh_cfg.n_bins, v_min=vh_cfg.v_min, v_max=vh_cfg.v_max,
+                        hl_sigma_ratio=vh_cfg.hl_sigma_ratio,
+                        dropout=vh_cfg.dropout,
+                        dtype=getattr(torch, vh_cfg.dtype),
+                    ).to(self.model.device)
+                else:
+                    self.model.value_head = ValueHead(
+                        input_dim=hidden_size,
+                        hidden_dims=vh_cfg.hidden_dims,
+                        dropout=vh_cfg.dropout,
+                        dtype=getattr(torch, vh_cfg.dtype)
+                    ).to(self.model.device)
+                self.value_readout_offset = int(getattr(vh_cfg, "readout_offset", 0))
             from verl.trainer.ppo.core_algos import get_policy_loss_fn
             self.policy_loss_fn = get_policy_loss_fn(config.rl_config.policy_loss.name)
+            if getattr(config.rl_config, 'ref_kl', False) and self.policy_head_config['type'] == "continuous":
+                # ref_kl's reference is peft's disable_adapter(), i.e. THE BASE MODEL.
+                # That is the SFT policy only when the SFT adapter was merged into the
+                # base (vlm.merge_adapter_dir). Without the merge the "reference" is the
+                # raw pretrained VLM and every ref/kl_* number is confidently meaningless
+                # -- a plausible wrong gauge, so refuse loudly instead.
+                if not getattr(self, 'merge_adapter_dir', None):
+                    raise ValueError(
+                        "rl_config.ref_kl requires vlm.merge_adapter_dir on continuous "
+                        "heads: disable_adapter() references the BASE model, which is "
+                        "the SFT policy only after the merge. Set vlm.merge_adapter_dir "
+                        "to the SFT adapter (and drop training.checkpoint), or turn "
+                        "ref_kl off.")
+            if getattr(self, 'merge_adapter_dir', None) and config.checkpoint is not None:
+                import os as _os
+                if _os.path.realpath(str(config.checkpoint)) == _os.path.realpath(str(self.merge_adapter_dir)):
+                    raise ValueError(
+                        "training.checkpoint and vlm.merge_adapter_dir point at the same "
+                        "adapter: it is already merged into the base, and loading it "
+                        "again would apply the delta twice. Set training.checkpoint to "
+                        "null (fresh zero-delta LoRA) or to a genuine resume checkpoint.")
         # 4. Apply PEFT (if config provided)
         self._setup_peft(config)
+        if getattr(config, "freeze_backbone", False):
+            # Phase-1 actor scope (docs/LATENT_RL.md): train the head only -- for the
+            # latent head that is the readout MLP + split (~5.2M params; the decoder froze
+            # itself at construction). Runs AFTER peft so the adapter params it freezes
+            # exist, BEFORE the optimizer groups so `rest_params` collects empty and the
+            # backbone lr becomes inert. h then moves only through the (small,
+            # separately-lr'd) head -- the minimal-drift-surface configuration, and the
+            # RLInf-endorsed one (their VLM fine-tuning bought nothing).
+            for n, p in self.model.named_parameters():
+                if "action_head" not in n and "value_head" not in n:
+                    p.requires_grad_(False)
             # Print trainable parameters to verify LoRA is active
         try:
             if self.accelerator.is_local_main_process:
@@ -795,7 +942,12 @@ class VLMTrainingMixin:
             {
                 "params": rest_params,
                 "lr": config.learning_rate,
-                "name": "adapters"
+                "name": "adapters",
+                # Under merge-based init this is decay TOWARD the SFT policy (the LoRA
+                # is a zero-init delta); see config_schema.TrainingConfig.weight_decay.
+                # None preserves the AdamW default every run to date has carried.
+                **({"weight_decay": float(config.weight_decay)}
+                   if getattr(config, "weight_decay", None) is not None else {}),
             }
         ]
 
@@ -892,13 +1044,18 @@ class VLMTrainingMixin:
             embeds_inputs['inputs_embeds'].requires_grad_(True)
         embeds_inputs['deepstack_visual_embeds'] = [v.to(self.model.dtype) for v in embeds_inputs['deepstack_visual_embeds']]
         logits_to_keep = embeds_inputs.pop('logits_to_keep')
+        value_logits_to_keep = embeds_inputs.pop('value_logits_to_keep', None)
+        if value_logits_to_keep is None:
+            value_logits_to_keep = logits_to_keep
         embeds_inputs.pop('input_ids_reference')
         embeds_inputs['seq_keep_mask']='everything' # force keeping everything since seq is already sparse
         hidden = self.language_model(**embeds_inputs,).last_hidden_state
         values = None
         policy_stats = {}
         if compute_values:
-            values = model.value_head(hidden[:,logits_to_keep].to(model.value_head.dtype)).squeeze(-1)
+            values = model.value_head(hidden[:,value_logits_to_keep].to(model.value_head.dtype))
+            if not getattr(model.value_head, "is_distributional", False):
+                values = values.squeeze(-1)
         if self.policy_head_config['type'] == "continuous":
             policy_stats = model.action_head(hidden[:, logits_to_keep])
         else:
@@ -987,6 +1144,25 @@ class VLMTrainingMixin:
         pg_loss,metrics = self.policy_loss_fn(old_log_prob=old_log_prob.to(log_prob.device),log_prob=log_prob,advantages=advantages.to(log_prob.device),response_mask=response_mask,config = self.rl_algo_config)
         metrics['loss/pg_loss'] = pg_loss.detach().item()
         metrics['return'] = torch.amax(returns).detach().item()
+        if (not _is_chain) and self.policy_head_config['type'] == "continuous":
+            # The latent/Gaussian head's instrument panel, mirroring the chain head's
+            # below. Same lesson applies: ppo_kl is a false safety gauge when small mu
+            # moves are 1/sigma^2-amplified into behavior, so drift-from-init is the
+            # canary. `mu` here is (approximately) the readout h itself (W_mu ~= I), so
+            # mu_absmean is this head's h_absmean.
+            with torch.no_grad():
+                _mu_now = mu.float().abs().mean().item()
+                _sigma = log_std.float().exp()
+                metrics['latent/mu_absmean'] = _mu_now
+                metrics['latent/sigma_mean'] = _sigma.mean().item()
+                metrics['latent/sigma_max'] = _sigma.max().item()
+                if not hasattr(self, "_latent_mu_absmean_init"):
+                    self._latent_mu_absmean_init = _mu_now
+                metrics['latent/mu_drift_from_init'] = (
+                    _mu_now / max(self._latent_mu_absmean_init, 1e-8) - 1.0)
+                _lr = (log_prob - old_log_prob.to(log_prob.device))[response_mask]
+                metrics['latent/abs_log_ratio_mean'] = _lr.abs().mean().item()
+                metrics['latent/abs_log_ratio_max'] = _lr.abs().max().item()
         if _is_chain:
             # THE INSTRUMENT PANEL for the chain ratio (docs/FLOW_SDE_RL.md). Full cadence,
             # every step -- the every-Nth-step sampling artifact has bitten three times.
@@ -1001,7 +1177,16 @@ class VLMTrainingMixin:
                     # |postprocess old - training-context anchor|: the rollout-seam gauge,
                     # produced for free by the anchor recompute in RLActor.train_rl_step.
                     metrics['chain/rollout_seam_gap'] = self._chain_seam_gap
-                metrics['chain/h_absmean'] = hh.float().abs().mean().item()
+                _h_now = hh.float().abs().mean().item()
+                metrics['chain/h_absmean'] = _h_now
+                # THE CANARY. ppo_kl is a false safety gauge for a flow head: the
+                # signfix collapse ran at kl~0.002 throughout while h eroded 13% and
+                # behavior died (small per-step mu moves compound through K denoise
+                # steps and the closed loop). Watch THIS, not KL: the collapse showed
+                # ~-5% by its midpoint and -13% at death.
+                if not hasattr(self, "_h_absmean_init"):
+                    self._h_absmean_init = _h_now
+                metrics['chain/h_drift_from_init'] = _h_now / max(self._h_absmean_init, 1e-8) - 1.0
                 if hasattr(self, "_chain_anchor_h"):
                     metrics['chain/h_absmean_anchor'] = self._chain_anchor_h
                 # determinism of the scorer on ITS OWN inputs, in-context
@@ -1009,11 +1194,21 @@ class VLMTrainingMixin:
                     (_chain_lp(hh, actions_continuous.to(hh.device),
                                sde_positions.to(hh.device)) - log_prob).abs().max())
         if self.rl_algo_config.value_head is not None:
-            value_loss,vf_clipfrac = compute_value_loss(vpreds,returns.to(log_prob.device),old_values.to(log_prob.device),response_mask,self.rl_algo_config.value_head.cliprange_value)
+            _vh = getattr(getattr(self, "model", None), "value_head", None)
+            if getattr(_vh, "is_distributional", False):
+                # Cross-entropy against HL-Gauss targets: bounded, scale-free gradients,
+                # no value clipping (clipping is a regression pathology patch; CE needs
+                # none). vf_clipfrac stays as a 0.0 constant so dashboards keep the key.
+                value_loss = _vh.distributional_loss(
+                    vpreds, returns.to(vpreds.device), response_mask)
+                vpreds = _vh.value(vpreds)   # scalar view for the metrics below
+                vf_clipfrac = torch.tensor(0.0)
+            else:
+                value_loss,vf_clipfrac = compute_value_loss(vpreds,returns.to(log_prob.device),old_values.to(log_prob.device),response_mask,self.rl_algo_config.value_head.cliprange_value)
             loss = pg_loss + value_loss
             metrics['critic/vf_clipfrac'] = vf_clipfrac.detach().item()
             metrics['train/vf_loss'] = value_loss.detach().item()
-            valid_values = torch.masked_select(vpreds, response_mask).cpu()
+            valid_values = torch.masked_select(vpreds.cpu(), response_mask.cpu().bool()).cpu()
             valid_returns = torch.masked_select(returns,response_mask.cpu())
             return_diff_var = torch.var(valid_returns - valid_values)
             return_var = torch.var(valid_returns)
@@ -1045,6 +1240,35 @@ class VLMTrainingMixin:
             kld = compute_full_kl_penalty(log_probs,ref_log_probs.to(log_probs.device))
             metrics['train/ref_kl_divergence'] = kld.mean().item()
             loss = loss + (kld * self.rl_algo_config.kl_coeff).mean()
+
+        if self.policy_head_config['type'] == "continuous" and ref_log_probs is not None:
+            # THE TETHER GAUGE (config_schema: ref_kl / ref_kl_coeff). pi_ref = the init
+            # policy (postprocess's snapshot swap), evaluated at the stored actions, so
+            # unlike ppo_kl -- which compares consecutive updates and slept at 0.002
+            # through an entire collapse -- this is drift-from-SFT in the policy's own
+            # density. k1 = E[log pi - log pi_ref] (signed, unbiased); k3 = E[e^r - 1 - r]
+            # with r = log pi_ref - log pi (non-negative, low-variance; verl convention).
+            # The exp is clamped for the sigma-amplified tails: one 1024-dim outlier step
+            # would otherwise print inf and, in constraint mode, dominate the gradient.
+            _ref = ref_log_probs.to(log_prob.device).reshape(log_prob.shape)
+            _r = (_ref - log_prob)[response_mask]
+            # k3 (the verl low_var_kl exponential) was tried first and is WRONG-CONDITIONED
+            # at chain-density scales: its small-|r| variance advantage is an RLHF-token
+            # result, and with buffer episodes up to n_adv cycles old, genuine drift puts
+            # per-step |r| at 5-7 nats -- e^r turned one tail sample into a 57x spike of
+            # the mean (measured, freezehead_10x idx 273) while k1 sat at 0.21. k2 = r^2/2
+            # is the quadratic estimator: positive, equally valid for small r, and only
+            # quadratic in the tail. k1 stays the primary signed gauge.
+            _k2 = 0.5 * _r.pow(2)
+            metrics['ref/kl_k1'] = (-_r).mean().detach().item()
+            metrics['ref/kl_k2'] = _k2.mean().detach().item()
+            metrics['ref/r_p95'] = _r.abs().quantile(0.95).detach().item()
+            metrics['ref/r_absmax'] = _r.abs().max().detach().item()
+            _coeff = float(self.rl_algo_config.get('ref_kl_coeff', 0.0) or 0.0)
+            if _coeff > 0.0:
+                # The leash penalizes k2, not k3: a k3 penalty would be steered by the
+                # buffer-tail spikes above rather than by typical drift.
+                loss = loss + _coeff * _k2.mean()
 
         if self.policy_head_config['type'] != "continuous" and rollout_log_probs is not None:
             kld = compute_full_kl_penalty(log_probs.cpu(),rollout_log_probs.cpu())
@@ -1105,7 +1329,7 @@ class VLMTrainingMixin:
         # Optional: Scale the loss if needed (usually done in config)
         return loss, metrics
     
-    def generic_train_step(self,embeds_inputs,loss_fn_names,loss_kwargs_list,loss_weights=None):
+    def generic_train_step(self,embeds_inputs,loss_fn_names,loss_kwargs_list,loss_weights=None,loss_scale=1.0):
         '''
         Generic train step that can be used for both RL, SFT, or any unholy combination thereof
         '''
@@ -1126,13 +1350,28 @@ class VLMTrainingMixin:
                 loss_part,metric = loss_fn(log_probs=log_probs,vpreds=vpreds,policy_stats=policy_stats,**loss_kwargs_list[loss_fn_name])
                 loss = loss + loss_part*weight
                 metrics |= metric
-                
+            # Token-weighting seam: scales the WHOLE minibatch loss (pg + value + any
+            # aux) by T_i/T_bar so gradient accumulation over episode-minibatches equals
+            # the global token mean. 1.0 = the historical episode-weighted objective.
+            if loss_scale != 1.0:
+                loss = loss * loss_scale
+                metrics['train/loss_scale'] = float(loss_scale)
+                # The OBJECTIVE's pg term: `loss/pg_loss` is recorded pre-scale inside
+                # rl_loss and stays episode-weighted (its mean keeps the old -0.26 offset
+                # by construction). This one is what the optimizer actually sees; its
+                # mean centering near 0 is the visible proof the weighting bias is gone.
+                if 'loss/pg_loss' in metrics:
+                    metrics['loss/pg_loss_scaled'] = metrics['loss/pg_loss'] * float(loss_scale)
             self.accelerator.backward(loss)
             # Clip gradients and return the total norm (Global L2)
             # max_grad_norm is usually 0.5 or 1.0 in PPO papers
             grad_norm = self.accelerator.clip_grad_norm_(
-                self.ddp_model.parameters(), 
-                max_norm=1.0 
+                self.ddp_model.parameters(),
+                # Config-gated (training.max_grad_norm, default 1.0 = the old hardcode).
+                # getattr-chained: the training config is stored at setup_training time
+                # and older pickled configs may predate the field.
+                max_norm=float(getattr(self.train_config, "max_grad_norm", 1.0)
+                               if hasattr(self, "train_config") else 1.0),
             )
             # Log the norm (Detect explosions if this spikes > 10.0)
             metrics['train/grad_norm'] = grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
@@ -1143,7 +1382,7 @@ class VLMTrainingMixin:
             self.optimizer.zero_grad()
         return metrics
             
-    def train_rl_step(self,embeds_inputs,actions=None,old_log_prob=None,advantages=None,returns=None,old_values=None,rollout_log_probs=None,ref_log_probs=None,actions_continuous=None,sde_positions=None):
+    def train_rl_step(self,embeds_inputs,actions=None,old_log_prob=None,advantages=None,returns=None,old_values=None,rollout_log_probs=None,ref_log_probs=None,actions_continuous=None,sde_positions=None,loss_scale=1.0):
         '''
         Docstring for train_rl_step
         
@@ -1158,6 +1397,7 @@ class VLMTrainingMixin:
             raise ValueError("old_log_prob, advantages and returns are required for train_rl_step")
         response_mask = torch.ones_like(old_log_prob, dtype=torch.bool)
         return self.generic_train_step(
+            loss_scale=loss_scale,
             embeds_inputs=embeds_inputs,
             loss_fn_names=['rl'],
             loss_kwargs_list={
@@ -1241,17 +1481,20 @@ class VLMTrainingMixin:
         # This updates self.model in-place, preserving optimizer references
         if os.path.exists(os.path.join(path, "adapter_model.bin")) or os.path.exists(os.path.join(path, "adapter_model.safetensors")):
              adapter_state_dict = load_peft_weights(path)
-             # An attached action_head must be INVISIBLE to the adapter load: peft iterates
-             # the current model's keys, and a head attached before load_checkpoint makes it
-             # expect head weights inside a backbone adapter file that rightly has none
-             # (KeyError 'base_model.model.action_head...'). Heads that load their own
-             # trained weights (flow_sde, latent) bring them from their own checkpoint_dir.
-             # `getattr(self.model, "action_head")` resolves through PeftModel's
-             # __getattr__ FORWARDING, so the owner may be a wrapped inner module --
-             # delattr on the wrapper raises AttributeError. Detach from whichever module
-             # actually registers it.
-             _head_owner = next((m for _, m in self.model.named_modules()
-                                 if "action_head" in getattr(m, "_modules", {})), None)
+             # An attached action_head must be INVISIBLE to the adapter load WHEN the
+             # checkpoint carries no head weights: peft iterates the current model's keys,
+             # and a head attached before load_checkpoint makes it expect head weights
+             # inside a backbone adapter file that rightly has none (KeyError
+             # 'base_model.model.action_head...'). Heads that load their own trained
+             # weights (flow_sde, latent) bring them from their own checkpoint_dir.
+             # BUT an RL checkpoint saved by save_checkpoint_unsafe DOES carry the trained
+             # head under modules_to_save -- detaching there would silently resume with
+             # the SFT-init head and RL-trained backbone, a wrong policy with no error.
+             # So detach only when the state dict has no action_head keys.
+             _ckpt_has_head = any("action_head" in k for k in adapter_state_dict)
+             _head_owner = None if _ckpt_has_head else next(
+                 (m for _, m in self.model.named_modules()
+                  if "action_head" in getattr(m, "_modules", {})), None)
              _detached_head = (_head_owner._modules["action_head"]
                                if _head_owner is not None else None)
              if _head_owner is not None:

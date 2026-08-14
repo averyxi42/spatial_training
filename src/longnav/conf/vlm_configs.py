@@ -57,6 +57,12 @@ class LatentHeadConfig:
     # Ticks executed per policy step. The rest of the chunk is discarded, as in training and
     # in the eval executor -- the remainder is superseded by the next observation.
     gap: int = 10
+    # Exploration temperature: sigma_rl = tau * sigma_phi (docs/LATENT_RL.md "At RL time").
+    # 1.0 = the checkpoint's own trained sigma -- the evidenced setting: the pilot's vary-c
+    # attribution (82% of within-episode return variance, best-of-3 0.611 -> 0.875) was
+    # measured at exactly that scale. Sweep only against a behavioral-spread measurement;
+    # the tau response is sub-linear (10x tau bought 5.3x spread on the pilot).
+    tau: float = 1.0
     # DIAGNOSTIC ONLY, and None is correct. The action is `c`; the decoder and the physics
     # are the environment, so `z_0` is environment noise and the PPO ratio over `c` is exact
     # without touching it. Pinning selects one arbitrary slice of the policy -- measured at
@@ -108,6 +114,13 @@ class FlowSDEHeadConfig:
     sde_noise_a: Optional[float] = None
     # Keep stochastic positions away from the 1/t score singularity.
     sde_exclude_last: int = 1
+    # "none" | "sigma": per-transition log-prob weight sigma_k/sigma_0. The on-policy
+    # density gradient scales as 1/sigma_k, so unweighted, late low-noise refinement
+    # steps dominate every update ~10x (measured: decoder grad x1.0 -> x9.6 across
+    # positions); "sigma" equalizes per-position gradient scale at 0.914 direction
+    # overlap. A deliberate biased surrogate in the logprob_reduction:"mean" tradition,
+    # applied identically in sampler and scorer -- see SDEConfig.position_weight.
+    sde_position_weight: str = "none"
     # Seeds the head's private sampling stream; None = fresh draws (normal training).
     sde_seed: Optional[int] = None
     # NO CLIPPING, same reason as the latent head: the "action" is the 660-float chain and
@@ -134,6 +147,27 @@ class ValueHeadConfig:
     hidden_dims: List[int] = field(default_factory=lambda: [1024, 512])
     cliprange_value: float = 0.2
     value_grad_scale: float = 0.1
+    # "regression" (clipped-MSE ValueHead, the pre-existing head) or "distributional"
+    # (DistributionalValueHead: categorical over [v_min, v_max], HL-Gauss cross-entropy --
+    # bounded, scale-free critic gradients; cliprange_value is unused there). The fields
+    # below only apply to "distributional".
+    kind: str = "regression"
+    n_bins: int = 51
+    # Support of the categorical critic. Pick generously from the reward shape: progress
+    # telescopes to ~start_m (p90 ~12 m discounted down by gamma), plus success_reward
+    # and minus escape_penalty. Out-of-range returns clamp to the edge bins.
+    v_min: float = -5.0
+    v_max: float = 15.0
+    hl_sigma_ratio: float = 0.75   # target smearing, in bin widths (HL-Gauss standard)
+    # Critic readout position, relative to the POLICY readout token (the sandwich `**`).
+    # 0 = share the policy's token (historical behavior). Negative offsets land in the
+    # "Action:" text immediately before the assistant prefix -- text tokens, so they
+    # survive both the turn crop and the sparsifier, with no template/tokenizer change.
+    # A separate token removes the first-order gradient collision at the one activation
+    # the flow policy hangs from (h drift is 1/sigma^2-amplified into policy movement);
+    # second-order interference through shared WEIGHTS remains -- that is what SFT
+    # value co-training addresses, and this offset is part of that checkpoint contract.
+    readout_offset: int = 0
 
 
 cs.store(name="lm_head", group="policy_head", node=LMHeadConfig())

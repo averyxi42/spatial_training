@@ -33,6 +33,12 @@ class VLMConfig:
     offload_cache: bool = False
     use_sparse: bool = True
     save_outputs: bool = False # only need this for RL
+    # SFT adapter dir to MERGE into the base at load (merge_and_unload), making the base
+    # model the SFT policy and the trainable LoRA a fresh zero-delta on top. Required for
+    # rl_config.ref_kl on continuous heads: it is what makes peft's stock
+    # disable_adapter() an exact reference to the SFT policy. Mutually exclusive with
+    # pointing training.checkpoint at the SAME adapter (that would apply the delta twice).
+    merge_adapter_dir: Optional[str] = None
 
 @dataclass 
 class PolicyLossConfig:
@@ -75,11 +81,33 @@ class RLAlgoConfig:
     # Value & Entropy. Optional so a chain-action head can set it to null explicitly --
     # chain entropy is schedule-fixed and rl_loss raises on a NONZERO bonus there.
     entropy_bonus: Optional[float] = 0.0
+    # Scale each episode-minibatch's loss by (its token count / cycle mean): the
+    # accumulated gradient becomes the global TOKEN mean instead of the episode mean.
+    # Off = the historical episode-weighted objective every run to date used (measured
+    # bias: quick successes get ~4x per-token influence; mean pg_loss offset -0.26).
+    token_weighted_loss: bool = False
+    # Bootstrap gamma*V(s_T) onto the last reward of TRUNCATED (budget-capped) episodes.
+    # Off treats the cap as absorbing, under-crediting long episodes' tails. Requires a
+    # value head and the env's `truncated` flag; silently inert without both.
+    bootstrap_truncated: bool = False
 
     # Ref KL Control
     use_ref: bool = True
     kl_coeff: float = 0.001
     kl_target: float = 0.1
+
+    # Continuous-head tether to the INIT policy (the frozen-head arm's ref-KL; discrete
+    # keeps its own use_ref/kl_coeff path above, which references the BASE model via
+    # disable_adapter -- a different and, for us, wrong reference). ref_kl=True makes
+    # every training postprocess run one extra no-grad forward with the peft weights
+    # swapped to their first-postprocess snapshot (== the loaded SFT/init policy) and
+    # store log pi_ref at the stored actions; rl_loss then logs ref/kl_k1 and ref/kl_k3
+    # every step. MEASURE, NOT CONSTRAIN, by default:
+    ref_kl: bool = False
+    # 0.0 = measure only (the default, deliberately -- read the gauge before trusting it
+    # as a leash). >0 adds ref_kl_coeff * k3 to the policy loss (k3 = the non-negative
+    # low-variance KL(pi||pi_ref) estimator, verl's low_var_kl convention).
+    ref_kl_coeff: float = 0.0
 
     # # Compatibility for verl's agg_loss
     # @property
@@ -133,6 +161,26 @@ class VLMTrainingConfig:
     save_step: Optional[int] = 10
     
     action_head_learning_rate: float = 5e-4
+    # Weight decay on the ADAPTERS group only (None = torch AdamW's default 0.01, which
+    # every run to date has silently carried on every group). Under merge-based init
+    # (vlm.merge_adapter_dir) the trainable LoRA is a zero-init delta on the SFT policy,
+    # so this decay becomes a standing L2 tether TOWARD the SFT policy -- the second
+    # divergence-curbing knob next to rl_config.ref_kl_coeff. Under the legacy
+    # parametrization (SFT weights inside the LoRA) it instead decays toward the RAW
+    # base -- leave it None there. Not applied to the head group: the head is pretrained,
+    # and decaying it pulls toward the zero function, not toward init.
+    weight_decay: Optional[float] = None
+    # Global grad-norm clip. 1.0 is the discrete-standard value; the chain head's
+    # raw norms sit 10-200 (density gradient ~ 1/sigma_step), where a 1.0 clip
+    # renormalizes EVERY step and feeds scale jitter into Adam's moments. With
+    # sde_position_weight=sigma the raw norm lands ~13, so ~20 clips outliers only.
+    max_grad_norm: float = 1.0
+    # Freeze everything except the action/value heads (requires_grad False after peft, so
+    # the "adapters" optimizer group collects empty and `learning_rate` is inert). The
+    # phase-1 latent-RL actor scope (docs/LATENT_RL.md: readout + split, ~5.2M params) and
+    # the minimal-drift-surface answer to the measured h-drift collapse channel. Default
+    # False: no existing run changes.
+    freeze_backbone: bool = False
 
     # PEFT: Pass the actual configuration object here (e.g., LoraConfig)
     # Typed as Any to avoid crashing if peft isn't installed on the driver
@@ -180,6 +228,17 @@ class RunConfig:
     episode_json: str = ""
     output_dir: str = "./dump/results"
     jobtype: str = "eval"
+    # --- interleaved train/eval (scripts/train_eval_rl.py only; train_rl.py ignores) ---
+    # Run one eval pass every `eval_every` training cycles, over a FIXED, seeded eval set
+    # of `eval_set_size` episodes (0 = n_rollout) drawn once from the training pool and
+    # partitioned across sims. Fixed set = consecutive points are PAIRED on identical
+    # episodes, which is what buys resolution -- a fresh random sample of the same size
+    # would bury any real movement under episode variance. `eval_ode` runs the chain head
+    # as the pure ODE (the deploy arbiter); eval rollouts never touch the training buffer.
+    eval_every: int = 4
+    eval_set_size: int = 0
+    eval_seed: int = 0
+    eval_ode: bool = True
 
 # --- ROOT CONFIGs ---
 # `sim` and `vlm.policy_head` are Hydra ConfigStore groups (see conf/env_configs.py,

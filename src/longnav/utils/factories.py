@@ -332,6 +332,18 @@ class ExpBootstrapper:
                 self.typed_cfg.vlm.model_id = base_model_path
             # self.resolved_dict['training']['checkpoint'] = checkpoint_path
             self.typed_cfg.training.checkpoint = checkpoint_path
+        elif self.resolved_dict['vlm'].get('merge_adapter_dir'):
+            # Merge-based init (no training.checkpoint): the true base model is named by
+            # the adapter being merged, exactly as a checkpoint would name it. Without
+            # this, model_id silently stays the schema default and the merge applies the
+            # adapter to the wrong base.
+            merge_path = resolve_checkpoint_path(self.resolved_dict['vlm']['merge_adapter_dir'])
+            base_model_path = get_base_model(merge_path)
+            if base_model_path is not None:
+                self.resolved_dict['vlm']['model_id'] = base_model_path
+                self.typed_cfg.vlm.model_id = base_model_path
+            self.resolved_dict['vlm']['merge_adapter_dir'] = merge_path
+            self.typed_cfg.vlm.merge_adapter_dir = merge_path
         # vlm_dict['save_outputs'] = True # force save outputs for RL
         self.resolved_dict['vlm']['save_outputs'] = True
         workers = RLWorkerFactory.create(

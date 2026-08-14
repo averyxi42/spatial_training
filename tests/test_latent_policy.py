@@ -159,3 +159,36 @@ class TestGaussianPathUnchanged:
     def test_unknown_reduction_raises_rather_than_falling_back(self):
         with pytest.raises(ValueError, match="logprob_reduction"):
             reduce_gaussian_logprob(np.zeros((1, 3)), "logsumexp")
+
+
+# ---------------------------------------------------------------------------------------
+# RL scaffolding: tau, deterministic eval, and the frozen actuator (2026-08-14)
+# ---------------------------------------------------------------------------------------
+class TestRLScaffolding:
+    def test_tau_scales_sigma_and_leaves_mu_alone(self):
+        h1 = _head()
+        h2 = _head()
+        h2.load_state_dict(h1.state_dict())
+        h2.tau = 2.0
+        hs = torch.randn(2, 1, HIDDEN)
+        with torch.no_grad():
+            o1, o2 = h1(hs), h2(hs)
+        assert torch.allclose(o1["mu"], o2["mu"])
+        assert torch.allclose(o2["log_std"], (o1["log_std"] + np.log(2.0)).clamp(
+            h2.min_log_std, h2.max_log_std), atol=1e-6)
+
+    def test_a_non_positive_tau_is_refused(self):
+        with pytest.raises(ValueError, match="tau"):
+            LatentIntentHead(readout=_head().readout, codec=_head().codec, gap=GAP, tau=0.0)
+
+    def test_the_decoder_is_frozen_and_the_policy_is_not(self):
+        head = _head()
+        assert all(not p.requires_grad for p in head.codec.decoder.parameters()), \
+            "the decoder is the actuator/environment at RL time; it must not train"
+        assert all(p.requires_grad for p in head.codec.latent.parameters())
+        assert all(p.requires_grad for p in head.readout.parameters())
+
+    def test_force_mean_defaults_off(self):
+        # rollout_core's sampling branch reads this attribute; set_ode_sampling flips it
+        # for eval cycles. Default False so training rollouts sample.
+        assert _head().force_mean is False

@@ -129,6 +129,10 @@ class EpisodeRolloutMixin:
                 rgb,patch_coords,state_dict = initial_state_ref
                 pos_id_kwargs['patch_coords'] = patch_coords
                 pos_id_kwargs['mode'] = "bev"
+            if state_dict.get('exhausted_sentinel'):
+                # The env's shard ran dry during reset (see objectnav_continuous.reset):
+                # report exhausted with no episode; the collector retires this sim.
+                return True, None, None
             step_count = 0
             done = False
             messages = substitute_convo_template(self.rollout_config['convo_start_template'],state_dict['obs'] | self.rollout_config)
@@ -194,7 +198,17 @@ class EpisodeRolloutMixin:
                     mu = policy_out["mu"]
                     log_std = policy_out["log_std"]
                     std = np.exp(log_std)
-                    if self.rollout_config.get('use_oracle_action'):
+                    # Resolved BEFORE sampling: `force_mean` (the latent head's
+                    # deterministic-eval switch, set by set_ode_sampling) must decide how
+                    # the action is drawn, and `decode_action` below reuses the handle.
+                    _head = getattr(getattr(self, "model", None), "action_head", None)
+                    if getattr(_head, "force_mean", False) and not self.rollout_config.get('use_oracle_action'):
+                        # Deterministic eval: act at the prior mean. The log-prob is still
+                        # recorded (at mu it is just the normalizer) so the trajectory
+                        # stays shape-identical to a sampled one; eval batches never
+                        # reach the PPO loss.
+                        action = np.asarray(mu, dtype=np.float32)
+                    elif self.rollout_config.get('use_oracle_action'):
                         # See the discrete branch below for the rationale.
                         # The policy still runs a real forward pass (mu/log_std
                         # above are the real distribution); only which action
@@ -229,10 +243,9 @@ class EpisodeRolloutMixin:
                     # ratio stays the thing the log-prob was computed over. No existing head
                     # defines `decode_action`, so this is identity for every current path.
                     # `run_episode` executes INSIDE the VLM worker, so the head is local at
-                    # `self.model.action_head`. Resolved defensively: test stubs stand in for
-                    # the worker without a `model` at all, and they must keep behaving
-                    # exactly as they did before this hook existed.
-                    _head = getattr(getattr(self, "model", None), "action_head", None)
+                    # `self.model.action_head` -- `_head` was resolved defensively above
+                    # (test stubs stand in for the worker without a `model` at all, and they
+                    # must keep behaving exactly as they did before this hook existed).
                     _decode = getattr(_head, "decode_action", None)
                     if _decode is not None:
                         action_to_env = _decode(action_to_env)
@@ -393,7 +406,7 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
     def postprocess_episode(self,eval=False):
         '''
         clears the internal state and returns the processed trajectory and model inputs.
-        - trajectory includes: 
+        - trajectory includes:
             - rollout logprobs (for rollout correction)
             - old logprobs (calculated from same weights as rollout model but with full forward pass instead of kv cache)
         If eval is True, skips forward passes and just returns raw trajectory
@@ -438,6 +451,34 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
                             actions_continuous = actions_continuous.unsqueeze(0)
                         old_log_prob = self._continuous_log_prob(actions_continuous, policy_stats['mu'], policy_stats['log_std']).squeeze(0).float().cpu()
                     self.rl_trajectory['old_log_prob'] = old_log_prob.numpy()
+                    if getattr(self.rl_algo_config, 'ref_kl', False):
+                        # THE h-SPACE TETHER, measure-first: log pi_ref at the STORED
+                        # actions, via the DEFAULT ref mechanism (the same
+                        # disable_adapter the discrete path uses at the bottom of this
+                        # function). CORRECT ONLY WHEN THE SFT POLICY WAS MERGED INTO
+                        # THE BASE (vlm.merge_adapter_dir) so the trainable LoRA is a
+                        # fresh zero-delta on top -- setup_training enforces this
+                        # pairing. disable_adapter also switches modules_to_save back
+                        # to their original (init) copies, so the reference is the init
+                        # POLICY, head included, even in arms where the head trains.
+                        # rl_loss turns this into ref/kl_k1 and ref/kl_k3 every step;
+                        # only a nonzero ref_kl_coeff makes it a constraint.
+                        self.unmerge_adapter()
+                        with self.model.disable_adapter():
+                            if self.rl_embeds_inputs is not None:
+                                ref_stats, _ = self._forward_embeds(self.rl_embeds_inputs, False)
+                            else:
+                                ref_stats, _ = self._forward_seq(self.rl_seq_inputs, False)
+                            _ref_head = getattr(getattr(self, "model", None), "action_head", None)
+                            _ref_chain_lp = getattr(_ref_head, "chain_log_prob_batch", None)
+                            if _ref_chain_lp is not None:
+                                ref_lp = _ref_chain_lp(ref_stats['h'], actions_continuous,
+                                                       sde_positions).squeeze(0)
+                            else:
+                                ref_lp = self._continuous_log_prob(
+                                    actions_continuous, ref_stats['mu'],
+                                    ref_stats['log_std']).squeeze(0)
+                        self.rl_trajectory['ref_logprobs'] = ref_lp.float().cpu().numpy()
                 else:
                     logits = policy_stats['logits']
                     logprobs = self._calculate_action_logprobs(logits).squeeze().float().cpu()
@@ -445,6 +486,9 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
                         logprobs = logprobs.unsqueeze(0) # ensure batch dim
                     self.rl_trajectory['old_logprobs'] = logprobs.numpy()
                 if values is not None:
+                    _vh = getattr(getattr(self, "model", None), "value_head", None)
+                    if getattr(_vh, "is_distributional", False):
+                        values = _vh.value(values)   # logits -> scalar; GAE consumes scalars
                     self.rl_trajectory['values'] = values.squeeze().float().cpu().numpy()
 
             if self.rl_algo_config.use_ref and self.policy_head_config['type'] != "continuous":
@@ -465,6 +509,48 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
         return self.rl_trajectory,model_inputs    
     
 class RLActor(RLWorker):
+    def set_ode_sampling(self, flag: bool) -> bool:
+        """Toggle deterministic acting for interleaved eval cycles.
+
+        One switch, two heads: the chain head's pure-ODE sampler (`force_ode`) and the
+        latent head's act-at-the-prior-mean mode (`force_mean`). Both mean the same thing
+        -- "evaluate the policy, not the exploration noise" -- so `task.eval_ode` drives
+        them through one call and a config never has to know which head it runs.
+
+        Set on every head INSTANCE (the peft ModulesToSaveWrapper forwards attribute
+        READS to the active module, but a write would land on the wrapper).
+        No-op (returns False) for heads without either flag."""
+        from longnav.utils.flow_sde_policy import FlowSDEHead
+        from longnav.utils.latent_policy import LatentIntentHead
+        hit = False
+        for m in getattr(self, "model", None).modules() if getattr(self, "model", None) else []:
+            if isinstance(m, FlowSDEHead):
+                m.force_ode = bool(flag)
+                hit = True
+            elif isinstance(m, LatentIntentHead):
+                m.force_mean = bool(flag)
+                hit = True
+        return hit
+
+    def set_sde_noise_a(self, a: float) -> bool:
+        """Set the chain head's SDE exploration scale (the H2 credited-channel probe
+        sweeps `noise_a` per arm).
+
+        SDEConfig is a frozen dataclass, so the config is REPLACED, not mutated. As with
+        `set_ode_sampling`, the walk is by isinstance so the write lands on every
+        FlowSDEHead INSTANCE (the peft ModulesToSaveWrapper forwards attribute READS to
+        the active module, but a write would land on the wrapper).
+        Returns False when the model carries no chain head."""
+        import dataclasses
+
+        from longnav.utils.flow_sde_policy import FlowSDEHead
+        hit = False
+        for m in getattr(self, "model", None).modules() if getattr(self, "model", None) else []:
+            if isinstance(m, FlowSDEHead):
+                m.sde = dataclasses.replace(m.sde, noise_a=float(a))
+                hit = True
+        return hit
+
     def run_episode(self,env_handle,initial_state_ref):
         is_exhausted,state_dict,_,_ = super().run_episode(env_handle, initial_state_ref)
         return is_exhausted,state_dict
@@ -476,7 +562,7 @@ class RLActor(RLWorker):
             return trajectory,inputs_tensors,inputs_metadata
         else: return trajectory,None,None
 
-    def train_rl_step(self, embeds_inputs_np, embeds_inputs_meta,traj_batch):
+    def train_rl_step(self, embeds_inputs_np, embeds_inputs_meta,traj_batch, loss_scale=1.0):
         embeds_inputs = TensorPacker.unpack(embeds_inputs_np,embeds_inputs_meta,device=self.accelerator.device)
         actions = traj_batch.get('actions', None)
         actions_continuous = traj_batch.get('actions_continuous', None)
@@ -489,16 +575,14 @@ class RLActor(RLWorker):
         sde_positions = traj_batch.get('sde_positions', None)
 
         # NOTE on the chain head's `old_log_prob`: the postprocess value is passed through
-        # unchanged, but `rl_loss` re-anchors it to the FIRST training epoch's own
-        # `log_prob.detach()` (see the chain branch there). Postprocess, an extra no-grad
-        # forward taken here, and the grad-enabled epoch forward were measured as different
-        # numeric regimes -- the epoch forward's `h` sits a stable 25% from the other two
-        # after `_setup_training`, which the chain density amplifies to 40-90 nats and every
-        # ratio pins at the clip. Grad and no-grad epoch forwards are bitwise identical, so
-        # epoch-1's own detached log-prob IS the correct anchor, costs nothing, and makes
-        # the epoch-1 ratio exactly 1 by construction. The postprocess value is kept as the
-        # rollout-seam gauge (docs/FLOW_SDE_RL.md, validation 3b/3c).
-        return super().train_rl_step(embeds_inputs, actions=actions, old_log_prob=old_log_prob, advantages=advantages, returns=returns, old_values=old_values, rollout_log_probs=rollout_log_probs, ref_log_probs=ref_logprobs, actions_continuous=actions_continuous, sde_positions=sde_positions)
+        # UNCHANGED -- there is no re-anchoring (an earlier anchor was removed; it papered
+        # over an sdpa-only numeric split, see the chain branch in `rl_loss`). Under
+        # flash_attention_2 the postprocess forward and the training forward agree to
+        # ~0.01 nats, verified per-cycle by the first on-policy minibatches of every cycle
+        # sitting at seam level. If actor/ppo_kl is large on minibatches trained BEFORE any
+        # optimizer step of the cycle, suspect attn_impl or a trajectory/model_inputs
+        # misalignment (see the alignment invariant in train_rl.py), never the seam.
+        return super().train_rl_step(embeds_inputs, actions=actions, old_log_prob=old_log_prob, advantages=advantages, returns=returns, old_values=old_values, rollout_log_probs=rollout_log_probs, ref_log_probs=ref_logprobs, actions_continuous=actions_continuous, sde_positions=sde_positions, loss_scale=loss_scale)
     
     def train_dagger_step(self, embeds_inputs_np, embeds_inputs_meta, traj_batch):
         """
