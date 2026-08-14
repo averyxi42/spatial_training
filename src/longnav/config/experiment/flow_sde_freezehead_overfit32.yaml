@@ -1,0 +1,145 @@
+# @package _global_
+# Flow-SDE chain-head RL, FROZEN HEAD on a MERGED BASE -- the discrete-parity arm.
+#
+# The two 10x-lr twins (lr10x wrong-sign, lr10x_signfix) both collapsed in <20 cycles
+# with backbone AND head training: h eroded 13% while ppo_kl slept at 0.002, and no
+# tether to the SFT policy existed anywhere in the stack. This config reruns EXACTLY
+# that regime -- same pool, same budget, same 2e-5 -- with the structure inverted to
+# match discrete RL:
+#
+#   * the SFT LoRA is MERGED into the base (vlm.merge_adapter_dir): the base model IS
+#     the SFT policy; the trainable LoRA is a fresh zero-delta on top.
+#   * the head (readout + velocity field) is FROZEN via action_head_learning_rate 0.0
+#     (AdamW scales decay by lr, so 0 is a true freeze). The h->chain codec is pinned
+#     to SFT; RL moves decisions through the backbone alone. The gradient path is the
+#     one every prior run already used (d logpi / dh through the velocity field's
+#     input-Jacobian at the K stored positions) -- freezing only drops the
+#     d logpi / d theta_head terms.
+#   * ref-KL is MEASURED every step (rl_config.ref_kl, coeff 0.0): postprocess scores
+#     each stored chain under disable_adapter() -- exactly the SFT policy, since the
+#     base is merged and the frozen head is the init head -- giving ref/kl_k1 and
+#     ref/kl_k3, drift-from-SFT in the policy's own density. The gauge ppo_kl
+#     structurally cannot be.
+#
+# 10x lr ON PURPOSE: the twins give a collapse trajectory at this exact lr to compare
+# against, so the result is dramatic and quick either way. If freeze-head is the fix,
+# the lr that killed both twins holds or climbs; if it collapses anyway, ref/kl_k3
+# narrates the collapse in SFT-nats.
+#
+# LAUNCH (from /Projects/spatial_training, after `ray stop --force`):
+#
+#   python3 -m longnav.scripts.train_eval_rl +training=hapo +resources=octo \
+#       +experiment=flow_sde_freezehead_overfit32 resources.vlm_conda_env=longnav_vlm
+#
+# READ AT CYCLE 0 BEFORE TRUSTING ANYTHING LATER:
+#   * ref/kl_k1 ~ ref/kl_k3 ~ 0 (seam level) -- else the merge or the reference is
+#     broken (a wrong reference reads plausible, never errors).
+#   * chain/h_drift_from_init EXACTLY 0 for the first step or two: the fresh LoRA's
+#     B=0 means zero delta until B moves (and A's gradient is B-gated, so the first
+#     cycles are a rank-limited warmup -- early quiet is parametrization, not
+#     stability).
+#   * train/grad_norm small-but-nonzero: backbone-only gradients, B-only at first.
+#     The ~13 raw-norm calibration came from runs WITH head gradients; re-read the
+#     clip against what this arm actually shows.
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  # THE MERGE: base <- base + cotrain-v3 LoRA at load. Same checkpoint the head loads
+  # from; after this the backbone needs no adapter checkpoint at all.
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000/adapter
+  policy_head:
+    # The head still loads its trained weights from here -- and then never moves.
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000
+    gap: 10
+    sde_n: 3
+    sde_noise_a: 0.15
+    sde_position_weight: sigma
+
+sim:
+  # Identical to flow_sde_objectnav_v3_overfit32: the fixed 32-episode pool (4 train
+  # scenes x 8, seed 0), matched budget and reward, so the collapsed twins are the
+  # direct comparison. Overfitting is the intended outcome.
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train8x4
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 0.4
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: false
+
+rollout:
+  max_steps: 175
+  # Templates verbatim from the v3 configs; the leading assistant echo is load-bearing
+  # (see flow_sde_objectnav_v3.yaml's header for the measurements).
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  # No adapter load: the SFT LoRA is merged into the base above. Pointing this at the
+  # merged adapter would apply the delta twice -- setup_training refuses by path.
+  checkpoint: null
+  load_optim: false
+  load_sched: false
+  # THE 10x REGIME: the exact lr both twins died at. That is the experiment.
+  learning_rate: 2e-5
+  # THE FREEZE. AdamW's decoupled decay is lr-scaled, so this is a true freeze with no
+  # decay bleed; grads still flow THROUGH the head into the LoRA.
+  action_head_learning_rate: 0.0
+  # Left at the (now explicit-in-schema) AdamW default via None: under the merged-base
+  # parametrization even the default 0.01 already decays TOWARD the SFT policy -- the
+  # second tether knob, held in reserve. Raise deliberately, not here: this run changes
+  # structure (freeze + merge), not regularization.
+  # weight_decay: null
+  grad_accum_steps: 2
+  max_grad_norm: 20.0
+  rl_config:
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    # MEASURE, NOT CONSTRAIN: the tether gauge runs from cycle 0; the leash
+    # (ref_kl_coeff > 0) waits until the gauge has been read against behavior.
+    ref_kl: true
+    ref_kl_coeff: 0.0
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "flow_sde_freezehead_10x"   # change per run to prevent local/wandb conflicts
+  output_dir: /Projects/spatial_training/dump/flow_rl
+  subset_label: "everything"
+  shard_size: 0
+  eval_every: 4
+  eval_set_size: 32
+  eval_ode: true

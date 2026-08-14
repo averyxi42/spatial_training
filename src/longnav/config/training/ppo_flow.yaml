@@ -1,0 +1,90 @@
+# @package _global_
+# Standard PPO (GAE + critic) for the flow-SDE chain head. HAPO's optimization base with
+# the estimator swapped to true GAE and a critic enabled.
+#
+# Compose: +training=ppo_flow +experiment=flow_sde_objectnav_v2 (the experiment's
+# training: block still applies on top -- keep its action_head_learning_rate /
+# grad_accum_steps / max_grad_norm overrides).
+#
+# The critic is DISTRIBUTIONAL by default (DistributionalValueHead): categorical over
+# [v_min, v_max], trained with cross-entropy against HL-Gauss targets -- bounded,
+# scale-free gradients where a regression critic chases a moving scalar with MSE.
+# Set kind: regression for the classic clipped-MSE head; cliprange_value applies only
+# there. GAE consumes the softmax-expectation scalar either way, so the estimator and
+# the rest of the pipeline are identical between kinds.
+training:
+  load_optim: false
+  load_sched: false
+  learning_rate: 2e-06
+  grad_accum_steps: 1
+  mixed_precision: 'no'
+  gradient_checkpointing: true
+  total_optimization_steps: 20000
+  warmup_steps: 32
+  save_step: 8
+  peft_config:
+    r: 128
+    lora_alpha: 256
+    lora_dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    modules_to_save: null
+    use_rslora: false
+  rl_config:
+    # True GAE via the driver-convention adapter (rl_core.gae_ppo); verl's stock "gae"
+    # takes gamma/lam positionally and would TypeError under this driver.
+    advantage_estimator: gae_ppo
+    n_rollout: 16
+    # With a per-step critic baseline the cross-cycle buffer is no longer the baseline
+    # mechanism; keep a modest window for advantage whitening statistics only.
+    n_adv: 64
+    n_epoch: 1
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    clip_ratio_c: 3.0
+    policy_loss:
+      name: clip_cov
+      clip_cov_ratio: 0.0002
+      clip_cov_ub: 5.0
+      clip_cov_lb: 1.0
+    gamma: 0.95
+    lam: 0.95
+    entropy_bonus: 0.0        # nonzero RAISES for a chain head
+    # Dense per-transition reward -> the TOKEN formulation is the natural one; both
+    # episode-bias removals on (see config_schema for the measured biases they remove).
+    token_weighted_loss: true
+    bootstrap_truncated: true
+    use_ref: true
+    kl_coeff: 0.001
+    kl_target: 0.1
+    global_batch_info: {}
+    value_head:
+      _target_: longnav.utils.vlm_worker.ValueHead   # dispatch is on `kind`, not target
+      kind: distributional
+      learning_rate: 5e-4      # fresh head: discrete-standard head lr is correct here
+      hidden_dims: [1024, 512]
+      dropout: 0.0
+      dtype: float32
+      n_bins: 51
+      # Support from the v2 reward shape: progress telescopes to ~start_m (p90 ~12 m,
+      # discounted), success_reward up to +2.5, escape_penalty -2.5.
+      v_min: -5.0
+      v_max: 15.0
+      hl_sigma_ratio: 0.75
+      # Separate critic sandwich: -2 from the policy readout = the 'assistant' header
+      # token -- constant identity every turn (a pure function of context, like the
+      # policy's `**`), text (survives crop + sparsifier), and NOT the activation the
+      # flow policy hangs from, removing the first-order critic-policy gradient
+      # collision. 0 = share the policy token (historical behavior).
+      readout_offset: -2
+      cliprange_value: 0.2     # regression-kind only; unused by distributional
+      value_grad_scale: 0.1    # backbone gradient bleed from the critic, as discrete runs

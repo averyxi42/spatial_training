@@ -1,0 +1,153 @@
+# @package _global_
+# Gaussian latent-intent RL on continuous ObjectNav -- the pre-committed comparison arm
+# (docs/LATENT_RL_BAKE.md): policy = N(mu(o), sigma(o)) over the 1024-d intent `c`,
+# actuator = the flow decoder with FRESH z_0 per decode (environment stochasticity, not
+# action -- see LatentHeadConfig.pin_flow_noise_seed). Design: docs/LATENT_RL.md +
+# docs/LATENT_RL_ENV.md.
+#
+# INIT: the latent PILOT ck1000 (run_reinitdiv_clean, frozen-trunk, 0.545/0.257 on
+# sample101), NOT the bake's v2 ck1000 (0.436). The bake never beat the pilot, so the
+# pre-committed clause naming v2 is superseded by its own intent: run the best latent
+# checkpoint available. Everything env-side is copied verbatim from
+# flow_sde_objectnav_v3_overfit32 so the two arms differ in the policy alone.
+#
+# LAUNCH (from /Projects/spatial_training, after `ray stop --force` -- stale ray workers
+# reuse old module code):
+#
+#   python3 -m longnav.scripts.train_eval_rl +training=hapo +resources=octo \
+#       +experiment=latent_objectnav_overfit32 resources.vlm_conda_env=longnav_vlm \
+#       task.eval_set_size=32 task.eval_every=4
+#
+# THE THREE NUMBERS TO READ AT CYCLE 0 BEFORE TRUSTING ANYTHING LATER:
+#   * latent/sigma_mean -- measured off the checkpoint at ~0.002 (the relaxation
+#     oscillator snapshotted at its sigma0 floor; state-dependence is negligible, weight
+#     row-norms ~0.085). If it reads differently here, the head loaded wrong.
+#   * train/grad_norm -- the Gaussian density gradient is 1/sigma^2-amplified; at
+#     sigma~0.002 raw norms should land ORDERS above the flow head's ~13. max_grad_norm
+#     below is a placeholder ceiling: re-cut it from this reading (clip outliers only,
+#     never every step -- renormalizing every step feeds scale jitter into Adam).
+#   * latent/abs_log_ratio_mean -- the recompute-seam gauge at epoch 0. Small per-dim h
+#     seams are sigma-amplified over 1024 dims; the framework aligns old/new log-probs by
+#     construction (same cached-embed forwards), so ~0 is expected and growth means the
+#     seam broke, exactly as for the chain head.
+defaults:
+  - override /policy_head@vlm.policy_head: latent_head
+  - override /sim: objectnav_continuous
+
+vlm:
+  attn_impl: flash_attention_2   # h-parity requirement, same as the chain head (sdpa
+                                 # shifted h ~25% between forwards; sigma-amplified here)
+  save_outputs: true
+  # MERGE-BASED INIT: the pilot's LoRA is baked into the base at load, so the base model
+  # IS the SFT policy and the trainable LoRA (if any -- frozen here) is a fresh
+  # zero-delta. This is what makes rl_config.ref_kl's disable_adapter() reference exact.
+  # training.checkpoint stays null accordingly -- setup_training refuses the double-apply.
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_reinitdiv_clean/checkpoint-1000/adapter
+  policy_head:
+    # The split, readout MLP and velocity field all come from HERE (the head loads
+    # itself; training.checkpoint below carries only the LoRA adapter). The decoder
+    # freezes itself at construction -- it is the actuator, not the policy.
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_reinitdiv_clean/checkpoint-1000
+    gap: 10
+    # The checkpoint's own sigma -- the scale every pilot vary-c measurement (82%
+    # attribution, best-of-3 0.611 -> 0.875) was taken at. Raise only against a
+    # behavioral-spread reading; response is sub-linear (10x tau bought 5.3x).
+    tau: 1.0
+    # Exact joint density. If actor/pg_clipfrac (or abs_log_ratio_max) shows the
+    # 1024-dim sum saturating the clip, the documented fallback is `mean` (the
+    # sequence-level-RLHF surrogate) -- a deliberate switch, never a silent one.
+    logprob_reduction: sum
+
+sim:
+  # THE OVERFIT DIAGNOSTIC POOL -- identical to flow_sde_objectnav_v3_overfit32: fixed
+  # 32 episodes (4 train scenes x 8, seed 0), matched scenes/budgets/reward so the two
+  # arms differ in the policy alone. Overfitting is the intended outcome; sample101
+  # evals of these checkpoints measure nothing.
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train8x4
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 0.4
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: false
+
+rollout:
+  max_steps: 175
+  # Templates copied VERBATIM from flow_sde_objectnav_v3_overfit32 -- the pilot is the
+  # same cotrain lineage and the harness scored it 0.545 under this exact format. The
+  # leading assistant echo is load-bearing (see that config's header); do not touch.
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  # No adapter load: the pilot's LoRA is MERGED into the base (vlm.merge_adapter_dir
+  # above), so the backbone already IS the pilot's. The head bundle loads separately
+  # from policy_head.checkpoint_dir. Pointing this at the merged adapter would apply
+  # the delta twice -- setup_training refuses it by path comparison.
+  checkpoint: null
+  load_optim: false
+  load_sched: false
+  # PHASE-1 ACTOR SCOPE (docs/LATENT_RL.md): readout + split only, ~5.25M params
+  # (measured: readout 3.15M + split 2.10M; decoder 0.85M self-frozen). The backbone lr
+  # becomes inert; h moves only through the head. This is simultaneously the
+  # minimal-drift-surface answer to the measured h-drift collapse channel -- the latent
+  # arm doubles as the freeze-backbone experiment.
+  freeze_backbone: true
+  action_head_learning_rate: 5e-6   # piRL-scale; the readout is pretrained -- it moves
+                                    # at "backbone speed", not fresh-MLP speed
+  grad_accum_steps: 2               # = n_rollout / num_vlms (16 / 8, +resources=octo)
+  # PLACEHOLDER CEILING -- see the header. Expected raw norms are 1/sigma^2-amplified
+  # far above the flow head's ~13; re-cut from the cycle-0 train/grad_norm reading so
+  # the clip catches outliers only. Set loose rather than tight: a clip that fires
+  # every step renormalizes the gradient and feeds scale jitter into Adam's moments.
+  max_grad_norm: 2.0e4
+  rl_config:
+    # A Gaussian head HAS a well-defined entropy, but it stays off: matched-reward
+    # comparability with the flow arm, and sigma is the quantity we watch, not shape.
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    # THE TETHER GAUGE, measure-only: one extra no-grad forward per training postprocess
+    # under the init-policy snapshot -> ref/kl_k1, ref/kl_k3 every step -- drift-from-SFT
+    # in the policy's own density, the number ppo_kl structurally cannot show. Constraint
+    # stays OFF (ref_kl_coeff 0.0) until the gauge has been read against behavior; on the
+    # freeze-head arm it is exact by construction, here it is exact because the snapshot
+    # carries modules_to_save too.
+    ref_kl: true
+    ref_kl_coeff: 0.0
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "latent_overfit32_pilot"   # change per run to prevent local/wandb conflicts
+  output_dir: /Projects/spatial_training/dump/flow_rl
+  subset_label: "everything"
+  shard_size: 0

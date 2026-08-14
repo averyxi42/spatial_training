@@ -1,6 +1,31 @@
 # @package _global_
-# Flow-SDE chain-head RL on continuous ObjectNav. Design: docs/FLOW_SDE_RL.md.
-# Launch with: +experiment=flow_sde_objectnav +training=hapo +resources=quad
+# Flow-SDE chain-head RL on continuous ObjectNav, v3: the current stack (time-kernel
+# reinforce++, sigma position weight, physical escape detector, escape penalty) with
+# EPISODE-LEVEL BIASES REMOVED. Design: docs/FLOW_SDE_RL.md.
+#
+# LAUNCH (from /Projects/spatial_training, after `ray stop --force` -- stale ray workers
+# reuse old module code and silently drop every fix this config depends on):
+#
+#   python3 -m longnav.scripts.train_rl +training=hapo +resources=octo +experiment=flow_sde_objectnav_v3 resources.vlm_conda_env=longnav_vlm
+#
+# v2 changes over flow_sde_objectnav (the echo-fix preflight config):
+#   * max_steps 175 -> 250 (sim AND rollout): longer-horizon exploration. gamma=0.95 keeps
+#     credit assignment local (~20-step effective horizon); the extra budget buys the dense
+#     progress signal more chances. WATCH VRAM: training forwards the whole episode in one
+#     pass, so peak activation memory scales with episode length -- first OOM response is
+#     225, not a smaller fleet.
+#   * success_distance 1.0 -> 0.2: forces precise arrival at a viewing position instead of
+#     grazing the 1 m bubble. NOTE what it does not do: there is no gaze/visibility term in
+#     success -- 0.2-to-viewpoint correlates with facing the object, it does not require it.
+#     Screening gates reachability AT success_distance on the robot-footprint mesh, so the
+#     admissible pool shrinks; watch `skipped_so_far` in the first cycles, and if >~20% is
+#     screened, extract replacement episodes (scripts/extract_episode_subset.py is cheap).
+#     Eval stays at 1.0 (sample101 convention) -- harder train, standard eval, on purpose.
+#   * success_reward 2.5 on the reached step (discrete-standard success term): at 0.2 m the
+#     progress reward barely distinguishes "arrived" from "hovered at 0.5 m" (~0.3 of
+#     signal), so precision termination gets its own gradient.
+#   * sde_n stays 1 DELIBERATELY: this run establishes the clean echo-fixed baseline; the
+#     N/a exploration sweep is follow-up run #1, one knob against a trusted curve.
 #
 # The conversation templates reproduce the SFT nopose format BYTE-FOR-BYTE (read from
 # data/v2_25hz_obs2.5hz/formatted_nopose row 0): the goal turn, then numbered
@@ -10,7 +35,6 @@
 defaults:
   - override /policy_head@vlm.policy_head: flow_sde_head
   - override /sim: objectnav_continuous
-  # - override /logger@task.logger: wandb
 
 vlm:
   attn_impl: flash_attention_2
@@ -18,34 +42,50 @@ vlm:
   policy_head:
     checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000
     gap: 10
-    sde_n: 1
+    # Held at 1 for the baseline run -- see the v2 header. The N/a sweep is follow-up #1.
+    sde_n: 3
     # From the doc's bounds: large enough that deliberate exploration is not drowned by the
     # checkpoint's own z_0 scatter, small enough that the marginal stays near the ODE's.
-    # First-run value; the ode-eval curve is the arbiter and this is the knob to move.
     # DO NOT lower `a` to stabilize KL: per-transition std is a*sqrt(t/(1-t))*sqrt(dt) and
     # per-step KL scales as 1/std^2, so 0.15 -> 0.05 made every optimizer step 9x LARGER in
     # nats (measured on flow_sde_train_minimal: 30-150 nats/step). `a` is both the
     # exploration scale and the currency the trust region is measured in.
     sde_noise_a: 0.15
+    # Grad-norm fix, half 1: weight transition k's log-prob by sigma_k/sigma_0. Unweighted,
+    # the density gradient scales ~1/sigma_k, so late low-noise REFINEMENT steps dominate
+    # every update ~10x (measured x1.0 -> x9.6 across positions) -- exploration credit
+    # should not concentrate where the sampler merely polishes. 0.914 direction overlap
+    # with the unweighted gradient; raw grad norm ~43 -> ~13 on identical draws.
+    sde_position_weight: sigma
 
 sim:
-  # The GENUINE training pool: 2000 episodes (25 x 80 hm3d TRAIN scenes, seed 0), written
-  # as a standard derived split by habitat_physical_nav/scripts/extract_episode_subset.py.
-  # Scene-disjoint from val (and therefore from sample101/sample400) by construction.
-  # Loads in ~10 s per actor; the full train split (50k episodes/scene) took minutes and
-  # ~15 GB RSS per actor, which is why this directory exists.
-  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train25x80
+  # The GENUINE training pool: 8000 episodes (100 x 80 hm3d TRAIN scenes,
+  # --sample-per-scene 100 --sample-seed 0), written as a standard derived split by
+  # habitat_physical_nav/scripts/extract_episode_subset.py. Scene-disjoint from val (and
+  # therefore from sample101/sample400) by construction. Sized so a run does not lap the
+  # pool early: the first bad run covered ~1200 episodes, and 25x80=2000 would recycle
+  # within days. Loads in ~40 s per actor; the full train split (50k episodes/scene) took
+  # minutes and ~15 GB RSS per actor, which is why this directory exists.
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train100x80
   scene_root: /Projects/spatial_training/data/scene_datasets
   gap: 10
   dt: 0.04
-  max_steps: 175            # 70 s of sim time at gap 10 -- the sample101 parity budget
-  success_distance: 1.0
+  max_steps: 175            # 100 s of sim time at gap 10 -- the v2 exploration budget.
+                            # (Eval keeps 175/70 s: budgets are currencies, train != eval.)
+  success_distance: 0.4     # precise arrival at a viewing position; see the v2 header
+  success_reward: 0.0       # terminal bonus on the reached step (discrete-standard term)
+  # Escapes were the sd04_noterm run's one clear behavioral drift (5.7% -> 12.1% after
+  # ~1.4k episodes, success falling in lockstep): an unpenalized escape ends the episode
+  # keeping all accumulated progress -- a free exit. Applies from the NEXT relaunch.
+  escape_penalty: 2.5
   navmesh: dataset          # reward geodesics on the smooth mesh; SCREENING runs on the
                             # robot-footprint mesh regardless (objectnav_continuous.py)
-  minimal_logging: false    # per-episode MP4 + summary via the amortized flush hook
+  minimal_logging: false    # per-episode MP4 + summary via the amortized flush hook;
+                            # video is per-tick, stride 2 (12.5 fps), realtime playback
 
 rollout:
-  max_steps: 175
+  max_steps: 175            # must match sim.max_steps or the driver and env disagree on
+                            # where an episode ends
   # STRUCTURE MUST MATCH THE FRAMEWORK DEFAULTS: both templates end with a trailing
   # assistant placeholder turn -- that turn is what plants the `<|im_start|>assistant\n**`
   # sandwich `_get_sandwich_indices` locates to read hidden states; a template ending on a
@@ -73,7 +113,7 @@ rollout:
   # against the harness eval stack on identical images: h cos fell to 0.78-0.93 with |h|
   # collapsing 134->39 from step 1 on, and oracle_success on matched sample101 episodes
   # read 0.31 vs the harness's 0.83. With the echo: cos 0.999998, relL2 0.0018, chunk
-  # impact 0.02 cm, EVERY step (scratchpad parity_check.py, 2026-08-21). The earlier
+  # impact 0.02 cm, EVERY step (tests/parity_rollout_paths.py, 2026-08-21). The earlier
   # "96 vs 88 duplication" measurement compared UNCROPPED token streams -- tokenize-time
   # parity cannot see the crop, which is exactly how this shipped wrong once.
   convo_turn_template:
@@ -102,23 +142,39 @@ training:
   # at 5e-4 moved the summed chain density 30-150 nats; every cycle's second half of
   # minibatches saw ratio ~ e^-50, PPO's min branch zeroed their gradient, and pg_clipfrac
   # stayed misleadingly low. The head is pretrained -- it moves at backbone speed.
-  action_head_learning_rate: 2e-6
+  action_head_learning_rate: 1e-6
   # One optimizer step per cycle, AT the cycle end: grad_accum_steps must equal
   # n_rollout / num_vlms (16 / 8 with +resources=octo). At n_epoch=1 that makes every
   # minibatch on-policy, so actor/ppo_kl degenerates to the rollout-seam gauge (~0.01
   # nats) and any growth means the seam broke, not the schedule. If you change resources
   # (quad -> 4 vlms), change this to 4 or the step fires mid-cycle again.
   grad_accum_steps: 2
+  # Grad-norm fix, half 2: with sde_position_weight=sigma the raw norm lands ~13, so a
+  # 1.0 clip (the discrete-standard hardcode, now config-gated) would STILL renormalize
+  # every step and feed 10-20x scale jitter into Adam's moments. 20 clips genuine
+  # outliers only.
+  max_grad_norm: 20.0
   # HAPO base (+training=hapo), with the chain-head exceptions:
   rl_config:
     entropy_bonus: 0.0      # nonzero RAISES for a chain head -- schedule-fixed entropy
-    n_epoch: 1              # revisit 2 once per-step KL is ~0.1 nat, not ~100
+    n_epoch: 1              # revisit 2 once per-step KL is confirmed ~0.1 nat, not ~100
+    # THE v3 CHANGE -- remove the episode-weighting bias: each minibatch (one episode,
+    # token-mean loss inside) is scaled by T_i/T_bar so accumulated gradients equal the
+    # global TOKEN mean. Measured without it: episode-weighted mean advantage +0.26 vs
+    # token-weighted -0.02 (quick successes carried ~4x per-token influence; the
+    # persistently negative pg_loss level was this offset). With it, pg_loss's level
+    # becomes ~0-centered and its drift actually means improvement.
+    token_weighted_loss: true
+    # INERT here, on purpose: bootstrapping the budget cap needs a value estimate and
+    # this config has no critic (that removal ships with +training=ppo_flow). The
+    # truncation-tail bias therefore REMAINS in v3 -- named, not fixed.
+    bootstrap_truncated: false
 
 task:
   logger:
     _target_: longnav.utils.logging_workers.WandbLoggerActor
     project: "cont_dev"
-  run_name: "flow_sde_train_echo_fix" #need to change this per run to prevent local or wandb conflicts.
+  run_name: "flow_sde_v3_n3_tokenweighted" #change per run to prevent local/wandb conflicts
   output_dir: /Projects/spatial_training/dump/flow_rl
   # "everything" + shard_size 0 is CORRECT here, not a placeholder: sim.episodes already
   # points at the extracted train-subset directory, so every actor samples the whole
