@@ -162,6 +162,9 @@ def main(cfg: RLConfig):
                 bootstrapper.typed_cfg.training.rl_config.n_epoch,
                 bootstrapper.typed_cfg.training.rl_config.n_rollout,
                 num_vlms,
+                token_weighted=getattr(
+                    bootstrapper.typed_cfg.training.rl_config,
+                    "token_weighted_loss", False),
             )
 
             print(f"Dispatched {len(training_futures)} training tasks for final epoch")

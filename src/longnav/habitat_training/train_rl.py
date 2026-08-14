@@ -141,6 +141,27 @@ def main(cfg: RLConfig):
 
             print("done collecting")
             num_vlms = len(trainers)
+
+            # ALIGNMENT INVARIANT: traj_batch row i and model_inputs[i] must describe the
+            # SAME episode -- the stored actions/old_log_prob are scored against those cached
+            # embeds. A failed episode returns trajectory=None; collate_trajectories used to
+            # drop it INSIDE the collate while model_inputs kept all entries, shifting every
+            # subsequent pairing by one and training episode X's actions against episode Y's
+            # embeds (ppo_kl explodes one-sidedly, exactly like a real off-policy blowup).
+            # So: drop the failure as a UNIT here, and pad back to the configured batch by
+            # duplicating kept episodes -- every dispatch round must occupy all num_vlms DDP
+            # ranks or the allreduce hangs, and the grad-accum counters must stay aligned.
+            kept = [i for i, tup in enumerate(rollout_list) if tup[0] is not None]
+            if not kept:
+                raise RuntimeError("every episode in this rollout cycle failed; check actor stdout for 'Episode failed'")
+            if len(kept) < len(rollout_list):
+                logger.warning(
+                    f"{len(rollout_list) - len(kept)} episode(s) failed this cycle; "
+                    f"padding the batch with duplicates of kept episodes")
+                order = kept + [kept[i % len(kept)] for i in range(len(rollout_list) - len(kept))]
+                rollout_list = [rollout_list[i] for i in order]
+                result_list = [result_list[i] for i in order]
+                log_list = [log_list[i] for i in order]
             # -------------------------------------------unpack and collate the trajectories
 
             trajectory_list += [tup[0] for tup in rollout_list]
@@ -248,8 +269,10 @@ def main(cfg: RLConfig):
                         rollout_stats = {
                             "rollout/ep_rew": traj_stats['rewards'].sum().item(),
                             "rollout/ep_len": valid_mask.sum().item(),
-                            "rollout/success": traj_stats['success'].max().item(), 
-                            "rollout/spl": traj_stats['spl'].max().item(),
+                            # float, not bool: the wandb logger excludes bools from
+                            # define_metric, so a bool here is table-only and never charts.
+                            "rollout/success": float(traj_stats['success'].max().item()),
+                            "rollout/spl": float(traj_stats['spl'].max().item()),
                             "rollout/ep_rtn": traj_stats['returns'].mean().item(),
                             "rollout/rtn_var": traj_stats['returns'].var().item(),
                             "rollout/global_cycle": global_cycle

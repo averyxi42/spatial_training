@@ -112,6 +112,27 @@ def run_rollout_cycle(
     """
     rollout_list, result_list, log_list = collect_rollouts(sims, trainers, shard_iter, n_rollout)
 
+    # ALIGNMENT INVARIANT: traj_batch row i and model_inputs[i] must describe the SAME
+    # episode -- stored actions/old_log_prob are scored against those cached embeds. A
+    # failed episode returns trajectory=None; letting collate_trajectories drop it
+    # internally while model_inputs keeps all entries shifts every subsequent pairing and
+    # trains episode X's actions against episode Y's embeds (a one-sided ppo_kl blowup
+    # indistinguishable from real off-policy drift). Drop the failure as a UNIT and pad
+    # back to size by duplicating kept episodes: every dispatch round must occupy all
+    # num_vlms DDP ranks or the allreduce hangs, and grad-accum counters must stay
+    # cycle-aligned.
+    kept = [i for i, tup in enumerate(rollout_list) if tup[0] is not None]
+    if not kept:
+        raise RuntimeError(
+            "every episode in this rollout cycle failed; check actor stdout for 'Episode failed'")
+    if len(kept) < len(rollout_list):
+        print(f"WARNING: {len(rollout_list) - len(kept)} episode(s) failed this cycle; "
+              "padding the batch with duplicates of kept episodes")
+        order = kept + [kept[i % len(kept)] for i in range(len(rollout_list) - len(kept))]
+        rollout_list = [rollout_list[i] for i in order]
+        result_list = [result_list[i] for i in order]
+        log_list = [log_list[i] for i in order]
+
     trajectory_list += [tup[0] for tup in rollout_list]
     del trajectory_list[: max(0, len(trajectory_list) - n_adv)]
     traj_batch = collate_trajectories(trajectory_list)
@@ -121,6 +142,67 @@ def run_rollout_cycle(
     distances = traj_batch.get("distance_to_goal", None)
 
     return traj_batch, model_inputs, values, distances, log_list
+
+
+def build_eval_partition(sims, set_size: int, seed: int):
+    """Draw the FIXED eval set once (seeded, from the pool the sims already parsed) and
+    partition it round-robin across sims. Fixed set => consecutive eval points are PAIRED
+    on identical episodes; a fresh random sample each cycle would bury real movement
+    under episode variance (measured: block-50 sd 0.063 at p=0.71)."""
+    uids = sorted(ray.get(sims[0].list_episode_uids.remote()))
+    rng = np.random.default_rng(seed)
+    k = min(set_size, len(uids))
+    chosen = sorted(rng.choice(len(uids), size=k, replace=False).tolist())
+    eval_uids = [uids[i] for i in chosen]
+    parts = [eval_uids[i::len(sims)] for i in range(len(sims))]
+    return eval_uids, parts
+
+
+def run_eval_cycle(sims, trainers, eval_parts, total, wandb_actor, global_cycle,
+                   out_dir, ode: bool = True):
+    """One interleaved eval pass: fixed slices to exhaustion, pure-ODE sampler, no
+    training-buffer contamination, one scalar wandb row, per-episode jsonl for pairing.
+
+    Runs on the SAME actors as training -- zero extra GPU residents, which is also the
+    fix for the eval-vs-training OOM class (2026-08-14, v3 crash)."""
+    if ode:
+        ray.get([t.set_ode_sampling.remote(True) for t in trainers])
+    for sim, part in zip(sims, eval_parts):
+        sim.set_log_prefix.remote("eval_env/")
+        sim.assign_shard.remote(list(part))
+    try:
+        _, result_list, _ = collect_rollouts(
+            sims, trainers, iter([]), total,
+            postprocess_kwargs={"return_inputs": False, "eval": True})
+    finally:
+        if ode:
+            ray.get([t.set_ode_sampling.remote(False) for t in trainers])
+        for sim in sims:
+            sim.set_log_prefix.remote("")
+            sim.assign_shard.remote(None)   # back to the full training pool
+    res = [r for r in result_list if r and not r.get("exhausted_sentinel")]
+    def _m(key, cast=float):
+        v = [cast(r.get(key, 0) or 0) for r in res]
+        return float(np.mean(v)) if v else float("nan")
+    row = {
+        "eval/success": _m("success"), "eval/oracle_success": _m("oracle_success"),
+        "eval/ospl_fix": _m("ospl_fix"), "eval/path_length_m": _m("path_length_m"),
+        "eval/steps": _m("steps"), "eval/n": len(res),
+        "eval/global_cycle": global_cycle,
+    }
+    if wandb_actor is not None:
+        wandb_actor.log_row.remote(dict(row))
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "eval_episodes.jsonl"), "a") as f:
+        for r in res:
+            f.write(json.dumps({"cycle": global_cycle,
+                                "uid": r.get("episode_label"),
+                                "success": int(bool(r.get("success"))),
+                                "ospl_fix": float(r.get("ospl_fix") or 0.0),
+                                "steps": r.get("steps")}) + "\n")
+    print(f"[eval cycle @ {global_cycle}] n={len(res)} success={row['eval/success']:.3f} "
+          f"oracle={row['eval/oracle_success']:.3f} ospl={row['eval/ospl_fix']:.3f}")
+    return row
 
 
 def compute_advantages_and_returns(
@@ -139,8 +221,23 @@ def compute_advantages_and_returns(
     else to compute it from once this function returns.
     """
     values = traj_batch.get("values", None)
+    rewards = traj_batch["rewards"]
+    if (getattr(cfg.training.rl_config, "bootstrap_truncated", False)
+            and values is not None and "truncated" in traj_batch.keys()):
+        # A budget-capped episode is TRUNCATED, not terminated: treating the cap as
+        # absorbing zeroes the tail's future value and under-credits long episodes.
+        # Standard fix: fold gamma*V onto the last reward. V(s_T) (the last observed
+        # state's value) stands in for V(s_{T+1}) -- one step stale, the usual
+        # approximation when the post-terminal observation is never forwarded.
+        rewards = rewards.clone()   # ep_rew logging must keep the raw rewards
+        mask = traj_batch["response_mask"]
+        last_idx = mask.sum(-1).long().clamp(min=1) - 1
+        for i in range(rewards.shape[0]):
+            li = int(last_idx[i])
+            if bool(traj_batch["truncated"][i, li]):
+                rewards[i, li] = rewards[i, li] + cfg.training.rl_config.gamma * values[i, li]
     adv_tuple = advantage_estimator_fn(
-        token_level_rewards=traj_batch["rewards"],
+        token_level_rewards=rewards,
         values=values,
         response_mask=traj_batch["response_mask"],
         config=cfg.training.rl_config,
@@ -163,6 +260,19 @@ def compute_advantages_and_returns(
     return traj_batch, global_return_mean
 
 
+def minibatch_token_scales(response_mask, n_rollout: int):
+    """Per-episode loss scales T_i / mean(T) over the cycle's episodes.
+
+    Each minibatch is ONE episode with token-mean loss inside and equal weight in
+    gradient accumulation -- an EPISODE-weighted objective. Multiplying minibatch i's
+    loss by T_i/mean(T) makes the accumulated gradient the global TOKEN mean:
+    mean_i[(T_i/T_bar) * token_mean_i] == token_mean over all tokens. Measured without
+    it: episode-weighted mean advantage +0.26 vs token-weighted -0.02, i.e. quick
+    successes carried ~4x per-token influence."""
+    lengths = response_mask[:n_rollout].float().sum(-1).clamp(min=1)
+    return (lengths / lengths.mean()).cpu().numpy()
+
+
 def run_training_epochs(
     trainers,
     model_inputs,
@@ -170,6 +280,7 @@ def run_training_epochs(
     n_epoch: int,
     n_rollout: int,
     num_vlms: int,
+    token_weighted: bool = False,
 ) -> Tuple[list, dict]:
     """Dispatch training steps for `n_epoch` epochs over the current batch.
 
@@ -190,6 +301,8 @@ def run_training_epochs(
     total_epochs = max(n_epoch, 1)
     training_futures: list = []
     future_metadata: dict = {}
+    scales = (minibatch_token_scales(traj_batch["response_mask"], n_rollout)
+              if token_weighted else None)
 
     for epoch in range(total_epochs):
         is_final_epoch = epoch == total_epochs - 1
@@ -203,6 +316,7 @@ def run_training_epochs(
                 ref = trainer.train_rl_step.remote(
                     *model_inputs[global_idx],
                     traj_batch[global_idx : global_idx + 1, traj_batch["response_mask"][global_idx].bool()],
+                    loss_scale=(float(scales[global_idx]) if scales is not None else 1.0),
                 )
                 epoch_futures.append(ref)
                 epoch_metadata[ref] = global_idx
@@ -257,6 +371,13 @@ def stream_results_and_log(
                     "rollout/ep_rtn": traj_stats["returns"].mean().item(),
                     "rollout/rtn_var": traj_stats["returns"].var().item(),
                     "rollout/global_cycle": global_cycle,
+                    # float, not bool: the wandb logger excludes bools from define_metric,
+                    # so a bool here would be table-only and never chart. Guarded: eval
+                    # trajectories may lack these keys.
+                    **({"rollout/success": float(traj_stats["success"].max().item())}
+                       if "success" in traj_stats.keys() else {}),
+                    **({"rollout/oracle_success": float(traj_stats["oracle_success"].max().item())}
+                       if "oracle_success" in traj_stats.keys() else {}),
                 }
                 try:
                     critic_mse = ((traj_stats["baseline"] - traj_stats["returns"]) ** 2).mean()

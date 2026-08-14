@@ -360,6 +360,39 @@ class BinnedKernelCritic:
         preds = y0 + alpha * (y1 - y0)
         return preds.view(original_shape)
     
+@register_adv_est("gae_ppo")
+def compute_gae_config_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    values: torch.Tensor = None,
+    config=None,
+    **kwargs,
+):
+    """verl's GAE behind THIS driver's calling convention.
+
+    The driver calls every estimator as fn(token_level_rewards=..., values=...,
+    response_mask=..., config=...), but verl's stock "gae" takes (gamma, lam) as
+    positional arguments and no config -- standard PPO would TypeError at the first
+    advantage computation. This adapter extracts gamma/lam from the config exactly like
+    the custom estimators above do, and refuses to run without values: GAE with a missing
+    critic silently degenerating would be a wrong number, not a fallback.
+    """
+    assert config is not None
+    if values is None:
+        raise ValueError(
+            "advantage_estimator 'gae_ppo' requires a value head "
+            "(training.rl_config.value_head) -- postprocess produced no values")
+    from verl.trainer.ppo.core_algos import compute_gae_advantage_return
+    advantages, returns = compute_gae_advantage_return(
+        token_level_rewards=token_level_rewards,
+        values=values * response_mask,
+        response_mask=response_mask,
+        gamma=config.gamma,
+        lam=config.get("lam", 0.95),
+    )
+    return advantages, returns
+
+
 @register_adv_est("reinforce_plus_plus_time_kernel")
 def compute_reinforce_plus_plus_time_kernel_advantage(
     token_level_rewards: torch.Tensor, 
@@ -405,7 +438,18 @@ def compute_reinforce_plus_plus_time_kernel_advantage(
         baseline = torch.zeros_like(returns)
         baseline[response_mask.bool()] = flat_baseline
         advantages = returns - baseline
-        advantages = verl_F.masked_whiten(advantages, response_mask)
+        # DEGENERATE-BATCH GUARD: an all-failure (or all-identical-return) batch has
+        # ~zero advantage variance; whitening then divides by ~0 -> NaN losses, NaN
+        # gradients, and the collapse becomes unrecoverable (observed: overfit32 signfix
+        # run, cycles 15-16). A batch with no return contrast carries no policy-gradient
+        # information -- zero it and skip cleanly rather than poisoning the optimizer.
+        _m = response_mask.bool()
+        if _m.any() and float(advantages[_m].std()) < 1e-6:
+            print("WARNING: degenerate advantage batch (std ~ 0); zeroing advantages "
+                  "for this cycle instead of whitening into NaN")
+            advantages = torch.zeros_like(advantages)
+        else:
+            advantages = verl_F.masked_whiten(advantages, response_mask)
         advantages = advantages * response_mask
     return advantages, returns, baseline
 
