@@ -147,17 +147,25 @@ sigma_t = a * sqrt(t / (1 - t))        # evaluate at t clamped away from both 0 
                                        # the clamp is a config constant beside `a`
 ```
 
-The SDE Euler-Maruyama step, written in this codebase's own signs (`dt = -1/K`, so this is the
-external spec's reverse-time step under the sign flip):
+The SDE Euler-Maruyama step, written in this codebase's own signs (`dt = -1/K`):
 
 ```
-drift      = v + 0.5 * sigma_t**2 * score
+drift      = v - 0.5 * sigma_t**2 * score   # MINUS: see the post-mortem below
 mu         = x_t + dt * drift
 sigma_step = sigma_t * sqrt(|dt|)      # per-step Gaussian std for the policy
 x_next     ~ Normal(mu, sigma_step**2 * I)
 ```
 
 ODE steps are `x_next = x_t + dt * v` — no noise, no correction, no log-prob.
+
+> **CORRECTED 2026-08-14.** This section originally asserted `drift = v + (sigma^2/2)*score`
+> with the note "the external spec's reverse-time step under the sign flip". That was the
+> bug: the external spec's convention (tau decreasing) already matched this codebase's, so
+> no flip was needed — the drift sign is a dynamical claim that must come from the
+> Fokker–Planck derivation, not a convention heuristic, and the originally designated
+> arbiter (the small-a marginal test) is blind to the resulting O(a^2) error. Full
+> post-mortem at the end of this document; the analytic high-noise guard test is the
+> arbiter now.
 
 **Wiring rules — each one is a real observed failure mode in this literature:**
 
@@ -460,3 +468,110 @@ weaker start.
   state-dependence that encodes was learned; a fixed schedule discards the analogue here by
   construction. It is the reason not to assume a scalar noise scale is free — and the first place
   to look if the fixed schedule underperforms in heterogeneous scenes.
+
+## Post-mortem: the drift-correction sign (2026-08-14)
+
+`_sde_transition` shipped with `mu = x + dt*(v + (sigma^2/2)*score)`. The correct
+reverse-time drift under this codebase's t:1->0, dt<0 convention is
+`v - (sigma^2/2)*score` (derive via Fokker-Planck in s=1-t, or see piRL Eq. 8). The "+"
+variant is the marginal-preserving drift for the OPPOSITE integration direction: with
+dt<0 it pushes mass away from the score at every step, so instead of cancelling the
+injected diffusion it doubles it -- the sampler converges to a systematically
+over-dispersed policy (~4-6x terminal std on an analytic Gaussian flow at a=0.8).
+
+Why months of verification never caught it, recorded so the next error of this class is
+found sooner:
+1. Distortion scales as a^2: ~1.5% at the configured a=0.15, invisible to the
+   marginal-preservation test, which checked the a->0 limit where both signs are exact.
+2. Every internal-consistency check is sign-invariant BY DESIGN: sampler and scorer
+   share the transition function, so ratios, seams, recompute equality and toy-env
+   learning all certified that we faithfully trained SOME policy -- never WHICH policy.
+3. The deviation sweeps had no ground truth for how much deviation is correct.
+
+THE LESSON: internal consistency cannot validate distributional correctness. Every
+sampler needs at least one test against an EXACT analytic solution, in the regime where
+the studied terms are LARGE (here: high noise). That guard now exists
+(tests/test_flow_sde_policy.py::TestHighNoiseMarginalPreservation, fails at 5.84x under
+the old sign).
+
+Strategic consequence: the working noise regime documented by piRL (a~0.5; a~0.2 fails)
+was unreachable -- distortion grew quadratically exactly along the escape route -- and
+the low-noise instability symptoms piRL predicts (clip spikes, low-sigma gradient
+blowups) were treated here by LOWERING lr instead of raising `a`, because raising `a`
+was genuinely broken. Fixed 2026-08-14; all prior SDE-sampled runs drew from the
+distorted sampler (evals were pure ODE and are unaffected).
+
+Exact mechanism (independent audit): piRL Eq. 9 writes mu = A + [v + (sigma^2/2tau)
+eps_hat]*delta, self-consistent ONLY when delta is read as d(tau) < 0. Reading delta as
+positive flips both terms; transcribing just the correction term while keeping the local
+x + dt*v produces exactly the shipped `+`. A half-transcription across a sign boundary --
+the specific trap to name in review: any formula imported from a paper must be imported
+WHOLE or re-derived whole, never term by term.
+
+Wrong-sign terminal-spread inflation is a curve, not a number (analytic Gaussian, K=10):
+1.10x / 2.01x / 6.42x at a = 0.15 / 0.5 / 1.0, growing as exp(O(a^2)).
+
+
+## Audit corrections (2026-08-14, independent re-derivation)
+
+1. **The last-step exclusion rationale was refuted.** The score's 1/t cancels exactly in
+   the drift: (sigma_t^2/2)*score = -a^2*eps_hat/(2(1-t)), monotonically shrinking toward
+   t=0 (coefficient 0.139 at t=0.1 vs 1.250 at t=0.9 for a=0.5); terminal marginals are
+   identical for n_exclude_last in {0,1,2,3}. The singular end is t=1. `n_exclude_last`
+   is a variance choice; 0 is legal and matches RLinf's default.
+2. **First-step noise rule changed to RLinf's.** sigma_t = a*sqrt(t/max(1-t, 1/K)):
+   first-step injected noise equals `a` exactly at every K, making our `a` commensurable
+   with piRL's sweep (their a~0.5 works, a~0.2 fails). The previous t<=0.95 clamp gave
+   a*sqrt(19/K) -- K-dependent, 1.38x RLinf's at K=10.
+3. **The schedule now has ONE implementation** (`_sigma`), read by the transition, the
+   scorer and the position weights alike.
+4. **The partial likelihood is an approximation, named as such.** Summing only the n
+   stochastic factors conditions on the stored deterministic sources, whose positions
+   are themselves theta-dependent; the ratio is a conditional likelihood, not the chain
+   density. This is the standard DDPO/Flow-GRPO estimator and RLinf does the same.
+
+## Evidence invalidated by the sign bug (register)
+
+- The (a, N) chunk-deviation sweeps and the credited-channel probe's SDE arms sampled the
+  wrong-sign noise process; only the probe's ODE arm stands. Re-run post-fix before use.
+- The "1x flat / 10x coherent harm" lr-ladder inference is CONFOUNDED: at 10x we
+  optimized a mis-specified density; the harm no longer evidences channel blindness (H2
+  demoted). The signfix A/B (identical config, sign the only variable) is the clean test.
+- Behavioral conclusions at a=0.15 (motion statistics, parity, ODE eval baselines) remain
+  VALID: distortion there was percent-level and all evals ran pure ODE.
+
+## Why the bug was self-sealing (append to the lessons)
+
+At a=0.15 the distortion was invisible in every observable we watched; at the a>=0.5
+where it becomes visible, degradation would have read as "high noise destroys fidelity --
+stay low", CONFIRMING the setting that kept the bug hidden and learning impossible. A
+faithful-looking initialization was not evidence against the bug; it was one of the
+bug's effects on our inference. Corollary for practice: when a hyperparameter direction
+is theoretically motivated but empirically "fails", verify the failure is not produced by
+a defect that scales along exactly that direction.
+
+See docs/RLINF_COMPARISON.md for the external-reference recipe and the v5 replication
+spec this all feeds into.
+
+## Post-mortem: the erosion lived in the backbone, not the head (2026-08-14)
+
+Question: in the collapsed both-halves-training runs (lr10x twins at 2e-5; pirl_lr at
+5e-6, eval 0.917 -> 0.625 over 36 cycles with h_drift settling at -6.1%), which module
+carried the degradation? Measured on pirl_lr2's ck7 vs ck31 (the decline window), offline,
+no rollouts:
+
+| channel | evidence |
+|---|---|
+| head weights | readout rel-drift 1.0e-4, velocity field 2.5e-4 over the window -- 15-38x LESS than the LoRA's 3.8e-3 (which accelerated: SFT->ck7 1.3e-3, ->ck31 4.5e-3) |
+| head as a function | mu shift on matched (h, x, t) probes: 0.6-3.7% of sigma_k per step (mean 2.2%) |
+| head, chunk-level | full ODE decode from identical h + z0: ck31 head vs ck7 head moves chunks **0.376 cm** mean -- inside the 0.24-0.88 cm band the SDE exploration noise itself occupies |
+| backbone, chunk-level | a 6.1% h-shrink alone (the canary's reading, same head) moves chunks **0.577 cm** mean / 1.228 cm terminal -- and this is a LOWER bound: h_absmean is blind to directional drift at constant scale, so the true backbone channel is strictly larger |
+
+Verdict: **the head stayed essentially the SFT head; the backbone drifted and dragged h
+with it.** The policy died through the h-channel, exactly the channel the frozen-head +
+merged-base + ref-KL arm (flow_sde_freezehead_overfit32) pins, gauges, and can leash.
+Caveats: synthetic-h probes (Gaussian at the measured absmean scale) and ck7 as the early
+reference; the fully decisive version is the checkpoint-swap eval (final backbone + init
+head vs init backbone + final head), which needs the fleet and is superseded in practice
+by the freeze-head arm itself -- if that arm survives the 10x lr that killed both twins,
+the attribution is confirmed interventionally.

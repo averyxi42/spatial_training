@@ -185,3 +185,53 @@ class TestSeams:
             _head(n=K)          # n_exclude_last=1 leaves only K-1 positions
         with pytest.raises(ValueError, match="noise sweep"):
             SDEConfig(n=1, noise_a=0.0)
+
+
+class TestHighNoiseMarginalPreservation:
+    """The drift-sign guard. The original marginal-preservation test ran at small `a`,
+    where a WRONG-SIGN drift correction deviates only ~1.5% (distortion grows as a^2) --
+    it passed for months over a sign error. This test runs the all-steps SDE at a = 0.8
+    on an analytic Gaussian flow where the exact terminal marginal is known, where the
+    wrong sign inflates terminal spread ~40% and cannot hide."""
+
+    def test_high_noise_marginal_preservation(self):
+        import math
+
+        import torch
+
+        from longnav.utils.flow_sde_policy import SDEConfig, _sde_transition
+
+        # Analytic model: data x1 ~ N(0, s1^2), noise x0 ~ N(0, 1), path
+        # x_t = t*noise + (1-t)*data (this codebase's convention). The optimal velocity
+        # field u_t = noise - data is, conditionally on x_t, linear:
+        #   E[u | x_t, t] = (t - (1 - t) * s1**2) / (t**2 + (1 - t)**2 * s1**2) * x_t ... derive:
+        # Var(x_t) = t^2 + (1-t)^2 s1^2; Cov(u, x_t) = t - (1-t) s1^2.
+        s1 = 0.6
+        class AnalyticDecoder(torch.nn.Module):
+            def forward(self, ctx, x, t):
+                tt = t.view(-1, 1, 1)
+                var = tt**2 + (1 - tt)**2 * s1**2
+                cov = tt - (1 - tt) * s1**2
+                return (cov / var) * x
+
+        dec = AnalyticDecoder()
+        class Codec:  # duck-typed: _sde_transition only needs .decoder-like callable
+            decoder = dec
+
+        K, a, n_draw = 64, 0.8, 20000
+        cfg = SDEConfig(n=1, noise_a=a)   # n unused below; cfg carries schedule fields
+        dt = -1.0 / K
+        torch.manual_seed(0)
+        x = torch.randn(n_draw, 1, 1)
+        ctx = torch.zeros(n_draw, 1)
+        with torch.no_grad():
+            for k in range(K):
+                t_k = torch.full((n_draw,), 1.0 + k * dt)
+                mu, std = _sde_transition(dec, ctx, x, t_k, dt, cfg)
+                x = mu + std * torch.randn_like(mu)
+        got = float(x.std())
+        # Correct reverse-time sign converges to s1 (loose tolerance: K=64 discretization
+        # + clamp effects). The wrong sign lands near ~2.3-2.5x s1 -- far outside.
+        assert abs(got - s1) / s1 < 0.25, (
+            f"terminal std {got:.4f} vs analytic {s1} -- drift-correction sign is wrong "
+            "(the '+' variant inflates the marginal ~4x at high noise)")

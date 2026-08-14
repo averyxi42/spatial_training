@@ -32,13 +32,15 @@ external spec warns the formulas flip with the convention):
 
     eps_hat = x_t + (1 - t) * v          # exact for the trained target: substitute and check
     score   = -eps_hat / max(t, t_min)   # grad log p_t for the conditional path N((1-t)a, t^2)
-    drift   = v + (sigma_t^2 / 2) * score
+    drift   = v - (sigma_t^2 / 2) * score   # reverse-time SDE, dt < 0
     mu      = x_t + dt * drift           # dt NEGATIVE -- same sign as the ODE update
     std     = sigma_t * sqrt(|dt|)
 
-with `sigma_t = a * sqrt(t / (1 - t))` on `t` clamped to `[t_sched_min, t_sched_max]`. The
-clamp's upper end matters: the schedule is singular at t = 1, which is exactly position 0.
-`n_exclude_last` keeps stochastic positions away from the 1/t singularity at the OTHER end.
+with `sigma_t = a * sqrt(t / max(1 - t, |dt|))` -- the denominator floor is RLinf's
+first-step rule (sigma_0 = a*sqrt(K), so first-step injected noise is exactly `a` at any
+K). The score's 1/t at the t->0 end CANCELS inside the drift (sigma^2*score =
+-a^2*eps_hat/(1-t), shrinking toward t=0), so `n_exclude_last` is a variance choice, not
+a singularity guard -- see docs/FLOW_SDE_RL.md "Audit corrections".
 
 Numerics, each a recorded failure mode (docs/FLOW_SDE_RL.md "Failure modes"):
   * the velocity net carries dropout=0.1 and RL runs under `model.train()`; every entry point
@@ -85,15 +87,34 @@ class SDEConfig:
 
     n: int                      # stochastic steps per chunk, 1 <= n <= K - n_exclude_last
     noise_a: float              # sigma_t = noise_a * sqrt(t / (1 - t))
-    n_exclude_last: int = 1     # keep stochastic positions away from the 1/t singularity
+    # VARIANCE CHOICE, NOT A SINGULARITY GUARD (audited 2026-08-14): the 1/t in the
+    # score cancels exactly against sigma_t^2 -- (sigma^2/2)*score = -a^2*eps_hat/
+    # (2(1-t)), monotonically SHRINKING toward t=0; the last position is the most benign
+    # and terminal marginals are identical for exclude 0..3. The singular end is t=1,
+    # handled by the schedule's denominator floor. 0 matches RLinf's default.
+    n_exclude_last: int = 1
     t_min: float = 1e-3         # floor inside the score, belt on top of n_exclude_last
     t_sched_min: float = 1e-3   # sigma_t schedule clamp, low side
     t_sched_max: float = 0.95   # ...high side: position 0 sits at t = 1.0 where the schedule
     #                             is singular. 0.95 is half a step below at K = 10 --
     #                             deliberate, config-visible, and validated by the marginal-
     #                             preservation test rather than derived.
+    # Per-transition weight on the summed log-prob, a DELIBERATE estimator change in the
+    # `logprob_reduction: mean` tradition (biased surrogate, chosen and named, never
+    # silent). "none" is the plain joint density. "sigma" multiplies transition k's
+    # log-prob by sigma_k / sigma_0 (<= 1): on-policy the density gradient scales as
+    # 1/sigma_k, so late low-noise refinement steps otherwise dominate every update ~10x
+    # (measured: decoder grad x1.0 -> x9.6 across positions, tracking 1/sigma to within
+    # 10%). The weight equalizes per-position gradient scale -- equivalently a per-position
+    # learning rate proportional to sigma_k -- at 0.914 direction overlap with the
+    # unweighted gradient. Applied identically in the sampler's reported log-prob and the
+    # scorer, so the ratio stays a ratio of one consistent quantity.
+    position_weight: str = "none"
 
     def __post_init__(self):
+        if self.position_weight not in ("none", "sigma"):
+            raise ValueError(
+                f"position_weight must be 'none' or 'sigma', got {self.position_weight!r}")
         if self.n < 1:
             raise ValueError(f"n must be >= 1, got {self.n} (use the plain ODE for n = 0)")
         if not (self.noise_a > 0.0):
@@ -102,11 +123,8 @@ class SDEConfig:
                 "the exploration scale and must come from the noise sweep "
                 "(docs/FLOW_SDE_RL.md, Validation)."
             )
-        if self.n_exclude_last < 1:
-            raise ValueError(
-                "n_exclude_last must be >= 1: the score carries 1/t and the final "
-                "transition sits closest to t = 0."
-            )
+        if self.n_exclude_last < 0:
+            raise ValueError(f"n_exclude_last must be >= 0, got {self.n_exclude_last}")
 
 
 # ======================================================================================
@@ -131,12 +149,38 @@ def _sde_transition(decoder: nn.Module, ctx: torch.Tensor, x_t: torch.Tensor,
     v = decoder(ctx.float(), x_t, t)                                    # (B, T, 3)
     tb = t.view(-1, 1, 1)
     eps_hat = x_t + (1.0 - tb) * v
+    # t_min cannot bind for any K <= 1000 (source times are >= 1/K); if it ever does,
+    # DESTINATION times are being fed to the scorer -- treat a binding clamp as an
+    # off-by-one detector, not a guard (independent audit, 2026-08-14).
     score = -eps_hat / tb.clamp_min(cfg.t_min)
-    tc = t.clamp(cfg.t_sched_min, cfg.t_sched_max).view(-1, 1, 1)
-    sigma_t = cfg.noise_a * torch.sqrt(tc / (1.0 - tc))
-    mu = x_t + dt * (v + 0.5 * sigma_t.pow(2) * score)
+    sigma_t = _sigma(t, cfg, dt).view(-1, 1, 1)
+    # SIGN: reverse-time drift is v MINUS (sigma^2/2)*score under this codebase's
+    # t:1->0, dt<0 convention (piRL Eq. 8; verified against an analytic Gaussian flow
+    # where the true terminal marginal is known -- the "+" sign converges to a ~4x wider
+    # distribution, with distortion growing as a^2, which is exactly why the low-a
+    # marginal-preservation test never caught it). See tests/test_flow_sde_policy.py::
+    # test_high_noise_marginal_preservation for the guard.
+    mu = x_t + dt * (v - 0.5 * sigma_t.pow(2) * score)
     std = sigma_t * math.sqrt(abs(dt))
     return mu, std.expand_as(mu)
+
+
+def _sigma(t: torch.Tensor, cfg: SDEConfig, dt: float) -> torch.Tensor:
+    """THE noise schedule -- the only implementation; sampler, scorer and position
+    weights all read it here (the module's one-function invariant applies to the
+    schedule too; a second copy silently desynchronised once).
+
+    sigma_t = a * sqrt(t / max(1 - t, |dt|)). The denominator floor is RLinf's first-step
+    rule: at t = 1 (position 0) it gives sigma_0 = a*sqrt(K), so the first step's
+    INJECTED noise sigma_0*sqrt|dt| equals `a` exactly, at every K -- which is what makes
+    `a` mean the same thing as piRL's swept `a` (their working point a~0.5, failure
+    a~0.2). The previous t<=0.95 clamp made first-step noise a*sqrt(19/K):
+    K-dependent, 1.38x RLinf's at K=10, and not transferable across K. Any bounded
+    schedule is marginal-preserving (the drift and diffusion share this tensor); the
+    choice is about comparability, not correctness."""
+    t = t.float()
+    denom = (1.0 - t).clamp_min(abs(dt))
+    return cfg.noise_a * torch.sqrt(t.clamp_min(0.0) / denom)
 
 
 def _gaussian_logprob(x: torch.Tensor, mu: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
@@ -144,6 +188,23 @@ def _gaussian_logprob(x: torch.Tensor, mu: torch.Tensor, std: torch.Tensor) -> t
     var = std.pow(2)
     lp = -0.5 * ((x - mu).pow(2) / var + torch.log(2.0 * math.pi * var))
     return lp.flatten(1).sum(dim=1)
+
+
+def _position_weight(k: torch.Tensor, cfg: SDEConfig, K: int) -> torch.Tensor:
+    """`(rows,)` weight for transition index `k` under `cfg.position_weight`.
+
+    For "sigma": sigma_k / sigma_0 with both taken from the clamped schedule, so
+    `noise_a` cancels and the weight depends only on (k, K, clamps). Position 0 always
+    weighs 1.0 and the weight is monotonically decreasing in k."""
+    if cfg.position_weight == "none":
+        return torch.ones_like(k, dtype=torch.float32)
+    dt = -1.0 / K
+    t_k = 1.0 + k.float() * dt
+    sig = _sigma(t_k, cfg, dt)
+    # ones_like keeps the device (a CPU-constructed sig0 crashed the first GPU run --
+    # the unit suite exercises this path on CPU only).
+    sig0 = _sigma(torch.ones_like(t_k[:1], dtype=torch.float32), cfg, dt)
+    return sig / sig0
 
 
 class _decoder_eval:
@@ -198,6 +259,9 @@ class FlowSDEHead(nn.Module):
         # The rollout draws through a private generator so a seeded run is reproducible
         # without touching the global stream (the latent head's `latent_generator` pattern).
         self._gen: Optional[torch.Generator] = None
+        # When True, sample_chain_np runs the PURE ODE (no stochastic transitions,
+        # logprob 0) -- the eval/deploy sampler, toggled per-cycle by interleaved eval.
+        self.force_ode = False
 
     # -- shapes ---------------------------------------------------------------------
     @property
@@ -237,6 +301,11 @@ class FlowSDEHead(nn.Module):
         admissible = K - cfg.n_exclude_last
         perm = torch.randperm(admissible, generator=self._gen, device=dev)[: cfg.n]
         positions = perm.sort().values
+        if self.force_ode:
+            # Empty positions, not just an empty pos_set: an ODE chain carrying
+            # stochastic positions could be handed to the scorer and yield a finite,
+            # confidently wrong log-prob. Make that structurally impossible.
+            positions = positions[:0]
         pos_set = set(positions.tolist())
 
         with _decoder_eval(self.codec.decoder):
@@ -251,7 +320,8 @@ class FlowSDEHead(nn.Module):
                     eps = torch.randn(mu.shape, device=dev, dtype=torch.float32,
                                       generator=self._gen)
                     x = mu + std * eps
-                    logprob = logprob + _gaussian_logprob(x, mu, std)
+                    w = _position_weight(torch.tensor([k], device=dev), cfg, K)
+                    logprob = logprob + w * _gaussian_logprob(x, mu, std)
                 else:
                     v = self.codec.decoder(ctx, x, t_k)
                     x = x + dt * v
@@ -311,14 +381,15 @@ class FlowSDEHead(nn.Module):
                 x_k = ch[idx, k]                                         # (rows, T, 3)
                 x_next = ch[idx, k + 1]
                 mu, std = _sde_transition(self.codec.decoder, ctx, x_k, t_k, dt, self.sde)
-                total = total + _gaussian_logprob(x_next, mu, std)
+                w = _position_weight(k, self.sde, self.K)
+                total = total + w * _gaussian_logprob(x_next, mu, std)
         return total.reshape(B, S)
 
     # -- run-log honesty ---------------------------------------------------------------
     def describe(self) -> str:
         return (f"flow-SDE head: K={self.K} n={self.sde.n} a={self.sde.noise_a} "
-                f"exclude_last={self.sde.n_exclude_last} gap={self.gap} "
-                f"chain={self.chain_len} floats  (eval/deploy = pure ODE)")
+                f"exclude_last={self.sde.n_exclude_last} pos_weight={self.sde.position_weight} "
+                f"gap={self.gap} chain={self.chain_len} floats  (eval/deploy = pure ODE)")
 
     # -- construction ------------------------------------------------------------------
     @classmethod
@@ -337,6 +408,7 @@ class FlowSDEHead(nn.Module):
                 n=int(cfg.get("sde_n", 1)),
                 noise_a=float(cfg["sde_noise_a"]),
                 n_exclude_last=int(cfg.get("sde_exclude_last", 1)),
+                position_weight=str(cfg.get("sde_position_weight", "none")),
             ),
         )
         seed = cfg.get("sde_seed")
