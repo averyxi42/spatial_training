@@ -31,10 +31,17 @@ from longnav.config_schema import RLConfig
 
 register_configs()
 
-M_REPEATS = 6
-A_LADDER = [0.15, 0.30, 0.50]
 SET_SIZE = 32          # pre-screen leaves ~24 servable
 SET_SEED = 0           # same fixed set as the overfit diagnostic
+# Env-overridable so one script serves both readings without an edit per run:
+#   PROBE_M=4 PROBE_A=0.15,0.30,0.50,0.70  -> the `a` CALIBRATION (piRL's init-gap
+#     rule: pick the largest `a` whose success gap against the ODE arm stays inside
+#     the z0 band). Needs the ladder wide, repeats only deep enough for a mean.
+#   PROBE_M=6 PROBE_A=0.15,0.30,0.50       -> the original H2 flip-rate reading, where
+#     per-episode outcome VARIANCE is the statistic and repeats matter more than reach.
+# Both come out of the same pass; only the emphasis differs.
+M_REPEATS = int(os.environ.get("PROBE_M", 6))
+A_LADDER = [float(x) for x in os.environ.get("PROBE_A", "0.15,0.30,0.50").split(",")]
 
 
 @hydra.main(version_base=None, config_name="rl_config", config_path='../config')

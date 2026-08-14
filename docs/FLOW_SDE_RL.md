@@ -575,3 +575,58 @@ reference; the fully decisive version is the checkpoint-swap eval (final backbon
 head vs init backbone + final head), which needs the fleet and is superseded in practice
 by the freeze-head arm itself -- if that arm survives the 10x lr that killed both twins,
 the attribution is confirmed interventionally.
+
+## The noise-scale calibration: `a` was never bounded by fidelity here (2026-08-14)
+
+`a` had been held at 0.15 since the design, on the doc's own reasoning that "sigma_t is
+bounded above by fidelity." That bound was assumed, never measured. It is now measured, on
+cotrain-v3 ck12000, over the fixed 24-episode overfit pool, 4 repeated passes per arm, two
+independently launched rounds (`scripts/probe_credited_channel.py`, `PROBE_M`/`PROBE_A`;
+raw in `dump/flow_rl/a_calibration{,_hi}`):
+
+| arm | mean success | sd over passes | per-episode outcome var | episodes flipping |
+|---|---|---|---|---|
+| ODE (round 1 / round 2) | 0.781 / 0.771 | 0.040 / 0.024 | 0.0859 | 10/24 |
+| a = 0.15 (the shipped setting) | 0.812 | 0.054 | 0.0833 | 10/24 |
+| **a = 0.30** | **0.865** | **0.021** | 0.0443 | 5/24 |
+| a = 0.50 (piRL's value) | 0.823 | 0.040 | 0.0859 | 10/24 |
+| a = 0.70 | 0.812 | 0.080 | 0.0781 | 9/24 |
+| a = 1.00 | 0.750 | **0.123** | -- | -- |
+| a = 1.50 | 0.615 | 0.098 | -- | -- |
+| a = 2.00 | 0.271 | 0.072 | -- | -- |
+| a = 3.00 | 0.000 (1 pass) | -- | -- | -- |
+
+Read it in three parts.
+
+**1. The plateau is an order of magnitude wide, and we sat at its conservative end.**
+Competence is flat-to-BETTER than the deterministic policy from 0.15 through 0.7 -- every
+stochastic arm in that range beats pure ODE -- with a soft shoulder at 1.0, a real cost at
+1.5, and total breakdown by 3.0. The usable range is ~5x what we had been training in.
+The sd column leads the mean by one rung: spread jumps 5x at a=1.0 (0.024 -> 0.123) while
+the mean is still at baseline, i.e. the decoder starts failing on SOME draws before it
+fails on average. Watch the spread, not the mean, when locating this edge on a new
+checkpoint.
+
+**2. The ODE arm is the WORST arm, which qualifies our own eval yardstick.** Deterministic
+decoding scored below every survivable noise setting, reproducibly across two rounds
+(0.781, 0.771). Consistent with the settling/oscillation artifact
+(`policy-settling-is-a-rollout-artifact`): noise appears to break the policy out of it.
+Every sample101 number in this project is an ODE number, so they are, if anything, a
+slight understatement of the checkpoint's marginal behaviour.
+
+**3. THE FINDING THAT MATTERS, and it is negative: the survivable range and the
+outcome-relevant range do not overlap.** Per-episode outcome variance is FLAT across the
+entire plateau -- a=0.7 (4.7x the shipped noise) produces the same 0.078 as the pure ODE
+arm's 0.086, which is z_0 scatter plus simulator nondeterminism and contains no credited
+noise at all. The chain-head gradient reaches `h` only through the eps-advantage
+correlation; if outcomes are independent of the credited noise, that correlation is zero
+in expectation and NO LEARNING RATE FIXES IT (H2, now confirmed post-sign-fix; the
+pre-fix SDE arms were invalidated). Where noise finally does dominate outcomes (>= 1.5)
+it does so by destroying the policy, not by exploring it.
+
+So: raise `a` to 0.3-0.7 in every future run -- it is free, and 0.3 had both the best mean
+and the tightest spread -- but do not expect it to supply the missing credit signal. The
+deficit is in the credit path (per-episode baselines on a heterogeneous fixed pool, reward
+shape, or a critic), not in the exploration scale. The measurement costs ~2 h of fleet and
+should be re-run per checkpoint: this is a property of the decoder's robustness radius,
+and a re-initialised or further-trained velocity field will move it.
