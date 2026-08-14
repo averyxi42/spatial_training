@@ -33,7 +33,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-
+import os
 
 class ContinuousObjectNavEnvActor:
     """The five-method env-actor interface, over a physically-simulated robot.
@@ -77,7 +77,11 @@ class ContinuousObjectNavEnvActor:
         self.source_kwargs = dict(source_kwargs or {})
         self.slack_penalty = float(slack_penalty)
         self.collision_penalty = float(collision_penalty)
-        self.seed = int(seed)
+        #self.seed = int(seed)
+        # CRITICAL: need different seed per worker to sample properly, below is jank but more correct version:
+        np.random.seed(os.getpid())
+        self.seed = np.random.randint(0,100000)
+        
         self.logging_output_dir = logging_output_dir
         self.logger_actor = logger_actor
 

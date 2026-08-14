@@ -10,6 +10,7 @@
 defaults:
   - override /policy_head@vlm.policy_head: flow_sde_head
   - override /sim: objectnav_continuous
+  # - override /logger@task.logger: wandb
 
 vlm:
   attn_impl: flash_attention_2
@@ -24,7 +25,7 @@ vlm:
     sde_noise_a: 0.15
 
 sim:
-  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1/val
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1/val #ONLY use val for quick proof of concept, invalid for real training.
   scene_root: /Projects/spatial_training/data/scene_datasets
   gap: 10
   dt: 0.04
@@ -79,9 +80,14 @@ training:
   rl_config:
     entropy_bonus: 0.0      # nonzero RAISES for a chain head -- schedule-fixed entropy
 
+
 task:
-  # TRAINING pool only: everything__uid (2000 episodes over the v1/val scene pool the
-  # label tables are built on) MINUS the eval subsets sample400_a/b, which it fully
-  # contains -- verified 200/200 each, and 0 overlap after the subtraction. sample101 is
-  # disjoint from this pool entirely. Eval on sample400/sample101 stays out-of-training.
-  subset_label: train_pool__uid
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "flow_sde_train_test" #need to change this per run to prevent local or wandb conflicts.
+  output_dir: /Projects/spatial_training/dump/flow_rl
+  subset_label: "everything"
+  shard_size: 0
+
+  # need to setup subset label to a proper subset (everything under train split suggested when full train)
