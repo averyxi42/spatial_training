@@ -591,10 +591,10 @@ raw in `dump/flow_rl/a_calibration{,_hi}`):
 | **a = 0.30** | **0.865** | **0.021** | 0.0443 | 5/24 |
 | a = 0.50 (piRL's value) | 0.823 | 0.040 | 0.0859 | 10/24 |
 | a = 0.70 | 0.812 | 0.080 | 0.0781 | 9/24 |
-| a = 1.00 | 0.750 | **0.123** | -- | -- |
-| a = 1.50 | 0.615 | 0.098 | -- | -- |
-| a = 2.00 | 0.271 | 0.072 | -- | -- |
-| a = 3.00 | 0.000 (1 pass) | -- | -- | -- |
+| a = 1.00 | 0.750 | **0.123** | 0.0781 | 9/24 |
+| a = 1.50 | 0.615 | 0.098 | 0.1016 | 12/24 |
+| a = 2.00 | 0.271 | 0.072 | 0.1042 | 12/24 |
+| a = 3.00 | 0.042 | -- | 0.0260 | 3/24 |
 
 Read it in three parts.
 
@@ -622,7 +622,15 @@ noise at all. The chain-head gradient reaches `h` only through the eps-advantage
 correlation; if outcomes are independent of the credited noise, that correlation is zero
 in expectation and NO LEARNING RATE FIXES IT (H2, now confirmed post-sign-fix; the
 pre-fix SDE arms were invalidated). Where noise finally does dominate outcomes (>= 1.5)
-it does so by destroying the policy, not by exploring it.
+it does so by destroying the policy, not by exploring it. Round 2's variance column
+completes the picture and is worth stating exactly, because it is the closest thing to a
+counterexample: variance DOES rise, from 0.078 at a=1.0 to ~0.10 at a=1.5-2.0, where the
+means are 0.615 and 0.271. That is not the channel opening -- it is the arms straddling
+the breakdown, where some passes decode usable trajectories and others do not; the
+flipping count rises to 12/24 for exactly that reason. By a=3.0, where nearly everything
+fails, variance collapses again to 0.026 (3/24 flipping) -- outcome variance requires
+outcomes to be uncertain, and total failure is as certain as total success. Read the
+variance column only where the policy is competent: there, it is flat.
 
 So: raise `a` to 0.3-0.7 in every future run -- it is free, and 0.3 had both the best mean
 and the tightest spread -- but do not expect it to supply the missing credit signal. The
