@@ -28,6 +28,11 @@ def collate_trajectories(trajectory_list: list[dict], device='cpu'):
 
     # 1. Identify Keys and Dtypes
     # We infer expected types based on common RL keys to ensure PyTorch compatibility
+    # A failed episode returns None (run_episode swallows its exception by design); one
+    # None must cost that episode, never the driver.
+    trajectory_list = [t for t in trajectory_list if t]
+    if not trajectory_list:
+        raise ValueError("no successful trajectories to collate")
     keys = trajectory_list[0].keys()
     batch = {}
     

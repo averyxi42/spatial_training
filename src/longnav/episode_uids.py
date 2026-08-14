@@ -1623,3 +1623,10 @@ EPISODE_UID_TABLE = {
         "mL8ThkuaVTM:0#42", "6s7QHgap2fW:0#81", "zt1RVoi7PcG:0#70",
     ],
 }
+
+
+# NOTE, 2026-08-14: a derived "train_pool__uid" (everything minus sample400_a/b) briefly
+# lived here and was REMOVED: episode-level disjointness is not cleanliness -- the whole
+# `everything__uid` pool sits on HABITAT VAL SCENES, so any subset of it trains in the very
+# buildings sample400/sample101 evaluate in. RL training subsets must come from the v1 TRAIN
+# split's scenes (disjoint from val by construction); see hm3d_train25x80__uid below.

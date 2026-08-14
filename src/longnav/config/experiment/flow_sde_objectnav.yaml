@@ -13,6 +13,7 @@ defaults:
 
 vlm:
   attn_impl: flash_attention_2
+  save_outputs: true
   policy_head:
     checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000
     gap: 10
@@ -35,6 +36,12 @@ sim:
 
 rollout:
   max_steps: 175
+  # STRUCTURE MUST MATCH THE FRAMEWORK DEFAULTS: both templates end with a trailing
+  # assistant placeholder turn -- that turn is what plants the `<|im_start|>assistant\n**`
+  # sandwich `_get_sandwich_indices` locates to read hidden states; a template ending on a
+  # user turn tokenizes without the pattern and every inference dies with `index -1 ... size
+  # 0` (observed, 15x). Texts are ours (the SFT corpus's constant `**____**` placeholder and
+  # numbered Observation turns); the SHAPE is the discrete default's, verbatim.
   convo_start_template:
     - role: user
       content:
@@ -45,15 +52,23 @@ rollout:
         - { type: text, text: "Observation 0:" }
         - { type: image }
         - { type: text, text: "Action:" }
-  convo_turn_template:
     - role: assistant
       content:
         - { type: text, text: "**____**" }
+  # NO leading assistant echo: the previous turn's trailing placeholder already closed the
+  # assistant block in the incremental stream, and an echo duplicates it (measured: 96 vs 88
+  # tokens against the corpus). With [user, assistant-ph] the 3-observation incremental
+  # stream matches the SFT corpus render TOKEN FOR TOKEN (108 == 108) -- the echo is a
+  # discrete-corpus convention ours does not share.
+  convo_turn_template:
     - role: user
       content:
         - { type: text, text: "Observation $step:" }
         - { type: image }
         - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
 
 training:
   # The backbone must BE the SFT policy: load the cotrain-v3 LoRA adapter, not a fresh one.
@@ -65,7 +80,8 @@ training:
     entropy_bonus: 0.0      # nonzero RAISES for a chain head -- schedule-fixed entropy
 
 task:
-  # sample400_a in HARNESS-UID format (scene:episode_id#occurrence): the continuous env's
-  # assign_shard refuses longnav labels by design -- the two uid conventions silently
-  # disagree in some scenes, and episode_uids.py carries the verified translation.
-  subset_label: sample400_a__uid
+  # TRAINING pool only: everything__uid (2000 episodes over the v1/val scene pool the
+  # label tables are built on) MINUS the eval subsets sample400_a/b, which it fully
+  # contains -- verified 200/200 each, and 0 overlap after the subtraction. sample101 is
+  # disjoint from this pool entirely. Eval on sample400/sample101 stays out-of-training.
+  subset_label: train_pool__uid
