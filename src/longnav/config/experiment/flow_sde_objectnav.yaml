@@ -23,7 +23,7 @@ vlm:
     sde_noise_a: 0.15
 
 sim:
-  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1/train
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1/val
   scene_root: /Projects/spatial_training/data/scene_datasets
   gap: 10
   dt: 0.04

@@ -344,15 +344,40 @@ class ContinuousObjectNavEnvActor:
         # `path` rather than `episodes`, and no `scene_root`: sources take the shard path
         # only, and scene resolution happens later in `resolve_scene`. Extra kwargs are
         # forwarded verbatim so a source needing more than a path does not add a field here.
+        kwargs = dict(self.source_kwargs)
+        if (self._shard and "scenes" not in kwargs
+                and self.episode_source_kind == "objectnav"):
+            # The shard's uids name their scenes (`scene:episode_id#occurrence`), and the
+            # full HM3D train split is 133 MB gzipped / minutes of parse. Restrict the load
+            # to the shard's own scenes -- measured: the eager full-split load exceeded
+            # four minutes PER ACTOR and was the entire "hung at Starting rollout
+            # collection" incident.
+            kwargs["scenes"] = sorted({u.split(":", 1)[0] for u in self._shard if ":" in u})
         source = build_episode_source(
-            self.episode_source_kind, path=self.episodes_path, **self.source_kwargs,
+            self.episode_source_kind, path=self.episodes_path, **kwargs,
         )
         episodes = list(source.load())
         if self._shard is not None:
             episodes = self._select(episodes, self._shard)
         self._episodes = episodes
         rng = np.random.default_rng(self.seed)
-        self._order = list(rng.permutation(len(episodes)))
+        # SCENE-GROUPED order, never a flat permutation. A flat shuffle makes consecutive
+        # episodes land in different scenes, and every scene change costs a full simulator
+        # reconfigure PLUS a robot-footprint navmesh recompute -- ~30 s of pure overhead per
+        # episode, forever. Shuffle scenes, then episodes within a scene: same seed-determined
+        # coverage, one scene build per scene visit. (CLAUDE.md's task layer gives the same
+        # advice: drive the outer loop with episodes_by_scene.)
+        by_scene: Dict[str, List[int]] = {}
+        for i, e in enumerate(episodes):
+            by_scene.setdefault(e.uid.split(":", 1)[0], []).append(i)
+        scene_order = list(by_scene)
+        rng.shuffle(scene_order)
+        order: List[int] = []
+        for s in scene_order:
+            idx = by_scene[s]
+            rng.shuffle(idx)
+            order.extend(idx)
+        self._order = order
         self._cursor = 0
 
 
