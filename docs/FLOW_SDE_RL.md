@@ -622,15 +622,34 @@ noise at all. The chain-head gradient reaches `h` only through the eps-advantage
 correlation; if outcomes are independent of the credited noise, that correlation is zero
 in expectation and NO LEARNING RATE FIXES IT (H2, now confirmed post-sign-fix; the
 pre-fix SDE arms were invalidated). Where noise finally does dominate outcomes (>= 1.5)
-it does so by destroying the policy, not by exploring it. Round 2's variance column
-completes the picture and is worth stating exactly, because it is the closest thing to a
-counterexample: variance DOES rise, from 0.078 at a=1.0 to ~0.10 at a=1.5-2.0, where the
-means are 0.615 and 0.271. That is not the channel opening -- it is the arms straddling
-the breakdown, where some passes decode usable trajectories and others do not; the
-flipping count rises to 12/24 for exactly that reason. By a=3.0, where nearly everything
-fails, variance collapses again to 0.026 (3/24 flipping) -- outcome variance requires
-outcomes to be uncertain, and total failure is as certain as total success. Read the
-variance column only where the policy is competent: there, it is flat.
+it does so by destroying the policy, not by exploring it. Round 2's variance column needs care,
+and an earlier draft of this section over-claimed about it. Variance DOES rise, 0.078 at
+a=1.0 to ~0.10 at a=1.5-2.0. Per-episode consistency (n=4 passes, 24 episodes) separates
+the two arms rather than lumping them:
+
+| arm | always-win | always-lose | MIXED | mean steps |
+|---|---|---|---|---|
+| ODE | 14 | 1 | 9 | 76 |
+| a=1.0 | 13 | 2 | 9 | 83 |
+| a=1.5 | 8 | 4 | **12** (6 of them new) | 108 |
+| a=2.0 | 1 | 11 | 12 | 138 |
+| a=3.0 | 0 | 21 | 3 | 156 |
+
+At **a=2.0** the variance really is breakdown: one episode still reliably succeeds and
+eleven reliably fail. At **a=1.5** it is not that simple -- only 3 episodes moved into
+always-lose, while SIX became newly outcome-variable that were deterministic at ODE. That
+is genuine per-episode uncertainty, i.e. exactly the eps-advantage correlation the chain
+gradient needs, and a=1.5 is the ONLY point on the ladder that supplies more of it than
+z_0 already does. By a=3.0 variance collapses to 0.026 as everything fails uniformly:
+outcome variance needs outcomes to be uncertain, and total failure is as certain as total
+success.
+
+So the honest reading, with the trade named rather than resolved: 0.3-0.7 is free and is
+the safe default; **a=1.5 is a legitimate untested gamble** -- more learnable variance,
+bought with rollout competence (0.75 -> 0.615) and 40% longer episodes, which widens the
+gap between the distribution we train on and the ODE policy we deploy, and some of the new
+signal may teach noise-robustness rather than navigation. A static probe cannot settle
+which effect dominates; a training arm can. >= 2.0 is out.
 
 So: raise `a` to 0.3-0.7 in every future run -- it is free, and 0.3 had both the best mean
 and the tightest spread -- but do not expect it to supply the missing credit signal. The
