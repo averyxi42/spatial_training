@@ -102,6 +102,43 @@ The merged card must additionally say: which local checkpoint it corresponds to 
 same policy as the adapter repo, and that a merged model cannot be diffed against the base
 to recover the LoRA — so the adapter repo stays the canonical artifact.
 
+## Is `merged + RL adapter` the same as `raw base + stacked adapter`?
+
+**In exact arithmetic yes; in stored bf16 no, and the gap is larger than the RL update.**
+Measured 2026-08-15 on `layers.0.self_attn.q_proj` and five siblings:
+
+| quantity | Frobenius norm | as % of `||W||` |
+|---|---|---|
+| weight `||W||` | 67.44 | -- |
+| SFT delta | 1.043 | 1.55% |
+| **bf16 rounding of the merged store** | **0.112** | 0.166% |
+| RL delta (a09 ck303) | 0.023 | 0.03% |
+
+Algebraically the two paths are identical: stacking gives
+`W + (512/256)([B_s B_r][A_s; A_r]) = W + 2 B_s A_s + 2 B_r A_r`, and merged-plus-RL gives
+`(W + 2 B_s A_s) + 2 B_r A_r`. What differs is that the merged repo **stores** the first
+sum in bf16, so the two differ by that rounding -- ULP-scale per element (max 1.5e-3,
+100% of elements touched) but **~5x the RL delta in norm** (4.1x-7.6x across probes).
+
+Two things follow, and the second is the one that matters:
+
+* The rounding is **unstructured** where the RL delta is a learned direction, so equal norm
+  does not mean equal behavioural effect -- a bf16 store is exactly the perturbation the
+  model already tolerates by construction. Expect the metric difference to be small. It is
+  nonetheless **not measured**, so do not claim the paths are interchangeable; claim they
+  are algebraically equal and numerically within bf16 store noise.
+* **The merged path is arguably the FAITHFUL one for these checkpoints.** RL runs with
+  `vlm.merge_adapter_dir` build their base by exactly this operation --
+  `PeftModel.from_pretrained(base, sft_adapter).merge_and_unload()` on the bf16 model at
+  load time (`vlm_worker.load_model`) -- so a published merged repo reproduces the base the
+  policy was TRAINED against, while stacking the two LoRAs onto the raw base does not. Our
+  own sample400 numbers were produced by the stacking path, i.e. the one that deviates from
+  training conditions by this rounding. The deviation is bf16-small, but if a published
+  number and a reproduction disagree slightly, this is the first thing to check.
+
+To settle it empirically rather than by argument, run the same episode subset both ways and
+compare paired outcomes; nobody has done that yet.
+
 ## Uploading
 
 ```python
