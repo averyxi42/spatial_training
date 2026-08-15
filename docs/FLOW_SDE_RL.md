@@ -614,6 +614,26 @@ decoding scored below every survivable noise setting, reproducibly across two ro
 Every sample101 number in this project is an ODE number, so they are, if anything, a
 slight understatement of the checkpoint's marginal behaviour.
 
+**CORRECTION (2026-08-15): finding 3 is a property of the 24-EPISODE POOL, not of the
+method.** Re-measuring the same statistic on the fixed eval partition of the 8000-episode
+pool (26 servable episodes over 23 scenes, 8 ODE passes + 6 at a=0.9, run
+`sft_baseline_fullpool_evalset`, same SFT checkpoint):
+
+| pool | arm | mean success | episodes flipping | per-episode outcome var |
+|---|---|---|---|---|
+| 24 eps / 4 scenes | ODE | 0.776 | 10/24 | 0.086 |
+| 24 eps / 4 scenes | a=0.7 | 0.812 | 9/24 | 0.078 |
+| **26 eps / 23 scenes** | ODE | 0.663 | 10/26 | **0.077** |
+| **26 eps / 23 scenes** | **a=0.9** | 0.611 | **17/26** | **0.120** |
+
+On the diverse pool the credited noise raises outcome variance **56% above the ODE floor**
+and takes the flipping count from 10/26 to 17/26. The channel is NOT blind there. The
+small pool's flatness now reads as a property of its episodes -- 4 easy scenes, bed/TV
+heavy, most episodes reliably winnable or reliably not, so nothing for the noise to tip --
+rather than of the sampler. Anything downstream of "the credited channel is blind"
+(including the argument that dense per-step progress must be doing all the learning)
+inherits that qualifier and should be re-derived per pool before being relied on.
+
 **3. THE FINDING THAT MATTERS, and it is negative: the survivable range and the
 outcome-relevant range do not overlap.** Per-episode outcome variance is FLAT across the
 entire plateau -- a=0.7 (4.7x the shipped noise) produces the same 0.078 as the pure ODE
