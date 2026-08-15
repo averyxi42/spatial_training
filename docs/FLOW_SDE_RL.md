@@ -677,3 +677,71 @@ deficit is in the credit path (per-episode baselines on a heterogeneous fixed po
 shape, or a critic), not in the exploration scale. The measurement costs ~2 h of fleet and
 should be re-run per checkpoint: this is a property of the decoder's robustness radius,
 and a re-initialised or further-trained velocity field will move it.
+
+## The pool ladder, and what the 8000-episode arm does *not* settle (2026-08-15)
+
+Three arms, identical in everything but the training pool (lr 2e-6, `a`=0.9, frozen head,
+merged base, `success_reward` 0.0 so the reward is dense geodesic progress only, ref-KL
+measured not constrained):
+
+| arm | pool | eval set | outcome |
+|---|---|---|---|
+| `flow_sde_freezehead_a09` | 24 servable, 4 scenes | drawn from that pool -- i.e. a training-set metric | **the programme's only held-out gain**: +0.053 oracle success (McNemar p=0.021), +0.086 oSPL at ck391 on sample400 (397 episodes, 20 unseen VAL scenes, paired) |
+| `..._a09_fullpool` | 7429 (8000 minus `plant`), 80 scenes | 26 drawn from that pool | no gain; killed at c56 |
+| `..._a09_held128` | 128 balanced | 26 **disjoint** from training | launched 2026-08-15 |
+
+The fullpool run's own eval series, all 15 passes it completed (`eval_episodes.jsonl`):
+
+    c0  0.692   c16 0.654   c32 0.654   c48 0.615
+    c4  0.654   c20 0.615   c36 0.654   c52 0.615
+    c8  0.615   c24 0.500   c40 0.615   c56 0.577
+    c12 0.654   c28 0.577   c44 0.692
+
+series mean 0.626, **sd 0.049** -- against the 8-pass SFT baseline on the same 26 episodes,
+0.6635 +/- **0.0448**. The run's scatter over 15 cycles is indistinguishable from the
+scatter of the *unchanged* SFT policy measured 8 times, which is what a policy that has not
+moved looks like. `ref/kl_k2` ~0.006 says the same thing from the other side.
+
+**What this does not license.** Three separate reasons to hold the null loosely:
+
+* it was **killed, not concluded** -- an OOM caused by a second GPU fleet launched alongside
+  it (2026-08-14's crash class, repeated), at ~55 cycles x 16 episodes = ~880 episodes, i.e.
+  **0.12 visits per pool episode**. The small-pool arm had ~250 visits/episode by ck391;
+* the eval set it looked flat on was **drawn from its own training pool**, and a single
+  point on it carries sd 0.045, so the series could hide a real effect of the size the
+  small-pool arm produced (+0.053);
+* the mechanism story cuts the other way. The credited noise channel -- the only path from
+  outcomes to the backbone -- was measurably **more** open on this pool (17/26 outcome-
+  uncertain episodes at a=0.9 vs 10/26 at ODE) than on the small pool, where it was flat
+  across the whole survivable noise range. If the large pool is worse, it is not because the
+  channel is narrower there.
+
+The honest statement is that **the large pool has not been given a fair trial**, not that it
+failed. What the small-pool win coincides with is also unflattering: heavy repetition, an
+episode-blind time-kernel baseline that is *biased* on a small heterogeneous pool, and a
+credited channel that was blind there -- leaving the dense progress reward as the only
+plausible teacher, which pool size does not obviously buy. `held128` exists to separate
+these: it is the first arm whose `eval/*` is a genuine generalisation signal.
+
+## Resuming an interrupted run (2026-08-15)
+
+RL cycles are spiky in memory and this fleet has now been killed twice mid-run, so the
+driver checkpoints the pieces a restart cannot reconstruct and picks them up automatically:
+
+    save_rl_state / load_rl_state    rl_state.pt next to the weights: schema, global_cycle,
+                                     and the ADVANTAGE BUFFER (`trajectory_list`, n_adv~256)
+    emergency_checkpoint             a `checkpoint_<cycle>_crash` written from the driver's
+                                     BaseException handler, then the exception re-raised
+
+Point `training.checkpoint` at a checkpoint dir and the run resumes at the next cycle with
+the buffer restored; absent or unreadable state reads as `(0, [])`, so nothing changes for a
+fresh run. Two details are deliberate. The buffer is written **first** -- it is driver-side,
+needing no actors, no GPU and no collective, so it survives the failures that make the
+weight save itself hang (the weight `ray.get` carries a 180 s timeout for the same reason).
+And the buffer matters: it is the advantage baseline's entire memory, so resuming without it
+restarts credit assignment from an empty baseline while the weights carry on.
+
+Verified end to end rather than by inspection: an uninterrupted run wrote buffers 16/32/48
+at checkpoints 0/1/2; a run killed after cycle 1 and resumed printed `resuming: cycle 2,
+advantage buffer 32 episodes` and wrote a `checkpoint_2` carrying 48 -- the same state the
+uninterrupted run had at that cycle.
