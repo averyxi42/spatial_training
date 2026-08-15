@@ -1,0 +1,154 @@
+# @package _global_
+# Flow-SDE RL, frozen head + merged base, at the CALIBRATED exploration scale.
+#
+# Two changes from flow_sde_freezehead_overfit32, and only two:
+#   * sde_noise_a 0.15 -> 0.9
+#   * learning_rate 2e-5 -> 2e-6, the standard rate (`hapo`'s default; the 1x that every
+#     earlier run is quoted against, and the 10x twins were 2e-5).
+# Everything else -- pool, budget, reward, templates, frozen head, merged base, ref-KL
+# gauge -- is inherited unchanged so the comparison against that run is clean.
+#
+# WHY a=0.9 (docs/FLOW_SDE_RL.md, the noise-scale calibration):
+#   measured on this exact checkpoint and pool, success by `a` --
+#     ODE 0.78 | 0.15 -> 0.81 | 0.30 -> 0.87 | 0.50 -> 0.82 | 0.70 -> 0.81
+#              | 1.00 -> 0.75 (sd 0.123) | 1.50 -> 0.62 | 2.00 -> 0.27 | 3.00 -> 0.04
+#   Competence is flat to a=0.7 and still near baseline at 1.0; the first real warning is
+#   the 5x jump in per-pass SPREAD at 1.0, which is the decoder failing on some draws
+#   before it fails on average. 0.9 sits just inside that shoulder: the most exploration
+#   this checkpoint demonstrably tolerates, without stepping onto the rung where variance
+#   turned unstable. IT IS INTERPOLATED, NOT MEASURED -- 0.7 and 1.0 were measured, 0.9
+#   was not. If cycle-0 rollout success comes in materially below ~0.75, the shoulder is
+#   closer than the ladder suggested; drop to 0.7 (measured clean) rather than tuning
+#   anything else first.
+#
+# WHAT THIS RUN CANNOT BE EXPECTED TO FIX. The same calibration showed per-episode outcome
+# variance is FLAT across the whole survivable plateau -- a=0.7 matches the pure-ODE arm's
+# z_0 scatter exactly. The chain gradient reaches h only through the eps-advantage
+# correlation, so raising `a` inside the plateau does not by itself open the credited
+# channel. This run is therefore a NECESSARY-CONDITION run: it removes an
+# over-conservative exploration setting that was never justified by measurement, at a
+# saner lr than the twin that decayed. If it is still flat, the deficit is in the credit
+# path (per-UID baseline on this heterogeneous fixed pool, reward shape, or a critic) --
+# and the one untested exploration gamble left is a=1.5, the only rung supplying more
+# outcome variance than z_0 does, at a real competence cost (see the doc).
+#
+# LAUNCH (from /Projects/spatial_training, after `ray stop --force`):
+#
+#   python3 -m longnav.scripts.train_eval_rl +training=hapo +resources=octo \
+#       +experiment=flow_sde_freezehead_a09 resources.vlm_conda_env=longnav_vlm
+#
+# READ AT CYCLE 0:
+#   * ref/kl_k1 ~ ref/kl_k2 ~ 0 -- else the merge or the reference is broken.
+#   * rollout/success ~ 0.75-0.85. Below that, see the a=0.9 note above.
+#   * chain/h_drift_from_init exactly 0 for the first step or two (fresh LoRA is B=0).
+#   * `blind_run` / `reward_lost` in the env info: the reward-lost gate (25 steps, now
+#     the default) is ACTIVE in this run and was not in the freeze-head twin. It ends
+#     1S7LAXRdDqK:48 early instead of spending a full budget on a zero-signal episode,
+#     so it changes TRAINING composition -- it does NOT raise the eval ceiling. That
+#     episode is still drawn into the fixed eval set every cycle and still fails
+#     (measured 0/75), so the EVAL ceiling stays 23/24 = 0.958. An earlier revision of
+#     this header claimed 1.0; that was wrong.
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  # The SFT LoRA baked into the base: the base model IS the SFT policy, the trainable
+  # LoRA is a fresh zero-delta, and peft's disable_adapter() is therefore an exact
+  # reference to SFT (what makes rl_config.ref_kl meaningful).
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000/adapter
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000
+    gap: 10
+    sde_n: 3
+    # THE CHANGE. See the header for the measured ladder this comes from.
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+
+sim:
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train8x4
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 0.4
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: false
+  # Explicit rather than inherited-by-default, because it changes what the pool IS:
+  # an episode whose geodesic goes permanently non-finite is unmeasurable, not hard.
+  reward_lost_steps: 25
+
+rollout:
+  max_steps: 175
+  # Byte-identical to the SFT corpus format; the leading assistant echo in the turn
+  # template is load-bearing (see flow_sde_objectnav_v3.yaml's header for the numbers).
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  # No adapter load: the SFT policy is merged into the base above. Pointing this at the
+  # merged adapter applies the delta twice and setup_training refuses it by path.
+  checkpoint: null
+  load_optim: false
+  load_sched: false
+  # THE OTHER CHANGE: back to the standard rate -- `hapo`'s 2e-6, the 1x every earlier
+  # run is quoted against (the 10x twins were 2e-5). The twins showed 10x eventually
+  # degrades even with the head frozen; this run buys its exploration from `a`, not lr.
+  learning_rate: 2.0e-6
+  # THE FREEZE, unchanged: gradients flow THROUGH the frozen h->chain codec into the
+  # LoRA, but the codec itself is pinned to SFT. AdamW scales decay by lr, so 0 is a
+  # true freeze with no decay bleed.
+  action_head_learning_rate: 0.0
+  grad_accum_steps: 2
+  max_grad_norm: 20.0
+  rl_config:
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    # The tether, still MEASURE-ONLY. The twin's k1 sat ~1.6 while eval was flat and
+    # climbed to ~2.5 exactly as eval decayed, so it is a demonstrated leading
+    # indicator on this stack -- and ~1.6 is the scale to set ref_kl_coeff from if the
+    # leash is ever armed. k2 (quadratic) replaces the k3 exponential, which spiked 57x
+    # off one buffer-aged tail sample.
+    ref_kl: true
+    ref_kl_coeff: 0.0
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "flow_sde_freezehead_a09"   # change per run to prevent local/wandb conflicts
+  output_dir: /Projects/spatial_training/dump/flow_rl
+  subset_label: "everything"
+  shard_size: 0
+  eval_every: 4
+  eval_set_size: 32
+  eval_ode: true
