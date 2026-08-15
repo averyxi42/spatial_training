@@ -142,6 +142,12 @@ Two things follow, and the second is the one that matters:
 To settle it empirically rather than by argument, run the same episode subset both ways and
 compare paired outcomes; nobody has done that yet.
 
+**FOR FUTURE CORRECTION.** The eval harness should load the merged repo as the base and
+apply the RL adapter directly, instead of rank-stacking two LoRAs over the raw base. The
+stacking exists only because the RL run merges its base in memory and saves a delta-only
+adapter; it buys nothing and costs faithfulness. This is the concrete form of the
+long-standing objection to the two-adapter design.
+
 ## Uploading
 
 ```python
