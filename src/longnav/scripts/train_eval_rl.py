@@ -7,9 +7,14 @@ train_rl.py plus a periodic in-loop evaluation pass, controlled by four task fie
   task.eval_set_size   FIXED eval set size; 0 = n_rollout (default 0)
   task.eval_seed       seed for drawing the eval set from the training pool (default 0)
   task.eval_ode        run the chain head as the pure ODE during eval (default true)
+  task.eval_uids_file  PIN the eval set to a file of uids instead of drawing it (default
+                       none). With sim.train_uids naming a disjoint set, this is what makes
+                       eval genuinely held out rather than drawn from the training pool --
+                       see docs/TRAINING_EVAL_SET.md.
 
 Design decisions, each load-bearing:
-  * The eval set is FIXED and seeded, drawn once from the pool the sims already parsed,
+  * The eval set is FIXED -- seeded and drawn once from the pool the sims already parsed,
+    or pinned verbatim by task.eval_uids_file --
     and partitioned across sims to run to exhaustion -- consecutive eval points are
     PAIRED on identical episodes, which is what buys resolution at small n (a fresh
     random sample each time would bury real movement under episode variance).
