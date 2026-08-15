@@ -30,7 +30,7 @@ simply impossible; they are counted and stepped over instead.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import os
@@ -64,6 +64,7 @@ class ContinuousObjectNavEnvActor:
         success_reward: float = 0.0,
         escape_penalty: float = 0.0,
         reward_lost_steps: int = 25,
+        exclude_categories: Optional[Sequence[str]] = None,
         seed: Optional[int] = None,
         logging_output_dir: Optional[str] = None,
         logger_actor: Any = None,
@@ -114,6 +115,14 @@ class ContinuousObjectNavEnvActor:
         # ticks, not tens of steps, so 25 steps (10 s of sim) is far above their scale.
         # 0 disables.
         self.reward_lost_steps = int(reward_lost_steps)
+        # Goal categories to drop from this actor's pool entirely. EMPTY BY DEFAULT, and
+        # the empty case is not merely a no-op filter -- `_load_episodes` skips the pass
+        # outright, so a run without it loads exactly the episodes it always did.
+        # Motivating case: `plant` is often mislabelled in HM3D, so a policy is punished
+        # for not finding a thing that is not there.
+        self._exclude_categories = frozenset(
+            c.strip().lower() for c in (exclude_categories or ()) if c and c.strip()
+        )
         # The SFT rejection thresholds, verbatim; imported here so a stale fork of the
         # numbers cannot drift from the corpus generator's.
         from continuous_demos.drive_failure import DriveFailureConfig
@@ -592,6 +601,27 @@ class ContinuousObjectNavEnvActor:
         episodes = list(source.load())
         if self._shard is not None:
             episodes = self._select(episodes, self._shard)
+        # AFTER `_select`, deliberately. `_select` RAISES on a shard uid it cannot resolve,
+        # so filtering first would turn a blacklisted-but-listed uid into a hard crash
+        # instead of a quiet exclusion. Filtering here also keeps shard assignment itself
+        # untouched: shards stay whatever the driver dealt, they just serve fewer episodes.
+        if self._exclude_categories:
+            before = len(episodes)
+            episodes = [
+                e for e in episodes
+                if (getattr(e, "object_category", None) or "").strip().lower()
+                not in self._exclude_categories
+            ]
+            dropped = before - len(episodes)
+            if not episodes:
+                raise ValueError(
+                    f"exclude_categories={sorted(self._exclude_categories)} removed all "
+                    f"{before} episodes from this actor's pool ({self.episodes_path}). "
+                    "An empty pool would silently read as an exhausted shard."
+                )
+            print(f"[env] exclude_categories={sorted(self._exclude_categories)}: "
+                  f"dropped {dropped}/{before} episodes, {len(episodes)} remain",
+                  flush=True)
         self._episodes = episodes
         self._reshuffle()
 

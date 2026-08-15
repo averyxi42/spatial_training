@@ -98,6 +98,22 @@ class ContinuousObjectNavEnvConfig:
     # caps the pool's reachable success. Transient snap dropouts last ticks, so 25 steps
     # (10 s of sim) sits far above their scale. 0 disables (pre-2026-08-14 behaviour).
     reward_lost_steps: int = 25
+    # Goal categories dropped from the pool entirely, e.g. ["plant"]. EMPTY BY DEFAULT.
+    # `plant` in particular is often mislabelled in HM3D, so the policy is charged for
+    # failing to find something that is not there.
+    #
+    # Interactions, all deliberate:
+    # * applied AFTER shard resolution, so a shard uid naming an excluded episode is
+    #   still resolvable (`_select` RAISES on unresolved uids) -- it is dropped, not fatal;
+    # * `list_episode_uids` therefore reports the FILTERED pool, so `build_eval_partition`
+    #   draws its fixed eval set from it too. Train and eval stay consistent within a run,
+    #   but two runs with different exclusions DO NOT share an eval set and their numbers
+    #   are not comparable;
+    # * orthogonal to reachability screening (`_next_admissible_episode`): excluded
+    #   episodes never reach the screener, so the `skipped_so_far` reason codes keep
+    #   counting genuine navmesh failures only;
+    # * emptying a pool raises rather than reading as an exhausted shard.
+    exclude_categories: Optional[List[str]] = None
     # None (the RL default) = a distinct per-worker seed, the discrete env's ep_seed
     # pattern; set an explicit int to reproduce an exact episode stream (eval).
     seed: Optional[int] = None
