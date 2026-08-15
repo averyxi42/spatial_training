@@ -1520,8 +1520,13 @@ class VLMTrainingMixin:
         sched_path = os.path.join(path, "scheduler.pt")
         if os.path.exists(sched_path) and load_sched:
             print("loading scheduler!")
-            sched_state = torch.load(sched_path, map_location=self.accelerator.device)
-            self.scheduler.load_state_dict(sched_state,weights_only=True)
+            # `weights_only` is a torch.load kwarg and was being passed to
+            # load_state_dict, which AcceleratedScheduler does not accept -- so
+            # load_sched=True raised TypeError on every resume. It defaults False, so
+            # nothing exercised it until the 2026-08-15 resume work.
+            sched_state = torch.load(sched_path, map_location=self.accelerator.device,
+                                     weights_only=True)
+            self.scheduler.load_state_dict(sched_state)
             print(" -> Scheduler loaded.")
 
 class DataGenerator:

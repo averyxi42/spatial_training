@@ -56,7 +56,7 @@ def main(cfg: RLConfig):
         run_rollout_cycle,
         run_training_epochs,
         stream_results_and_log,
-    )
+     load_rl_state, emergency_checkpoint)
     from verl.trainer.ppo.core_algos import get_adv_estimator_fn
 
     advantage_estimator_fn = get_adv_estimator_fn(cfg.training.rl_config.advantage_estimator)
@@ -85,7 +85,13 @@ def main(cfg: RLConfig):
     with open(os.path.join(run_dir, "eval_set_uids.txt"), "w") as f:
         f.write("\n".join(eval_uids) + "\n")
 
-    trajectory_list = []
+    # RESUME. `training.checkpoint` already restores weights (and optimizer/scheduler
+    # when load_optim/load_sched are set); rl_state.pt next to it carries the DRIVER's
+    # state -- the advantage buffer and the cycle counter. Absent file => (0, []), i.e.
+    # an ordinary launch is byte-identical to before.
+    start_cycle, trajectory_list = load_rl_state(tcfg.training.checkpoint)
+    global_cycle = start_cycle          # defined before the loop so a fault during
+                                        # setup still names a cycle in the crash dir
 
     def cleanup():
         for trainer in trainers:
@@ -97,7 +103,7 @@ def main(cfg: RLConfig):
         ray.shutdown()
 
     try:
-        for global_cycle in range(num_rollouts):
+        for global_cycle in range(start_cycle, num_rollouts):
             # ------------------------- interleaved eval pass -------------------------
             if eval_every > 0 and global_cycle % eval_every == 0:
                 logger.info(f"Eval pass @ cycle {global_cycle}")
@@ -130,8 +136,20 @@ def main(cfg: RLConfig):
                                    logger, log_list)
 
             maybe_checkpoint(trainers, global_cycle, tcfg.training.save_step,
-                             tcfg.task.output_dir, tcfg.task.run_name)
+                             tcfg.task.output_dir, tcfg.task.run_name,
+                             trajectory_list=trajectory_list)
             del model_inputs
+    except BaseException as exc:
+        # FAULT PATH. Save before teardown: an OOM or a dead rank otherwise costs every
+        # cycle since the last save_step boundary. Re-raises, so the real traceback is
+        # what the operator sees.
+        print(f"FAULT at cycle {global_cycle}: {type(exc).__name__}: {exc}", flush=True)
+        try:
+            emergency_checkpoint(trainers, global_cycle, tcfg.task.output_dir,
+                                 tcfg.task.run_name, trajectory_list)
+        except BaseException as exc2:                     # noqa: BLE001
+            print(f"emergency checkpoint itself failed: {exc2}", flush=True)
+        raise
     finally:
         cleanup()
 

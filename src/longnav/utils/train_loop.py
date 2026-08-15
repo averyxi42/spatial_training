@@ -414,12 +414,93 @@ def stream_results_and_log(
                 logger.error(f"[{completed_count}/{total_tasks}] Task failed: {e}")
 
 
+def save_rl_state(path: str, global_cycle: int, trajectory_list: list) -> None:
+    """The driver-side state a weights checkpoint does NOT contain.
+
+    `save_checkpoint_unsafe` writes the adapter, the optimizer and the scheduler -- so a
+    resume already restores the model and the optimizer moments. What it cannot see is
+    state the DRIVER owns: the advantage buffer (`trajectory_list`, the last `n_adv`
+    episodes the time-kernel baseline is fitted on) and the cycle counter. Restarting
+    without the buffer refits the baseline from empty, which is a real discontinuity in
+    the advantage scale exactly when a run is resumed -- i.e. exactly when someone is
+    trying to compare before and after.
+
+    Written next to the weights so the two cannot drift apart. Failure to write is
+    reported and swallowed: losing the buffer must never cost the checkpoint."""
+    import torch
+    try:
+        torch.save({"schema": 1, "global_cycle": int(global_cycle),
+                    "trajectory_list": trajectory_list},
+                   os.path.join(path, "rl_state.pt"))
+    except Exception as exc:                       # noqa: BLE001 -- see docstring
+        print(f"WARNING: could not write rl_state.pt to {path}: {exc}", flush=True)
+
+
+def load_rl_state(path: Optional[str]):
+    """`(next_cycle, trajectory_list)` from a checkpoint dir, or `(0, [])`.
+
+    Absent file, unreadable file or no path all mean "start fresh", so an ordinary launch
+    and a resume from a pre-2026-08-15 checkpoint take the identical path. Returns the
+    NEXT cycle to run, not the one that was saved."""
+    if not path:
+        return 0, []
+    import torch
+    f = os.path.join(path, "rl_state.pt")
+    if not os.path.exists(f):
+        return 0, []
+    try:
+        d = torch.load(f, map_location="cpu", weights_only=False)
+    except Exception as exc:                       # noqa: BLE001
+        print(f"WARNING: rl_state.pt at {path} is unreadable ({exc}); starting fresh",
+              flush=True)
+        return 0, []
+    traj = list(d.get("trajectory_list") or [])
+    cyc = int(d.get("global_cycle", -1)) + 1
+    print(f"resuming: cycle {cyc}, advantage buffer {len(traj)} episodes (from {f})",
+          flush=True)
+    return cyc, traj
+
+
+def emergency_checkpoint(trainers, global_cycle: int, output_dir: str, run_name: str,
+                        trajectory_list: Optional[list] = None,
+                        timeout_s: float = 180.0) -> Optional[str]:
+    """Save on the way DOWN, after a fault, before the actors are torn down.
+
+    Ordering is the whole point. The advantage buffer lives in the DRIVER's memory and
+    needs no actor, no GPU and no collective, so it is written FIRST -- a dead rank, a
+    wedged NCCL group or an OOM'd worker cannot cost us the thing that is cheapest to
+    keep. Only then do we ask an actor for the weights, under a timeout, because that
+    request is exactly what hangs when a rank has died (observed 2026-08-15: an OOM took
+    rank 4's process group with it and the driver sat on a ray.get that never returned).
+
+    Everything here is best-effort and swallows its own failures: a crash handler that
+    raises replaces the real traceback with its own."""
+    path = os.path.join(output_dir, run_name, "checkpoints", f"checkpoint_{global_cycle}_crash")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"emergency checkpoint: cannot create {path}: {exc}", flush=True)
+        return None
+    if trajectory_list is not None:
+        save_rl_state(path, global_cycle, trajectory_list)     # driver-side, no actors
+        print(f"emergency: advantage buffer saved ({len(trajectory_list)} episodes)", flush=True)
+    try:
+        ray.get(trainers[0].save_checkpoint_unsafe.remote(path), timeout=timeout_s)
+        print(f"emergency: weights saved -> {path}", flush=True)
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"emergency: weights NOT saved ({type(exc).__name__}: {exc}); "
+              f"the buffer at {path} still pairs with the last periodic checkpoint",
+              flush=True)
+    return path
+
+
 def maybe_checkpoint(
     trainers,
     global_cycle: int,
     save_step: int,
     output_dir: str,
     run_name: str,
+    trajectory_list: Optional[list] = None,
 ) -> None:
     """Matches train_rl.py L294-300. Gated independently from
     `stream_results_and_log` since checkpointing happens every `save_step`
@@ -427,10 +508,11 @@ def maybe_checkpoint(
     steps_until_save = (global_cycle + 1) % save_step
     if steps_until_save == 0:
         print("saving checkpoiutsnt")
-        ray.get(
-            trainers[0].save_checkpoint_unsafe.remote(
-                os.path.join(output_dir, run_name, "checkpoints", f"checkpoint_{global_cycle}")
-            )
-        )
+        ckpt_dir = os.path.join(output_dir, run_name, "checkpoints",
+                                f"checkpoint_{global_cycle}")
+        ray.get(trainers[0].save_checkpoint_unsafe.remote(ckpt_dir))
+        # None (the default) keeps the pre-2026-08-15 behaviour exactly: weights only.
+        if trajectory_list is not None:
+            save_rl_state(ckpt_dir, global_cycle, trajectory_list)
     else:
         print(f"T-{steps_until_save} steps until checkpoint!")
