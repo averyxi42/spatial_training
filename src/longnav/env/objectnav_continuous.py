@@ -656,9 +656,11 @@ class ContinuousObjectNavEnvActor:
                 raise ValueError(
                     f"train_uids matched none of this actor's {len(idx)} episodes; "
                     "an empty training order would read as an exhausted shard")
-            if len(keep) != len(self._train_uids):
-                print(f"[env] train_uids: {len(keep)} of {len(self._train_uids)} "
-                      f"requested uids present in the pool", flush=True)
+            # Printed on EVERY reshuffle, not only on a mismatch. A held-out run's whole
+            # claim is that training never sees the eval episodes, and silence is not
+            # evidence of that -- it reads identically to a filter that never ran.
+            print(f"[env] train_uids: serving {len(keep)} of this actor's {len(idx)} "
+                  f"episodes ({len(self._train_uids)} uids requested)", flush=True)
             idx = keep
         self._order = [int(i) for i in self._rng.permutation(len(idx))]
         self._order = [idx[i] for i in self._order]
