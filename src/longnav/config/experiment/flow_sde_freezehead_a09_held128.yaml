@@ -1,0 +1,162 @@
+# @package _global_
+# Flow-SDE RL, frozen head + merged base, a=0.9 -- 128 TRAINING EPISODES, HELD-OUT EVAL.
+#
+# TWO CHANGES from flow_sde_freezehead_a09_fullpool, both about what is trained on:
+#   sim.train_uids       restricts the TRAINING stream to 128 uids (the pool stays the
+#                        full v1_train100x80, see below for why)
+#   task.eval_uids_file  pins the eval set to the 26 uids the fullpool run evaluated on,
+#                        which are DISJOINT from the 128
+#
+# WHY. The fullpool run (8000 episodes) showed no gain in either the ODE or the a=0.9
+# readout after 55 cycles; the a09 run (24 episodes, 4 scenes) did gain on held-out val
+# scenes. 128 sits between them, and until now no run could tell learning from
+# memorisation because the eval set was drawn FROM the training pool -- quasi-held-out at
+# best, and on a small pool a training-set metric outright. Here training never serves an
+# eval episode, so `eval/*` is a real generalisation signal for the first time.
+#
+# THE EVAL SET IS PINNED, NOT REDRAWN. It is the fullpool run's own set
+# (`dump/eval_system/episode_sets/fullpool_evalset_servable26.txt`), so this run's curve is
+# directly comparable to that one's and to the 8-pass SFT baseline measured on it:
+# ODE 0.6635 +/- 0.0448 success, 0.3823 +/- 0.0516 oSPL (see docs/TRAINING_EVAL_SET.md).
+# A redrawn set would have thrown that baseline away.
+#
+# WHY THE POOL STAYS 8000. Uids are `scene:episode_id#occurrence` and the occurrence
+# counter is assigned per shard FILE, so a 154-episode derived dataset would renumber them
+# and silently invalidate every pinned uid -- including the eval set's. Restricting the
+# stream over the intact pool keeps every uid meaning what it meant. It also leaves the
+# eval episodes IN the pool, which is what lets `run_eval_cycle` reach them: the filter is
+# skipped whenever an explicit shard is assigned, and eval is the only thing that assigns
+# one. (`task.shard_size` must therefore stay 0; the driver refuses otherwise.)
+#
+# THE 128 ARE BALANCED, not a uniform draw -- at n=128 from 7397, chance alone swings a
+# category between 15 and 35. Stratified over goal category x geodesic tercile, breaking
+# ties toward the least-picked scene, by
+# `dump/eval_system/episode_sets/mk_trainset128.py` (seed 0, deterministic):
+#   categories  chair 27 / bed 26 / toilet 26 / sofa 25 / tv_monitor 24  (plant excluded)
+#   scenes      all 80, 32 scenes x1 + 48 x2
+#   geodesic    42/43/43 across terciles cut at 4.85 m and 8.27 m, mean 7.49 m
+#              (the pinned eval 26 mean 8.10 m, so eval is slightly the harder set)
+# Screening removes ~19% at serve time, so expect ~104 of the 128 actually served; the
+# first cycle's `[env] train_uids:` line reports the real number.
+#
+# NOT CHANGED, so the pool remains the only variable against fullpool: success_reward
+# stays 0.0, a stays 0.9, lr stays 2e-6, exclude_categories stays [plant] (it applies to
+# the pool, hence to the eval set too -- the pinned 26 already carry no plant).
+
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  # The SFT LoRA baked into the base: the base model IS the SFT policy, the trainable
+  # LoRA is a fresh zero-delta, and peft's disable_adapter() is therefore an exact
+  # reference to SFT (what makes rl_config.ref_kl meaningful).
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000/adapter
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000
+    gap: 10
+    sde_n: 3
+    # THE CHANGE. See the header for the measured ladder this comes from.
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+
+sim:
+  # 8000 episodes over 80 HM3D TRAIN scenes, scene-disjoint from val (and therefore from
+  # sample101/sample400) by construction.
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train100x80
+  # HM3D `plant` labels are frequently wrong; excluded so the policy is not charged for
+  # failing to find something that is not there. ~571 of 8000 episodes. TRAINING ONLY --
+  # the eval harness still scores every category, so held-out numbers stay comparable
+  # with every historical result.
+  exclude_categories: [plant]
+  # TRAINING STREAM ONLY -- the pool, and therefore the eval set, is untouched. See the
+  # header for why this is a uid filter over the full pool rather than a smaller dataset.
+  train_uids: /Projects/spatial_training/dump/eval_system/episode_sets/trainset128.txt
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 0.4
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: false
+  # Explicit rather than inherited-by-default, because it changes what the pool IS:
+  # an episode whose geodesic goes permanently non-finite is unmeasurable, not hard.
+  reward_lost_steps: 25
+
+rollout:
+  max_steps: 175
+  # Byte-identical to the SFT corpus format; the leading assistant echo in the turn
+  # template is load-bearing (see flow_sde_objectnav_v3.yaml's header for the numbers).
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  # No adapter load: the SFT policy is merged into the base above. Pointing this at the
+  # merged adapter applies the delta twice and setup_training refuses it by path.
+  checkpoint: null
+  load_optim: false
+  load_sched: false
+  # THE OTHER CHANGE: back to the standard rate -- `hapo`'s 2e-6, the 1x every earlier
+  # run is quoted against (the 10x twins were 2e-5). The twins showed 10x eventually
+  # degrades even with the head frozen; this run buys its exploration from `a`, not lr.
+  learning_rate: 2.0e-6
+  # THE FREEZE, unchanged: gradients flow THROUGH the frozen h->chain codec into the
+  # LoRA, but the codec itself is pinned to SFT. AdamW scales decay by lr, so 0 is a
+  # true freeze with no decay bleed.
+  action_head_learning_rate: 0.0
+  grad_accum_steps: 2
+  max_grad_norm: 20.0
+  rl_config:
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    # The tether, still MEASURE-ONLY. The twin's k1 sat ~1.6 while eval was flat and
+    # climbed to ~2.5 exactly as eval decayed, so it is a demonstrated leading
+    # indicator on this stack -- and ~1.6 is the scale to set ref_kl_coeff from if the
+    # leash is ever armed. k2 (quadratic) replaces the k3 exponential, which spiked 57x
+    # off one buffer-aged tail sample.
+    ref_kl: true
+    ref_kl_coeff: 0.0
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "flow_sde_a09_held128"   # change per run to prevent local/wandb conflicts
+  output_dir: /Projects/spatial_training/dump/flow_rl
+  subset_label: "everything"
+  shard_size: 0
+  eval_every: 4
+  eval_set_size: 32          # ignored when eval_uids_file is set; kept for the record
+  # The fullpool run's own eval set, pinned so the curve is comparable to that run and to
+  # the 8-pass SFT baseline in docs/TRAINING_EVAL_SET.md. Disjoint from train_uids.
+  eval_uids_file: /Projects/spatial_training/dump/eval_system/episode_sets/fullpool_evalset_servable26.txt
+  eval_ode: true

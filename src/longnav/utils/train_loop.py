@@ -144,16 +144,30 @@ def run_rollout_cycle(
     return traj_batch, model_inputs, values, distances, log_list
 
 
-def build_eval_partition(sims, set_size: int, seed: int):
+def build_eval_partition(sims, set_size: int, seed: int, uids: Optional[List[str]] = None):
     """Draw the FIXED eval set once (seeded, from the pool the sims already parsed) and
     partition it round-robin across sims. Fixed set => consecutive eval points are PAIRED
     on identical episodes; a fresh random sample each cycle would bury real movement
     under episode variance (measured: block-50 sd 0.063 at p=0.71)."""
-    uids = sorted(ray.get(sims[0].list_episode_uids.remote()))
-    rng = np.random.default_rng(seed)
-    k = min(set_size, len(uids))
-    chosen = sorted(rng.choice(len(uids), size=k, replace=False).tolist())
-    eval_uids = [uids[i] for i in chosen]
+    pool = sorted(ray.get(sims[0].list_episode_uids.remote()))
+    if uids:
+        # PINNED set: use it verbatim, in the given order. A redrawn set is a different
+        # set -- change the pool, the filter, the size or the seed and every historical
+        # number on it becomes incomparable in silence. Pinning is how a run's eval
+        # survives those changes, and how an eval set can be HELD OUT of training
+        # (see the env's `train_uids`).
+        eval_uids = [u for u in uids if u]
+        missing = [u for u in eval_uids if u not in set(pool)]
+        if missing:
+            raise KeyError(
+                f"{len(missing)} pinned eval uid(s) are not in this pool "
+                f"(e.g. {missing[:3]}). The pool must CONTAIN the eval episodes even "
+                "when training never serves them.")
+    else:
+        rng = np.random.default_rng(seed)
+        k = min(set_size, len(pool))
+        chosen = sorted(rng.choice(len(pool), size=k, replace=False).tolist())
+        eval_uids = [pool[i] for i in chosen]
     parts = [eval_uids[i::len(sims)] for i in range(len(sims))]
     return eval_uids, parts
 

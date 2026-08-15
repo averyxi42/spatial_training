@@ -67,7 +67,15 @@ def main(cfg: RLConfig):
         # dataclasses.replace on the frozen SDEConfig, installed on every head instance.
         ray.get([t.set_sde_noise_a.remote(float(a)) for t in trainers])
 
-    arms = [("ode", None)] + [(f"sde_a{a:g}", a) for a in A_LADDER]
+    # PROBE_ODE=0 skips the ODE arm. Worth skipping whenever a training run is already
+    # evaluating the same fixed partition with `eval_ode: true` -- that series IS the ODE
+    # arm, and re-measuring it costs a pass per rep while the informative arm waits. Keep
+    # it when you need a tight FIXED-checkpoint ODE estimate (the eval series mixes
+    # checkpoints, so its scatter is policy change plus noise).
+    arms = ([("ode", None)] if os.environ.get("PROBE_ODE", "1") != "0" else []) \
+        + [(f"sde_a{a:g}", a) for a in A_LADDER]
+    if not arms:
+        raise SystemExit("no arms: PROBE_ODE=0 with an empty PROBE_A leaves nothing to run")
     outcomes = defaultdict(lambda: defaultdict(list))   # arm -> uid -> [0/1,...]
     tick = 0
     try:

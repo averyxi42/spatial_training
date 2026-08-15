@@ -65,6 +65,7 @@ class ContinuousObjectNavEnvActor:
         escape_penalty: float = 0.0,
         reward_lost_steps: int = 25,
         exclude_categories: Optional[Sequence[str]] = None,
+        train_uids: Optional[Any] = None,
         seed: Optional[int] = None,
         logging_output_dir: Optional[str] = None,
         logger_actor: Any = None,
@@ -120,6 +121,19 @@ class ContinuousObjectNavEnvActor:
         # outright, so a run without it loads exactly the episodes it always did.
         # Motivating case: `plant` is often mislabelled in HM3D, so a policy is punished
         # for not finding a thing that is not there.
+        # Restrict the TRAINING stream to these uids (a list, or a path to a
+        # comma/newline-separated file). The pool itself is untouched, which is the
+        # point: uids are occurrence-counted per shard file, so building a smaller
+        # DATASET would renumber them and silently break any pinned eval set. Applies
+        # only when no explicit shard is assigned -- `run_eval_cycle` assigns eval uids
+        # and restores with `assign_shard(None)`, so eval still reaches episodes that
+        # training never serves. That is what makes a disjoint held-out eval possible.
+        self._train_uids = None
+        if train_uids:
+            if isinstance(train_uids, str):
+                raw = open(train_uids).read()
+                train_uids = [u.strip() for u in raw.replace("\n", ",").split(",")]
+            self._train_uids = frozenset(u for u in train_uids if u)
         self._exclude_categories = frozenset(
             c.strip().lower() for c in (exclude_categories or ()) if c and c.strip()
         )
@@ -632,7 +646,22 @@ class ContinuousObjectNavEnvActor:
         amortizes those. `self._rng` persists across passes, so pass k+1 is a NEW
         permutation (an RL actor must not replay the identical order every cycle), while an
         explicit `seed` still reproduces the whole stream."""
-        self._order = [int(i) for i in self._rng.permutation(len(self._episodes))]
+        idx = list(range(len(self._episodes)))
+        # Training-stream restriction (see __init__). `_shard is None` IS the training
+        # case; an assigned shard is an eval pass and must serve exactly what it was
+        # given, so the filter is skipped there.
+        if self._train_uids is not None and self._shard is None:
+            keep = [i for i in idx if self._episodes[i].uid in self._train_uids]
+            if not keep:
+                raise ValueError(
+                    f"train_uids matched none of this actor's {len(idx)} episodes; "
+                    "an empty training order would read as an exhausted shard")
+            if len(keep) != len(self._train_uids):
+                print(f"[env] train_uids: {len(keep)} of {len(self._train_uids)} "
+                      f"requested uids present in the pool", flush=True)
+            idx = keep
+        self._order = [int(i) for i in self._rng.permutation(len(idx))]
+        self._order = [idx[i] for i in self._order]
         self._cursor = 0
 
     def _select(self, episodes: List[Any], wanted: List[str]) -> List[Any]:

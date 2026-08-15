@@ -238,6 +238,11 @@ class RunConfig:
     eval_every: int = 4
     eval_set_size: int = 0
     eval_seed: int = 0
+    #: Path to a file of eval uids (comma or newline separated). When set, the eval
+    #: partition is these episodes verbatim instead of a seeded draw from the pool --
+    #: which is what lets an eval set stay FIXED across runs whose pools differ, and what
+    #: lets it be held out of training via the env's `train_uids`.
+    eval_uids_file: Optional[str] = None
     eval_ode: bool = True
 
 # --- ROOT CONFIGs ---

@@ -61,11 +61,48 @@ outcome-uncertain episodes (17/26 vs 10/26) and raises per-episode outcome varia
 over the ODE floor. On the 24-episode/4-scene pool the same statistic was flat -- see the
 2026-08-15 correction in `FLOW_SDE_RL.md`. Baselines and channel diagnostics are per-pool.
 
-## Fixing the set at training time (not implemented)
+## Holding the set out of training (implemented 2026-08-15)
 
-The env serves episodes from the whole pool, including the eval uids. Excluding
-`fullpool_evalset_servable26.txt` from the training stream -- a filter in
-`ContinuousObjectNavEnvActor._load_episodes`, alongside the existing `exclude_categories`
-pass -- would make the in-training curve a clean generalisation signal rather than a
-quasi-held-out one, at the cost of 26 episodes of training data out of 7429. The uid files
-above exist so that change has something stable to reference.
+Two settings, and a run needs BOTH -- one without the other silently gives you the old
+quasi-held-out arrangement under a new name.
+
+    sim.train_uids       restrict the TRAINING stream to these uids (list, or a file path)
+    task.eval_uids_file  pin the eval set to these uids verbatim, instead of drawing it
+
+`train_uids` filters in `_reshuffle` and **only when no explicit shard is assigned**. That
+is what keeps the two compatible: training runs on the trivial (`None`) shard, while
+`run_eval_cycle` assigns explicit eval shards and restores `assign_shard(None)` afterwards,
+so eval still reaches episodes training never serves. The driver **refuses to start** if
+`train_uids` is set with `task.shard_size > 0`, because an explicitly sharded run would
+bypass the filter and quietly train on the whole pool.
+
+`eval_uids_file` makes `build_eval_partition` use the file's uids in order and raise on any
+uid absent from the pool. The pool must therefore still CONTAIN the eval episodes -- which
+is why the eval set is held out by restricting the training stream rather than by shrinking
+the dataset. Uids are `scene:episode_id#occurrence` and the occurrence counter is assigned
+per shard FILE, so a derived subset renumbers them and invalidates every pinned uid.
+
+First run to use them: `flow_sde_freezehead_a09_held128` (128 balanced training episodes,
+this file's pinned 26 as a genuinely held-out eval). Pure-logic tests, no simulator, in
+`tests/test_held_out_eval.py`.
+
+## `trainset128` (2026-08-15)
+
+128 training uids drawn from `v1_train100x80` minus `plant` minus the 32 drawn eval uids
+(7397 remaining), by `dump/eval_system/episode_sets/mk_trainset128.py` (seed 0,
+deterministic; the file records the draw's parameters). **Stratified, not uniform** -- at
+n=128 chance alone swings a category between 15 and 35, and a training pool whose
+composition differs from the eval set's turns a delta into an artifact. Cells are goal
+category x geodesic tercile; within a cell the least-picked scene wins.
+
+| | trainset128 | pinned eval26 |
+|---|---|---|
+| categories | chair 27 / bed 26 / toilet 26 / sofa 25 / tv_monitor 24 | tv_monitor 10 / bed 6 / sofa 5 / chair 4 / toilet 1 |
+| scenes | all 80 (32 x1, 48 x2) | 23 |
+| geodesic | mean 7.49 m, 42/43/43 across terciles cut at 4.85 / 8.27 m | mean 8.10 m |
+
+The eval set is skewed because it was a uniform draw of 32 and is now pinned to stay
+comparable with the 8-pass baseline above; that is the cost of pinning, and it is the
+reason the training set is balanced instead. Screening removes ~19% at serve time, so
+expect ~104 of the 128 to be served -- the first cycle's `[env] train_uids:` line reports
+the real number.

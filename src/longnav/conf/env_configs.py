@@ -114,6 +114,20 @@ class ContinuousObjectNavEnvConfig:
     #   counting genuine navmesh failures only;
     # * emptying a pool raises rather than reading as an exhausted shard.
     exclude_categories: Optional[List[str]] = None
+    # Restrict the TRAINING episode stream to these uids (a list, or a path to a file of
+    # comma/newline-separated uids). Empty = the whole filtered pool, which is every run
+    # before 2026-08-15. Applied in `_reshuffle` and ONLY when no shard is assigned, so
+    # `run_eval_cycle` -- which assigns explicit eval shards and restores `assign_shard(None)`
+    # -- still reaches episodes training never serves. That is the point: with
+    # `task.eval_uids_file` naming a DISJOINT set, the in-training eval stops being
+    # quasi-held-out (the pool's eval episodes are trained on every len(pool)/n_rollout
+    # cycles) and becomes a real generalisation signal.
+    #
+    # Uids are `scene:episode_id[#occurrence]` and the occurrence counter is assigned per
+    # shard FILE, so a uid is only meaningful against the pool it was written from. Restrict
+    # the stream over the full pool rather than building a derived dataset -- a derived
+    # subset renumbers occurrences and silently invalidates every pinned uid.
+    train_uids: Optional[Any] = None
     # None (the RL default) = a distinct per-worker seed, the discrete env's ep_seed
     # pattern; set an explicit int to reproduce an exact episode stream (eval).
     seed: Optional[int] = None

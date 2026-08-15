@@ -78,7 +78,20 @@ def main(cfg: RLConfig):
 
     # Draw the fixed eval set up front (the sims have parsed the pool during bootstrap's
     # first reset) and log its identity so any later analysis can reproduce it.
-    eval_uids, eval_parts = build_eval_partition(sims, eval_set_size, eval_seed)
+    if getattr(tcfg.sim, "train_uids", None) and int(getattr(tcfg.task, "shard_size", 0)) > 0:
+        raise ValueError(
+            "sim.train_uids is set but task.shard_size > 0. The uid filter applies only to "
+            "the trivial (None) shard, so an explicitly sharded run would train on the WHOLE "
+            "pool while the config says otherwise -- and the eval set would no longer be "
+            "held out. Set shard_size: 0.")
+    eval_uids_file = getattr(tcfg.task, "eval_uids_file", None)
+    pinned = None
+    if eval_uids_file:
+        with open(eval_uids_file) as f:
+            pinned = [u.strip() for u in f.read().replace("\n", ",").split(",") if u.strip()]
+    eval_uids, eval_parts = build_eval_partition(sims, eval_set_size, eval_seed, uids=pinned)
+    if pinned:
+        logger.info(f"eval set: PINNED from {eval_uids_file}")
     logger.info(f"eval set: {len(eval_uids)} fixed episodes (seed {eval_seed}), "
                 f"every {eval_every} cycles, ode={eval_ode}")
     os.makedirs(run_dir, exist_ok=True)
