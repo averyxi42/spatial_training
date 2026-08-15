@@ -634,6 +634,31 @@ rather than of the sampler. Anything downstream of "the credited channel is blin
 (including the argument that dense per-step progress must be doing all the learning)
 inherits that qualifier and should be re-derived per pool before being relied on.
 
+**RETRACTION (2026-08-15, later the same day): the whole outcome-variance line of argument
+-- the original finding 3, this correction to it, and the return-variance follow-up run
+between them -- does not measure credit, and neither "blind" nor "more open" is supported
+by any of it.**
+
+The policy gradient reaches the backbone through `Cov(noise_t, A_t)`. Outcome variance is
+not that quantity and does not bound it. The counterexample is the reward on the real line
+with a fixed goal direction, `r_t = eps_t`: `E[R] = 0` for ANY noise scale, so mean return,
+return variance and flip rate are uninformative *by construction* -- while `r_t = eps_t`
+exactly, so the per-step correlation is near-maximal. Perfect credit, zero episode-level
+footprint. Our geodesic-delta reward is that, locally.
+
+What these probes actually measured is closed-loop RE-CONVERGENCE: whether a perturbed
+trajectory returns to the same endpoint. It does (per-episode return variance under a=0.9
+is 0.91x the ODE floor, 0.76x excluding escapes -- measured on the same 416 passes), while
+closest-approach variance rises 39%. The trajectories genuinely diverge and the endpoints
+do not. That is a fact about the controller, not about whether the gradient sees anything.
+
+Per-step credit was therefore never plausibly blind: noise perturbs the executed chunk,
+which mechanically changes the geodesic delta, which IS `r_t`. The real question is what
+that credit *teaches* -- see `REWARD_HORIZON_ANALYSIS.md`, which measures it and finds the
+signal loud everywhere and silent exactly where episodes are decided (failures churn
++11.7/-10.6 m to net +1.1 m, and their best moment sits 74 steps before the end, where
+gamma=0.95 has attenuated it to 0.022).
+
 **3. THE FINDING THAT MATTERS, and it is negative: the survivable range and the
 outcome-relevant range do not overlap.** Per-episode outcome variance is FLAT across the
 entire plateau -- a=0.7 (4.7x the shipped noise) produces the same 0.078 as the pure ODE
@@ -719,8 +744,10 @@ moved looks like. `ref/kl_k2` ~0.006 says the same thing from the other side.
 The honest statement is that **the large pool has not been given a fair trial**, not that it
 failed. What the small-pool win coincides with is also unflattering: heavy repetition, an
 episode-blind time-kernel baseline that is *biased* on a small heterogeneous pool, and a
-credited channel that was blind there -- leaving the dense progress reward as the only
-plausible teacher, which pool size does not obviously buy. `held128` exists to separate
+credited channel measured as blind there -- though that last reading is retracted above:
+outcome variance does not measure credit, and the per-step channel is near-mechanical.
+The live question is not whether credit flows but what it teaches
+(`REWARD_HORIZON_ANALYSIS.md`), which pool size does not obviously change. `held128` exists to separate
 these: it is the first arm whose `eval/*` is a genuine generalisation signal.
 
 ## Resuming an interrupted run (2026-08-15)
