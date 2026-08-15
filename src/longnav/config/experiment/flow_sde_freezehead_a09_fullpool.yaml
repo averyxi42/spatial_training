@@ -1,0 +1,167 @@
+# @package _global_
+# Flow-SDE RL, frozen head + merged base, a=0.9 -- ON THE FULL 8000-EPISODE POOL.
+#
+# ONE CHANGE from flow_sde_freezehead_a09: the training pool.
+#   sim.episodes  v1_train8x4 (24 servable episodes, 4 scenes)  ->  v1_train100x80
+#                 (8000 episodes, 80 scenes)
+#   plus sim.exclude_categories: [plant], a data-quality filter (HM3D `plant` labels are
+#   frequently wrong, so the policy is charged for failing to find something that is not
+#   there). ~7% of this pool. Deliberately NOT changing the reward: `success_reward`
+#   stays 0.0, so this run is comparable to a09 and the pool is the only variable.
+#
+# WHY. The a09 run trained on 24 episodes in 4 scenes and gained +0.053 oracle success /
+# +0.086 oSPL on 20 unseen val scenes (sample400, n=397, paired, McNemar p=0.021 at
+# ck391). Two things about that setup are unsatisfying and this run fixes both at zero
+# compute cost -- at 16 episodes/cycle the wall-clock per cycle is identical whatever the
+# pool size; only the revisit rate changes (~250 visits/episode there, ~0.6 here).
+#
+#   * THE ADVANTAGE BASELINE IS EPISODE-BLIND. The time-kernel baseline knows nothing
+#     about which episode a return came from, so on a small heterogeneous pool episode
+#     identity is an unremoved fixed effect -- hard episodes read as uniformly negative
+#     advantage regardless of behaviour. With episodes essentially never repeating, that
+#     bias becomes unbiased noise instead of systematic mis-credit. The big pool cures it
+#     for free; a curriculum over a small pool would make it worse.
+#   * THE CREDITED CHANNEL IS OUTCOME-BLIND (measured: per-episode outcome variance is
+#     flat across the whole survivable noise range, a=0.7 equals pure-ODE z0 scatter). So
+#     what plausibly drives learning is the DENSE per-step progress gradient, whose
+#     currency is the diversity of visited states -- and 8000 episodes over 80 scenes is
+#     far more of that than 24 episodes seen 250 times. The old pool was also badly
+#     category-skewed (bed 10 / tv_monitor 10 of 32); this one is balanced.
+#
+# WHAT THIS RUN IS FOR, precisely: (1) does it stay stable at data scale, and (2) if it
+# survives, does it beat a09 on HELD-OUT scenes. It is not expected to beat a09's
+# in-pool numbers -- it cannot memorise 8000 episodes and should not try.
+#
+# THE NUMBER TO WATCH: `eval/oracle_success` on the fixed eval partition, against its own
+# cycle-0 value. On this pool that partition is QUASI-HELD-OUT (32 episodes drawn from
+# 8000, so they recur about every 500 cycles), which means for the first time the
+# in-training eval is a live generalisation signal rather than a training-set metric.
+# a09 gained +0.10 in ~50 cycles on episodes it was training on; if the execution-gradient
+# account is right, expect roughly +0.05 here by cycle ~50. FLAT at cycle 50 with healthy
+# k2 (~0.02) would say the a09 transfer was pool-specific after all.
+#
+# STABILITY TRIPWIRES, same as a09: chain/h_drift_from_init (the twins died at -6% to
+# -13%), ref/kl_k2 (a09 settled ~0.02), train/grad_norm (~2 at this lr). ref_kl stays
+# MEASURE-ONLY; arm ref_kl_coeff only if drift runs.
+#
+# LAUNCH (from /Projects/spatial_training, after `ray stop --force`):
+#
+#   python3 -m longnav.scripts.train_eval_rl +training=hapo +resources=octo \
+#       +experiment=flow_sde_freezehead_a09_fullpool resources.vlm_conda_env=longnav_vlm
+#
+# READ AT CYCLE 0: ref/kl_k1 ~ ref/kl_k2 ~ 0 (else the merge or the reference is broken);
+# rollout/success ~ 0.75-0.85 (below that, a=0.9 is past this checkpoint's shoulder --
+# drop to 0.7, which is measured clean); h_drift exactly 0 for the first step or two.
+# Episode load is ~40 s per actor on this pool, against a few seconds on the small one --
+# expect a slower first cycle, not a hang.
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  # The SFT LoRA baked into the base: the base model IS the SFT policy, the trainable
+  # LoRA is a fresh zero-delta, and peft's disable_adapter() is therefore an exact
+  # reference to SFT (what makes rl_config.ref_kl meaningful).
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000/adapter
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000
+    gap: 10
+    sde_n: 3
+    # THE CHANGE. See the header for the measured ladder this comes from.
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+
+sim:
+  # 8000 episodes over 80 HM3D TRAIN scenes, scene-disjoint from val (and therefore from
+  # sample101/sample400) by construction.
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train100x80
+  # HM3D `plant` labels are frequently wrong; excluded so the policy is not charged for
+  # failing to find something that is not there. ~571 of 8000 episodes. TRAINING ONLY --
+  # the eval harness still scores every category, so held-out numbers stay comparable
+  # with every historical result.
+  exclude_categories: [plant]
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 0.4
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: false
+  # Explicit rather than inherited-by-default, because it changes what the pool IS:
+  # an episode whose geodesic goes permanently non-finite is unmeasurable, not hard.
+  reward_lost_steps: 25
+
+rollout:
+  max_steps: 175
+  # Byte-identical to the SFT corpus format; the leading assistant echo in the turn
+  # template is load-bearing (see flow_sde_objectnav_v3.yaml's header for the numbers).
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  # No adapter load: the SFT policy is merged into the base above. Pointing this at the
+  # merged adapter applies the delta twice and setup_training refuses it by path.
+  checkpoint: null
+  load_optim: false
+  load_sched: false
+  # THE OTHER CHANGE: back to the standard rate -- `hapo`'s 2e-6, the 1x every earlier
+  # run is quoted against (the 10x twins were 2e-5). The twins showed 10x eventually
+  # degrades even with the head frozen; this run buys its exploration from `a`, not lr.
+  learning_rate: 2.0e-6
+  # THE FREEZE, unchanged: gradients flow THROUGH the frozen h->chain codec into the
+  # LoRA, but the codec itself is pinned to SFT. AdamW scales decay by lr, so 0 is a
+  # true freeze with no decay bleed.
+  action_head_learning_rate: 0.0
+  grad_accum_steps: 2
+  max_grad_norm: 20.0
+  rl_config:
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    # The tether, still MEASURE-ONLY. The twin's k1 sat ~1.6 while eval was flat and
+    # climbed to ~2.5 exactly as eval decayed, so it is a demonstrated leading
+    # indicator on this stack -- and ~1.6 is the scale to set ref_kl_coeff from if the
+    # leash is ever armed. k2 (quadratic) replaces the k3 exponential, which spiked 57x
+    # off one buffer-aged tail sample.
+    ref_kl: true
+    ref_kl_coeff: 0.0
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "flow_sde_a09_fullpool"   # change per run to prevent local/wandb conflicts
+  output_dir: /Projects/spatial_training/dump/flow_rl
+  subset_label: "everything"
+  shard_size: 0
+  eval_every: 4
+  eval_set_size: 32
+  eval_ode: true

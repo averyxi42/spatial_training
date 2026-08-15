@@ -648,9 +648,19 @@ class VectorRolloutPolicy:
         else:
             self._merged = False
 
-        # `get_rope_index` lives on Qwen3VLModel; unwrap peft to reach it.
-        base = getattr(backbone, "base_model", backbone)
-        self.vl_for_cond_gen = getattr(base, "model", base)
+        # `get_rope_index` lives on Qwen3VLModel; unwrap peft to reach it. Unwrap by TYPE,
+        # not by attribute probing: a peft-wrapped backbone is
+        # PeftModel -> LoraModel(.base_model) -> ForConditionalGeneration(.model) -> Model,
+        # but an ADAPTER-FREE checkpoint (a merged model, which is what a published
+        # `-merged` repo is) starts one level in, and `getattr(base, "model", base)` then
+        # unwraps one level too far and hands back Qwen3VLModel, whose `.model` does not
+        # exist. That crashed every shard the first time a merged checkpoint was loaded.
+        try:
+            from peft import PeftModel
+            _is_peft = isinstance(backbone, PeftModel)
+        except Exception:
+            _is_peft = False
+        self.vl_for_cond_gen = backbone.base_model.model if _is_peft else backbone
         self.vl_model = self.vl_for_cond_gen.model
         self.language_model = self.vl_model.language_model
         # None -> torch's global RNG. `seed_stop` makes a sampled stop decision
