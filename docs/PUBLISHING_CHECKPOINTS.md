@@ -127,14 +127,17 @@ Two things follow, and the second is the one that matters:
   model already tolerates by construction. Expect the metric difference to be small. It is
   nonetheless **not measured**, so do not claim the paths are interchangeable; claim they
   are algebraically equal and numerically within bf16 store noise.
-* **The merged path is arguably the FAITHFUL one for these checkpoints.** RL runs with
-  `vlm.merge_adapter_dir` build their base by exactly this operation --
+* **The merged path IS the training path -- verified bit-identical, not merely argued.**
+  RL runs with `vlm.merge_adapter_dir` build their base by
   `PeftModel.from_pretrained(base, sft_adapter).merge_and_unload()` on the bf16 model at
-  load time (`vlm_worker.load_model`) -- so a published merged repo reproduces the base the
-  policy was TRAINED against, while stacking the two LoRAs onto the raw base does not. Our
-  own sample400 numbers were produced by the stacking path, i.e. the one that deviates from
-  training conditions by this rounding. The deviation is bf16-small, but if a published
-  number and a reproduction disagree slightly, this is the first thing to check.
+  load time (`vlm_worker.load_model`). Reproducing that on GPU (`device_map="cuda"`, as
+  training does) and comparing against the published CPU merge gives `torch.equal` **True**
+  and max |diff| **0.0** on `layers.0.{q_proj,o_proj,down_proj}` and `layers.15.q_proj` --
+  so device does not perturb the rounding, and the published repo is the base the policy
+  trained against. Stacking the two LoRAs onto the RAW base is a different base by exactly
+  the rounding above, and **that is the path our own sample400 numbers came from**. A
+  third-party running merged-repo + RL adapter is therefore closer to training conditions
+  than our reported numbers are. If a reproduction disagrees slightly, check this first.
 
 To settle it empirically rather than by argument, run the same episode subset both ways and
 compare paired outcomes; nobody has done that yet.
