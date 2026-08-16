@@ -772,3 +772,15 @@ Verified end to end rather than by inspection: an uninterrupted run wrote buffer
 at checkpoints 0/1/2; a run killed after cycle 1 and resumed printed `resuming: cycle 2,
 advantage buffer 32 episodes` and wrote a `checkpoint_2` carrying 48 -- the same state the
 uninterrupted run had at that cycle.
+
+## held128 at cycle ~400: efficiency confirmed, success null with power (2026-08-16)
+
+Full analysis in **`HELD128_RESULTS.md`** (results + the offline gamma/baseline/grouping
+studies + the mastery-rate comparison; scripts in `dump/eval_system/analysis_2026-08-16/`).
+Headlines: held-out oSPL and step count are genuinely improving (Newey-West t +5.1 / -3.6,
+block-bootstrap p <= 0.0005, paired over identical episodes) -- the ck391 motion-quality
+currency reproduced under a clean held-out protocol. Held-out **success is not moving**, and
+at 102 passes that is a powered null (2-se upper bound ~ +0.036; a ck391-sized +0.05 would
+have shown at t~3.7). Training pool is in the mastery regime (within-episode Var(return)
+declining, t=-2.45). Decision rule pre-registered in the doc: Newey-West success-slope t at
+~160 passes decides continue vs pivot to the value co-train.
