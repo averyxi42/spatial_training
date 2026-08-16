@@ -149,3 +149,15 @@ removes (1) for all future runs.
    navmesh choice must match the env: current lineage is `dataset`). Offline gate:
    held-out EV must beat the distance kernel on existing rollouts before entering
    a run at GAE lambda=1.
+
+## Verdict at the pre-registered 160-pass point (2026-08-16, cycle 648)
+
+The rule fired the CONTINUE branch, against the analyst's stated expectation: success
+slope Newey-West t = **+2.84** over 162 passes (rule: >=2 continue). Success half1
+0.679 -> half2 0.691, last-20-pass mean **0.706**; oSPL still rising (NW t +4.92,
+last-20 0.452); steps still falling (t -3.34). The "plateau" read at 130 passes was
+premature -- passes 130-162 resumed climbing, consistent with lagged conversion
+(efficiency gains converting to success within budget). Training side still
+accelerating (within-episode success t +5.1, speed t +7.3). Run continues toward the
+deep-mastery endpoint; next scheduled read at ~cycle 1150 (~1 day) with the same
+robust-trend machinery. Curriculum run deferred while this curve is still paying.
