@@ -161,3 +161,25 @@ premature -- passes 130-162 resumed climbing, consistent with lagged conversion
 accelerating (within-episode success t +5.1, speed t +7.3). Run continues toward the
 deep-mastery endpoint; next scheduled read at ~cycle 1150 (~1 day) with the same
 robust-trend machinery. Curriculum run deferred while this curve is still paying.
+
+## sample400 capstone: ck791 (2026-08-17)
+
+`checkpoint_791` (eval26 peak band, cycles ~740-800) on sample400, conditions identical to
+the ck391/baseline pair (script: `dump/eval_system/run_held128_ck791.sh`), 397 three-way
+paired: **success 0.589, oracle 0.733, SPL 0.272, oSPL 0.483** -- above the >0.70 oSR /
+>0.45 oSPL frontier bar on unseen VAL scenes, critic-free.
+
+vs baseline: oracle +0.083 (McNemar 57/24, p<0.001), oSPL +0.082 (t=+4.69) -- exceeds
+ck391's historic gain. vs ck391: >= in every metric and every category (oracle +0.030,
+p=0.126; oSPL tie), significantly better nowhere: statistical parity with a uniform
+nominal edge. The eval26 gains transferred to val essentially in full -- the
+scene-familiarity discount did not materialize.
+
+**Harness-composition trap (cost one aborted eval):** `convert_flow_rl_checkpoint` copies
+the SFT layout's `turn_vector_head_config.json` whose `model_id` is the RAW base; for a
+merged-base RL run that composes raw base + delta-only adapter, which scores near zero and
+errors nowhere (observed: 3/27, tracking 0.1-0.4 vs healthy 0.89; archived
+`s400_held128_ck791_BROKEN_rawbase`). Fix: point `model_id` at `checkpoint-12000_MERGED`
+(RL adapter then applies directly; NO rank-stack needed), and probe-verify base weights
+bit-equal + 392 lora tensors before launching. Stamped in the checkpoint's
+`conversion_manifest.json`.
