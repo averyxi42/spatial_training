@@ -89,6 +89,40 @@ is Track A anyway; (4) costs the training fleet. **Revisit only if Track A plate
 below auto-stop**, and then as a supervised-anchored auxiliary inside the next planned run
 (curriculum or critic), never standalone.
 
+## Consolidation with the critic track (2026-08-18 revision), and revised sequencing
+
+The stop head and the critic are one track approached from two ends: under the telescoped
+reward, V^pi(s) ~= d(s) - E[d_final | s, pi]. The stop head's distance regression IS the
+first (oracle-geometry) term; everything the critic wants beyond the distance kernel IS
+the second (policy) term. Build ONE state probe with two outputs, (log-d_hat, R_hat):
+stop = threshold on the first; the candidate advantage baseline = the second; the
+residual R_t - f(d_hat) is exactly the V*-vs-V^pi gap, and its explained variance from h
+answers the critic program's central unknown ("can the backbone see where the policy will
+fail"). Shared data pipeline (sidecar + rollout mining supplies BOTH labels per frame),
+shared k-fold validation harness. Distinctions kept: d(s) is policy-independent (lazy
+refresh, eval-gated); V^pi is policy-conditional (staleness = bias; strict offline gate,
+lambda=1 entry).
+
+**REVISED SEQUENCING: the training lands inside the critic-compatible SFT co-train, not
+as a standalone probe run.** Two reasons beyond GPU cost: (1) the detached-value-probe
+route was already tried and shelved (`critic-is-last-resort`: probe detached first) --
+frozen-h probing risks failing for representation reasons, and the fix in that case is
+letting the auxiliary gradients shape the backbone, which is precisely what co-training
+does; (2) the backbone forwards are the expensive part, and the next SFT co-train run
+(cotrain-v2 on the long-goal PointNav corpus, already queued) pays them anyway --
+auxiliary (d, R) heads ride at ~zero marginal cost, with `stop_grad=False` arms so the
+backbone becomes proximity- and outcome-aware rather than merely probed.
+
+What proceeds NOW (cheap, CPU, no fleet):
+* Phase 0 prize quantification from existing s400 logs (no GPU);
+* the full distance-sidecar annotation run over the demo corpora (CPU-parallel);
+* the rollout-mining pipeline (mp4 frame decode at policy-step indices + d_t/R_t label
+  join) -- so the co-train run receives ready-made label columns, not a data project.
+
+What waits for the co-train: trunk/head training, threshold calibration, the sample400
+`--stop-head` confirmation, the R_hat-vs-kernel gate. Until then, published numbers keep
+the explicit oracle-stop asterisk, on our benchmarks and navverse alike.
+
 ## Constraints honored
 
 * Rollout speed: h-probe adds an MLP on an existing activation -- microseconds against a
