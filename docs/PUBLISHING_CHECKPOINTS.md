@@ -11,6 +11,13 @@ existing family:
 | `longnav-objectnav-flow-nopose-cotrain-2p5hz` | cotrain-v3 ck12000 — the SFT policy every RL run initialises from |
 | `longnav-objectnav-flow-pose-2p5hz` | pose-injected sibling |
 | `longnav-objectnav-flow-pose-1hz` | 1 Hz decision-rate sibling |
+| `longnav-objectnav-flow-nopose-cotrain-2p5hz-merged` | SFT LoRA folded into weights — the base every RL adapter applies to |
+| `longnav-objectnav-flow-nopose-cotrain-2p5hz-rl-a09-ck303` | RL delta, 24-episode run (its card's table came from the rank-stacked path) |
+| `longnav-objectnav-flow-nopose-cotrain-2p5hz-rl-a09-held128-ck791` | RL delta, held128 run — sample400 0.733 oracle / 0.483 oSPL, measured on the shipped merged+adapter composition |
+
+RL releases carry the cycle number in the name (unlike SFT repos): an RL checkpoint is a
+frozen artifact of a specific cycle, selected by an eval series, and the run it came from
+does not "continue" the way an SFT run does.
 
 Naming: `longnav-<task>-<head>-<pose variant>-<observation rate>`, all lowercase, hyphens.
 Append `-merged` for a weights-merged variant (below). Do NOT put the step number in the
