@@ -1,0 +1,152 @@
+# @package _global_
+# GAMMA 0.97 HORIZON FALSIFIER -- warm start from ck791, 64 mid-band episodes, n_rollout 24.
+#
+# THE TREATMENT IS GAMMA ALONE (0.95 -> 0.97; half-life 13.5 -> 22.8 policy steps). Every
+# other change exists to keep the treatment readable, and none touches what the gradient IS:
+#
+#   n_rollout 16 -> 24    POWER. Measured per-step credit dilution at 0.97 is 1.64x
+#                         (corr(r,A) 0.402 -> 0.314, time kernel, docs/HELD128_RESULTS.md
+#                         sec. 3); 24/1.64 = 14.6 effective vs today's 16 = ~96% of current
+#                         per-step SNR. The estimator is deliberately NOT switched to the
+#                         distance kernel (which would give 18.4): that code path has never
+#                         run in a real cycle and a never-run estimator inside a falsifier
+#                         makes a flat result unreadable. It debuts elsewhere after a parity
+#                         test.
+#   warm start ck791      ATTRIBUTION. ck791 is the held128 run's published peak (sample400
+#                         0.733 oracle / 0.483 oSPL), and that run's objective CONVERGED by
+#                         ~cycle 550 -- the motion-quality payload is spent. Any held-out
+#                         movement here is attributable to the horizon change, not to
+#                         re-earning speed. Resume restores adapter weights + the advantage
+#                         buffer + cycle counter (rl_state.pt); optimizer starts fresh
+#                         (load_optim false). Cycle numbering continues from 792 --
+#                         cosmetic. The inherited buffer's trajectories are re-scored at
+#                         gamma 0.97 each cycle (advantages are recomputed from stored
+#                         rewards) and flush within ~11 cycles (256/24).
+#   pool 128 -> 64        THROUGHPUT + SPINE. trainset64_gamma097: the 38 unmastered
+#                         mid-band survivors of trainset128 (behavioural classification,
+#                         pinned to each episode's first 150 servings -- see
+#                         mk_trainset64_gamma097.py) + 26 fresh mid-geodesic-band
+#                         (4.85-8.27 m) episodes, category-stratified, scene-balanced.
+#                         Drops the mastered 52 (within-episode success var 0.018 -- no
+#                         gradient contrast) and the hopeless 6. The survivors carry
+#                         ~150-serving histories, so within-episode differencing runs
+#                         ACROSS the gamma switch: per-episode before/after.
+#
+# PRE-REGISTERED READOUT (fixed before first look; the project has been burned twice by
+# post-hoc thresholds):
+#   PRIMARY   eval26 (same pinned file as held128 -- same instrument, directly comparable
+#             to that run's curve and the SFT baseline): Newey-West t on the success and
+#             oSPL slopes at ~150 cycles (~10 h at the projected ~14 cycles/h).
+#   HEALTH    training-side discounted return at gamma 0.97. The warm start is converged
+#             at 0.95, so the 0.97 objective has fresh headroom; if training G0 does not
+#             move, the setup is broken and the eval readout is VOID, not evidence.
+#   ON RECORD the reward-horizon analysis predicts FLAT-TO-WORSE (search-phase credit at
+#             0.97 still inherits the variance floor). Any resolved positive movement,
+#             especially on far-tercile eval episodes, is genuine horizon evidence and
+#             licenses the gamma-0.99 + value-baseline escalation (where the distance
+#             kernel becomes load-bearing: 2.9x vs 4.5x).
+#
+# NOT CHANGED (the falsifier's control surface): estimator (time kernel, sigma 40),
+# a = 0.9, lr 2e-6, frozen head, exclude [plant], eval cadence, KL measure-only,
+# success_reward 0.0, n_adv 256.
+
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  # The SFT LoRA baked into the base, exactly as held128: disable_adapter() remains an
+  # exact SFT reference. The warm start below then loads ck791's RL delta INTO the
+  # trainable adapter -- base merge + adapter load compose, they do not double-apply.
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000/adapter
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000
+    gap: 10
+    sde_n: 3
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+
+sim:
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train100x80
+  exclude_categories: [plant]
+  # THE POOL: 64 uids over the intact 8000-episode pool (uid validity requires the intact
+  # pool -- occurrence counters are per shard file; see trainset128's header).
+  train_uids: /Projects/spatial_training/dump/eval_system/episode_sets/trainset64_gamma097.txt
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 0.4
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: false
+  reward_lost_steps: 25
+
+rollout:
+  max_steps: 175
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  # WARM START: the held128 run's published peak checkpoint. Restores the RL adapter,
+  # the advantage buffer and the cycle counter (rl_state.pt). NOT the merged adapter --
+  # that lives in vlm.merge_adapter_dir above and setup_training refuses it here by path.
+  checkpoint: /Projects/spatial_training/dump/flow_rl/flow_sde_a09_held128/checkpoints/checkpoint_791
+  load_optim: false
+  load_sched: false
+  learning_rate: 2.0e-6
+  action_head_learning_rate: 0.0
+  grad_accum_steps: 2
+  max_grad_norm: 20.0
+  rl_config:
+    # THE TREATMENT.
+    gamma: 0.97
+    # POWER COMPENSATION (see header): restores ~96% of the 0.95-run's per-step SNR.
+    n_rollout: 24
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    ref_kl: true
+    ref_kl_coeff: 0.0
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "flow_sde_gamma097_warm64"
+  output_dir: /Projects/spatial_training/dump/flow_rl
+  subset_label: "everything"
+  shard_size: 0
+  eval_every: 4
+  eval_set_size: 32          # ignored when eval_uids_file is set; kept for the record
+  # SAME pinned eval as held128 and fullpool: the instrument is unchanged, so this run's
+  # curve overlays held128's directly and inherits the 8-pass SFT baseline.
+  eval_uids_file: /Projects/spatial_training/dump/eval_system/episode_sets/fullpool_evalset_servable26.txt
+  eval_ode: true
