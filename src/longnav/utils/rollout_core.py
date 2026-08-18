@@ -318,13 +318,19 @@ class EpisodeRolloutMixin:
                         trajectory_dict["actions"] = action_id
                         trajectory_dict["rollout_probs"] = action_probs
                     if compute_value:
-                        # Per-step rollout-time values were never implemented (the old
-                        # `self._compute_value` existed nowhere); values come from the
-                        # post-episode recompute forward. Refuse loudly rather than
-                        # AttributeError deep in a rollout.
-                        raise NotImplementedError(
-                            "per-step rollout values are not implemented; values are "
-                            "computed in the post-episode recompute (rl_trajectory['values'])")
+                        # An extension point: the BASE class never defines
+                        # `_compute_value` (values come from the post-episode recompute
+                        # forward), but a subclass may -- the dummy-worker tests do.
+                        # Refuse loudly only when nothing provides it, instead of the
+                        # old AttributeError from deep inside a rollout.
+                        if not hasattr(self, "_compute_value"):
+                            raise NotImplementedError(
+                                "per-step rollout values need a _compute_value "
+                                "implementation; the base class computes values in the "
+                                "post-episode recompute (rl_trajectory['values'])")
+                        import torch
+                        with torch.no_grad():
+                            trajectory_dict["values"] = self._compute_value(outputs).cpu().numpy()
                     trajectory_buffer.append(trajectory_dict)
                 if self.policy_head_config['type'] == "continuous":
                     action_text = ",".join([f"{x:.3f}" for x in np.asarray(action_id).reshape(-1)])
