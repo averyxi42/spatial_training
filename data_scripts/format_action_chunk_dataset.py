@@ -171,6 +171,20 @@ def main():
                         "--modality-marker: `<pose>` is one modality type and a goal pose "
                         "is another occurrence of it, bound by occurrence order like every "
                         "other. Omit for ObjectNav")
+    p.add_argument("--distance-column", default=None,
+                   help="episode-table column of per-observation geodesic distances "
+                        "(`obs_distances` from the builder's --distance-sidecar). When "
+                        "set, emits `distance_targets` (the column, NaN-preserving), "
+                        "`return_targets` (discounted return-to-go under the RL reward "
+                        "clip(delta-d), computed HERE so the corpus carries them -- see "
+                        "state_probe.distance_return_targets) and a per-row "
+                        "`return_gamma` stamp so mixed-gamma concatenations are visible. "
+                        "Omit: today's exact output")
+    p.add_argument("--return-gamma", type=float, default=None,
+                   help="gamma for return_targets. REQUIRED with --distance-column; no "
+                        "default because gamma changes what the column MEANS")
+    p.add_argument("--reward-clip", type=float, default=0.75,
+                   help="per-step reward clip for return_targets (the RL env's value)")
     p.add_argument("--goal-values-column", default="obs_goals",
                    help="column holding the per-observation goal poses. Distinct from "
                         "--goal-column, which is the goal *text*")
@@ -271,6 +285,34 @@ def main():
                 args.segment_column, args.goal_placement)},
             num_proc=args.num_proc, desc="goal value rows",
             **cache_kw("goal_values"),
+        )
+
+    if args.distance_column:
+        if args.return_gamma is None:
+            raise SystemExit("--distance-column requires --return-gamma (no default: "
+                             "gamma is part of what return_targets means)")
+        from longnav.utils.state_probe import distance_return_targets
+
+        before = size(ds)
+        ds = ds.filter(
+            lambda ex: len(ex[args.distance_column]) == len(ex[args.images_column]),
+            num_proc=args.num_proc, desc="distance align check",
+            **cache_kw("distance_align"),
+        )
+        if size(ds) != before:
+            print(f"  dropped {before - size(ds)} row(s) whose {args.distance_column} "
+                  f"count disagreed with the observation count")
+        _g, _c = float(args.return_gamma), float(args.reward_clip)
+        ds = ds.map(
+            lambda ex: {
+                "distance_targets": [float("nan") if v is None else float(v)
+                                     for v in ex[args.distance_column]],
+                "return_targets": distance_return_targets(
+                    ex[args.distance_column], gamma=_g, reward_clip=_c),
+                "return_gamma": _g,
+            },
+            num_proc=args.num_proc, desc="distance/return targets",
+            **cache_kw("distret"),
         )
 
     if args.max_turns:
