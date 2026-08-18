@@ -163,3 +163,34 @@ Remaining for the derived trainer (`train_flow_matching_sft_value.py`, to be cop
    RL config must agree.
 3. Save hook: `save_state_probe` next to each checkpoint; RL-side load path in
    `setup_training` (currently always fresh-inits).
+
+## Derived trainer: BUILT AND SMOKE-TESTED (2026-08-18, spatial 1ce91f2)
+
+`data_scripts/train_flow_matching_sft_value.py` -- verbatim copy of the original +
+fenced `# --- PROBE ---` additions. Verified end to end on a real mini-pipeline
+(2-scene corpus slice -> builder --distance-sidecar -> format --return-gamma 0.97 ->
+4 training steps on GPU):
+
+* probe CE losses start at their near-uniform theoretical values (distance ln64=4.16,
+  value ln51=3.93) and DECLINE (4.21->4.04, 3.90->3.47 in 4 steps); probe grad norm ~0.9;
+  `state_probe.pt`+config written into every checkpoint and `final/`.
+* token-identity pin HELD at offset -2 across all turns -- the offset lands on a
+  constant text token in the real template (closes the audit's open item).
+* probe-off parity: the original trainer is NOT run-to-run deterministic (same seed,
+  losses differ across identical invocations -- flash-attn class nondeterminism), so
+  parity is guaranteed structurally: probe-off delegates to the parent forward
+  immediately, uses the original collator class, and the original trainer class.
+* three bugs found and pinned by tests: (1) pre-parser flags must be copied onto the
+  merged namespace (the original's own warning); (2) `nn.Module` class-attribute
+  default shadowed the registered probe submodule -> silent zero-grad co-training
+  (test: test_no_state_probe_class_attribute_shadow); (3) `find_turn_spans` returns
+  per-batch-row nested lists.
+* suite state: 5 spatial test failures reproduce identically at the pre-change commit
+  (pre-existing golden-fixture drift, forward/component + model_metrics families);
+  my earlier audit fix broke `_compute_value` as a subclass extension point and is now
+  restored with the refusal kept for the base case (trajectory-shapes tests pass).
+
+Launch-blocking remainder: NONE on the trainer. The full-corpus data build (builder
+--distance-sidecar + format --return-gamma over v2_25hz, CPU hours) and the three
+launch decisions (mixture w/ or w/o the PointNav corpus, gamma column(s), fleet order)
+are what stand between here and the co-train run.
