@@ -381,6 +381,14 @@ def parse_args():
                           "return_gamma stamp (checked against row 0)")
     pre.add_argument("--probe-head-lr", type=float, default=None,
                      help="probe params LR; default: --head-lr group")
+    pre.add_argument("--probe-datasets", default=None,
+                     help="comma-separated mixture component NAMES that train the probe. "
+                          "The mechanism is the data itself (components lacking "
+                          "distance_targets/return_targets are skipped row-by-row); this "
+                          "flag makes the intent EXPLICIT and CHECKED: each named "
+                          "component must carry the columns, each unnamed one must not. "
+                          "A component with columns you forgot to name is an error, not "
+                          "a silent inclusion. Single-dataset runs ignore this.")
     # --- END PROBE ---
     pre.add_argument("--decoder-layers", type=int, default=4)
     pre.add_argument("--decoder-heads", type=int, default=4)
@@ -592,6 +600,7 @@ def parse_args():
     args.probe_value_weight = mine.probe_value_weight
     args.probe_gamma = mine.probe_gamma
     args.probe_head_lr = mine.probe_head_lr
+    args.probe_datasets = mine.probe_datasets
     # --- END PROBE ---
     args.latent_cvae = mine.latent_cvae
     args.latent_beta = mine.latent_beta
@@ -705,6 +714,27 @@ def main():
                                  length=args.mixture_length, seed=args.mixture_seed)
         if is_main:
             print(train_ds.describe())
+        # --- PROBE --- explicit per-component contract (see --probe-datasets help)
+        if args.probe and args.probe_datasets is not None:
+            wanted = {n.strip() for n in args.probe_datasets.split(",") if n.strip()}
+            unknown = wanted - {sp.name for sp in specs}
+            if unknown:
+                raise SystemExit(f"--probe-datasets names unknown components: {sorted(unknown)}")
+            for sp in specs:
+                cols = set(base.load_split(sp.path, sp.split or args.train_split).column_names)
+                has = {"distance_targets", "return_targets"} <= cols
+                if sp.name in wanted and not has:
+                    raise SystemExit(
+                        f"--probe-datasets includes {sp.name!r} but its dataset carries no "
+                        "distance/return target columns; join them first "
+                        "(add_distance_targets.py)")
+                if sp.name not in wanted and has:
+                    raise SystemExit(
+                        f"component {sp.name!r} carries probe target columns but is not in "
+                        "--probe-datasets; name it or point at the un-joined dataset -- "
+                        "silent inclusion is the failure mode this flag exists to prevent")
+            if is_main:
+                print(f"[probe] training value/distance on components: {sorted(wanted)}")
     else:
         train_ds = base.load_split(args.train_dataset, args.train_split)
     eval_ds = None
