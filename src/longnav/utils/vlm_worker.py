@@ -346,6 +346,13 @@ class VLMWorker:
                 self.outputs['deepstack_visual_embeds'][layer_idx].append(layer_tensor)
     def _get_sparse_logit_indices(self, indices=None):
         indices = self.logit_indices if indices is None else indices
+        # A readout position dropped by the sparsifier would silently remap to the
+        # PREVIOUS kept token -- the critic/policy would read a different activation
+        # with no error anywhere. Refuse instead.
+        kept = self.seq_keep_mask[indices]
+        assert bool(kept.all()), (
+            "readout index dropped by the sparsifier (a template or seq_keep change "
+            f"removed a readout token): positions {[i for i, k in zip(indices, kept.tolist()) if not k]}")
         ranks = self.seq_keep_mask.long().cumsum(dim=0)
         logits_to_keep = ranks[indices] - 1 # logit indices of the sparsified sequence
         return logits_to_keep

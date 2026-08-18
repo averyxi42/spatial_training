@@ -318,10 +318,13 @@ class EpisodeRolloutMixin:
                         trajectory_dict["actions"] = action_id
                         trajectory_dict["rollout_probs"] = action_probs
                     if compute_value:
-                        import torch
-                        # Compute value estimate for the current state
-                        with torch.no_grad():
-                            trajectory_dict["values"] = self._compute_value(outputs).cpu().numpy()
+                        # Per-step rollout-time values were never implemented (the old
+                        # `self._compute_value` existed nowhere); values come from the
+                        # post-episode recompute forward. Refuse loudly rather than
+                        # AttributeError deep in a rollout.
+                        raise NotImplementedError(
+                            "per-step rollout values are not implemented; values are "
+                            "computed in the post-episode recompute (rl_trajectory['values'])")
                     trajectory_buffer.append(trajectory_dict)
                 if self.policy_head_config['type'] == "continuous":
                     action_text = ",".join([f"{x:.3f}" for x in np.asarray(action_id).reshape(-1)])
