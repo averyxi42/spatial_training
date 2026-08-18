@@ -131,3 +131,35 @@ the explicit oracle-stop asterisk, on our benchmarks and navverse alike.
 * Compute: everything runs on GPUs 5-7 between evals; the gamma097 fleet is untouched.
 * Comparability: all existing numbers stay valid -- `--auto-stop` results are labeled
   oracle-stop; `--stop-head` results are a new, honestly-labeled column.
+
+## Build status (2026-08-18)
+
+Built, tested, committed:
+* habitat e457430 -- `--distance-sidecar` on the chunk builder: episode rows gain
+  `obs_distances` (anchor-frame geodesic, NaN-preserving), hard error on a sidecar miss,
+  omission keeps today's exact schema. 4 new tests.
+* spatial 1cff19e -- `longnav/utils/state_probe.py`: `LogDistanceHead` (64 uniform
+  log1p bins over [0,40 m], HL-Gauss, `p_within(logits, r)` as the calibrated stop rule,
+  meter-space expectation), `ValueDistHead` (linear support [-8,24] per the audit),
+  `StateProbe` (shared hidden, per-head weights, straight-through grad_scale),
+  `distance_return_targets` (returns from the d-series under the RL reward; NaN-safe),
+  save/load (`state_probe.pt` + config json). 11 tests.
+  `format_action_chunk_dataset.py`: `--distance-column` + `--return-gamma` (required
+  together, no gamma default) emit `distance_targets` / `return_targets` /
+  per-row `return_gamma` at format time -- returns are corpus columns, never derived in
+  the collator (decision 2026-08-18).
+
+Remaining for the derived trainer (`train_flow_matching_sft_value.py`, to be copied from
+`train_flow_matching_sft.py` per the preserve-the-original rule):
+1. Collator: slice `distance_targets`/`return_targets` with the SAME window the collator
+   already applies to action targets (the `start`/`n_turns` variables at the
+   `stop_targets` emission site are exactly the needed ones).
+2. Probe-hidden gather -- carries an OPEN DESIGN DECISION: train the probe on the pooled
+   sandwich context (offset 0, trivially available at the `TurnEncoding.pooled` seam,
+   maximally shapes h) or at the RL contract offset -2 (requires a dense->sparse index
+   remap via `turn_vectors.to_sparse_indices` for positions outside the turn span; matches
+   `ValueHeadConfig.readout_offset` so the RL handoff reads the SAME activation the head
+   was trained on). The offset is checkpoint contract either way; whichever is chosen, the
+   RL config must agree.
+3. Save hook: `save_state_probe` next to each checkpoint; RL-side load path in
+   `setup_training` (currently always fresh-inits).
