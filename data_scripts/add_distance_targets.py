@@ -41,6 +41,13 @@ def main():
     p.add_argument("--return-gamma", type=float, required=True)
     p.add_argument("--reward-clip", type=float, default=0.75)
     p.add_argument("--num-proc", type=int, default=8)
+    p.add_argument("--allow-missing", action="store_true",
+                   help="episodes absent from the sidecar get all-NaN distance targets "
+                        "and all-NaN returns (masked by the probe loss) instead of a "
+                        "hard error. For sidecars with validated-refusal gaps (e.g. the "
+                        "PointNav island-checksum refusals); the fill count is printed "
+                        "and silence would misrepresent coverage, so it also refuses "
+                        "if MORE than half the rows are missing.")
     args = p.parse_args()
     out = Path(args.out_dir)
     if out.exists():
@@ -54,7 +61,12 @@ def main():
     def add(ex):
         series = lookup.get(ex["episode_id"])
         if series is None:
-            raise KeyError(f"sidecar has no episode {ex['episode_id']}; wrong --sidecar?")
+            if not args.allow_missing:
+                raise KeyError(f"sidecar has no episode {ex['episode_id']}; wrong --sidecar?")
+            n = len(ex["frame_indices"])
+            return {"distance_targets": [float("nan")] * n,
+                    "return_targets": [float("nan")] * n,
+                    "return_gamma": g}
         d = [series[i] for i in ex["frame_indices"]]
         return {
             "distance_targets": [float("nan") if v is None else float(v) for v in d],
@@ -65,6 +77,13 @@ def main():
     done = DatasetDict({name: split.map(add, num_proc=args.num_proc,
                                         desc=f"distance/return targets [{name}]")
                         for name, split in splits.items()})
+    if args.allow_missing:
+        for name, split in done.items():
+            miss = sum(1 for r in split if r["episode_id"] not in lookup)
+            print(f"  [{name}] NaN-filled rows (missing from sidecar): {miss}/{len(split)}")
+            if miss > len(split) / 2:
+                raise SystemExit("more than half the rows are missing from the sidecar; "
+                                 "this is the wrong sidecar, not a coverage gap")
     done.save_to_disk(str(out))
     print(f"wrote {out}: " + ", ".join(f"{k}={len(v)}" for k, v in done.items()))
 
