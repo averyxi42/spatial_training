@@ -44,6 +44,12 @@ ap.add_argument("--episode-paths", default=f"{SET_DIR}/episode_set64_paths.txt")
 ap.add_argument("--kernel-sigma", type=float, default=40.0)
 ap.add_argument("--stop-radius", type=float, default=1.0)
 ap.add_argument("--limit", type=int, default=None)
+ap.add_argument("--goal-manifest", default=None,
+                help="json of {episode_tag: goal_text}; when set, episode-paths entries "
+                     "are bare tags (no rollout dir, no summary.json) -- used for "
+                     "expert-distribution sets built from formatted corpus rows")
+ap.add_argument("--out-suffix", default="",
+                help="suffix for the output json name (e.g. '_expert')")
 args = ap.parse_args()
 CKPT = os.path.abspath(args.ckpt)
 
@@ -88,13 +94,17 @@ print(f"ckpt {CKPT}  offset {w.value_readout_offset}  pin {w.probe_expected_toke
 # ---------------- replay each pinned conversation through the packed forward ----------
 V, D, P, G, DT, T = [], [], [], [], [], []   # flat per-step series across episodes
 n_done = 0
+goal_manifest = json.load(open(args.goal_manifest)) if args.goal_manifest else None
 for ep_path in ep_paths:
     # same sanitization as mine_rollout_frames
     tag = os.path.basename(ep_path).replace("@", "_").replace(":", "_").replace("#", "_")
     srows = rows_by_ep.get(tag)
     if not srows:
         print(f"  SKIP {tag}: no mined rows"); continue
-    summary = json.loads(open(os.path.join(ep_path, "summary.json")).read())
+    if goal_manifest is not None:
+        summary = {"goal": goal_manifest[tag]}
+    else:
+        summary = json.loads(open(os.path.join(ep_path, "summary.json")).read())
     steps = sorted(srows)
     # conversation must be CONTIGUOUS from step 0 -- stop at the first gap
     contig = []
@@ -167,7 +177,7 @@ res = {
     "n_near": int(near.sum()),
 }
 os.makedirs(SET_DIR, exist_ok=True)
-out = os.path.join(SET_DIR, os.path.basename(CKPT.rstrip("/")) + ".json")
+out = os.path.join(SET_DIR, os.path.basename(CKPT.rstrip("/")) + args.out_suffix + ".json")
 json.dump(res, open(out, "w"), indent=2)
 print(json.dumps(res, indent=2))
 print(f"-> {out}")
