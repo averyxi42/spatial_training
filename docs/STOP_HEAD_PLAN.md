@@ -194,3 +194,28 @@ Launch-blocking remainder: NONE on the trainer. The full-corpus data build (buil
 --distance-sidecar + format --return-gamma over v2_25hz, CPU hours) and the three
 launch decisions (mixture w/ or w/o the PointNav corpus, gamma column(s), fleet order)
 are what stand between here and the co-train run.
+
+## Status 2026-08-18 — probe integration proven; first counterfactual read (ck-200)
+
+The full chain is validated end to end: SFT co-train (cotrain-v4, ddp4 GPUs 0-3,
+meters-scale metrics per dataset) → checkpoint persists the worker-frame readout
+convention (`worker_value_readout_offset`, `probe_token_id`; the span-shift
+off-by-one this caught is documented in the parity script) →
+`tests/parity_probe_paths.py` (token pin + packed-vs-incremental seams ≤0.05 m /
+0.03) → 20-cycle mini RL run (`flow_sde_probe_mini`, GPU 4) with the probe frozen
+and observational. Two integration bugs found and fixed on the way: peft
+`modules_to_save` wrapping the frozen adapter (cache landed on peft's deep copy;
+now gated on a trainable critic) and `StateProbeConfig.from_dict` on the new pins.
+
+**Counterfactual verdict at checkpoint-200 (20 cycles, paired on the same
+buffer):** adv-variance kernel 4.17 ≤ naive 4.29 < probe 4.98; corr(v̂, G) 0.071;
+probe value MSE 18.8 vs kernel 4.2. The step-200 probe is not a baseline — as
+pre-registered, this is the lower bound, not the answer. Distance head already
+discriminates on-policy: p_stop(near) 0.16-0.39 vs p_stop(far) 0.016-0.052
+(~10x) with regression-to-the-mean bias (far episodes under-predicted ~7 m).
+
+Next read: `flow_sde_probe_mini_ck1000` auto-launches when checkpoint-1000 lands
+(same instrument, deeper probe). Decision rule: probe adv-var crossing below the
+kernel's makes the value-baseline case on-policy; still above at ck-2000+ routes
+through calibration on the 294k mined on-policy frames
+(`data/mined_rollout_frames/gamma097_g097`) before any ceiling conclusion.

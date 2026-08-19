@@ -428,11 +428,13 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
             values = None
             import torch
             with torch.no_grad():
+                _want_values = (self.rl_algo_config.value_head is not None
+                                or bool(getattr(self.rl_algo_config, "state_probe", None)))
                 if self.rl_embeds_inputs is not None:
-                    policy_stats,values = self._forward_embeds(self.rl_embeds_inputs,(self.rl_algo_config.value_head is not None))
+                    policy_stats,values = self._forward_embeds(self.rl_embeds_inputs,_want_values)
                     model_inputs = self.rl_embeds_inputs
                 elif self.rl_seq_inputs is not None:
-                    policy_stats,values = self._forward_seq(self.rl_seq_inputs,(self.rl_algo_config.value_head is not None))
+                    policy_stats,values = self._forward_seq(self.rl_seq_inputs,_want_values)
                     model_inputs = self.rl_seq_inputs
                 else:
                     raise ValueError("No stored model inputs found for postprocessing.")
@@ -499,6 +501,16 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
                     if getattr(_vh, "is_distributional", False):
                         values = _vh.value(values)   # logits -> scalar; GAE consumes scalars
                     self.rl_trajectory['values'] = values.squeeze().float().cpu().numpy()
+                    # StateProbeValueAdapter caches the distance head's outputs from
+                    # the SAME forward; drain immediately (single-producer/consumer
+                    # within this episode -- see the adapter's docstring).
+                    if getattr(_vh, "last_distance_m", None) is not None:
+                        self.rl_trajectory['probe_distance_m'] = \
+                            _vh.last_distance_m.squeeze().numpy()
+                        self.rl_trajectory['probe_p_stop'] = \
+                            _vh.last_p_stop.squeeze().numpy()
+                        _vh.last_distance_m = None
+                        _vh.last_p_stop = None
 
             if self.rl_algo_config.use_ref and self.policy_head_config['type'] != "continuous":
                 with torch.no_grad():

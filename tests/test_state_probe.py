@@ -118,3 +118,31 @@ class TestProbeAndIO:
                               return_targets=torch.rand(2, 3))
         sum(losses.values()).backward()
         assert hidden.grad is None or float(hidden.grad.abs().max()) == 0.0
+
+
+def test_metrics_meters_scale_and_masking():
+    import torch
+    from longnav.utils.state_probe import StateProbe, StateProbeConfig
+    cfg = StateProbeConfig.from_dict({
+        "readout_offset": -2, "grad_scale": 0.1,
+        "distance": {"hidden_dims": [8], "n_bins": 16, "d_max": 40.0,
+                     "hl_sigma_ratio": 0.75, "loss_weight": 1.0},
+        "value": {"hidden_dims": [8], "n_bins": 11, "v_min": -8.0, "v_max": 24.0,
+                  "hl_sigma_ratio": 0.75, "loss_weight": 1.0, "gamma": 0.97}})
+    probe = StateProbe(4, cfg)
+    h = torch.randn(1, 5, 4)
+    d = torch.tensor([[1.0, 2.0, float("nan"), 4.0, 5.0]])
+    r = torch.tensor([[0.5, float("nan"), float("nan"), 1.5, 2.0]])
+    m = probe.metrics(h, d, r)
+    # counts respect each head's own mask
+    assert float(m["probe_dist_n"]) == 4.0
+    assert float(m["probe_value_n"]) == 3.0
+    # mae consistent with its own sums, and finite
+    assert torch.isfinite(m["probe_dist_abs_err_sum"])
+    assert abs(float(m["probe_dist_err_sum"])) <= float(m["probe_dist_abs_err_sum"]) + 1e-6
+    # predictions live in meter space: an untrained head's expectation is
+    # inside [0, d_max], so MAE against 1-5 m targets is bounded by d_max
+    assert float(m["probe_dist_abs_err_sum"]) / 4.0 < 40.0
+    # all-NaN targets -> no keys rather than zeros that would skew a drain
+    m2 = probe.metrics(h, torch.full((1, 5), float("nan")), None)
+    assert "probe_dist_n" not in m2

@@ -1,0 +1,132 @@
+# @package _global_
+# PROBE-PLUMBING MINI RUN -- a parity and metrics INSTRUMENT, not a training experiment.
+#
+# Purpose (pre-registered; see docs/STOP_HEAD_PLAN.md and task thread 2026-08-18): run
+# ~20 real RL cycles on ONE GPU, disjoint from the cotrain-v4 SFT (GPUs 0-3) and the
+# sample400 evals (5-7), to validate that the PPO stack matches the value-SFT's
+# computational flow before either the full-fleet SFT or any critic-baseline RL run:
+#
+#   1. the frozen state probe loads from the SFT checkpoint (rl_config.state_probe=auto)
+#      and its worker-frame readout convention (persisted worker_value_readout_offset +
+#      probe_token_id) passes the worker's token-identity assert on every turn;
+#   2. rollout accuracy metrics are MEANINGFUL: probe/dist_mae_m against the env's own
+#      per-step distance_to_goal, probe/value_mae_ep against realized returns,
+#      probe/p_stop_near vs p_stop_far discrimination;
+#   3. the per-cycle PAIRED variance counterfactual (probe/adv_var_probe vs
+#      adv_var_kernel vs adv_var_naive on the same buffer) quantifies the variance
+#      reduction a probe baseline would buy -- the on-policy version of the offline
+#      kernel-baseline studies. The checkpoint is EARLY (HL-Gauss learns fast), so this
+#      is a lower bound that sharpens as the SFT matures.
+#
+# WHAT TRAINS IS UNCHANGED from the gamma097 recipe (time kernel, frozen head, measure-
+# only KL): the probe is observational here. Training metrics from this run mean
+# NOTHING (pool 8, n_rollout 6, one GPU) -- do not read tea leaves from them.
+#
+# Fresh run, fresh buffer: the collated batch takes its key set from the first
+# trajectory, so a probe run must not resume a buffer whose rows lack probe keys.
+
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+resources:
+  num_vlms: 1
+  num_sims: 1
+  vlm_gpu_fraction: 0.45
+  sim_gpu_fraction: 0.15
+  vlm_conda_env: longnav_vlm     # schema default 'longnav' does not exist on this box
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  # The value-SFT checkpoint IS the policy: adapter merged into the base so
+  # disable_adapter() references it exactly; trainable LoRA starts as a fresh zero
+  # delta on top. checkpoint-1000 deliberately (early read; pinned for reproducibility).
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v4_probe_mix/checkpoint-1000/adapter
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v4_probe_mix/checkpoint-1000
+    gap: 10
+    sde_n: 3
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+
+sim:
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train100x80
+  exclude_categories: [plant]
+  # 8 uids: enough scene/goal variety to exercise scene switches and both success and
+  # failure episodes; small enough that one sim serves a cycle quickly.
+  train_uids: /Projects/spatial_training/dump/eval_system/episode_sets/probe_mini8.txt
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 0.4
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: false
+  reward_lost_steps: 25
+
+rollout:
+  max_steps: 175
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  checkpoint: null
+  load_optim: false
+  load_sched: false
+  learning_rate: 2.0e-6
+  action_head_learning_rate: 0.0
+  grad_accum_steps: 2
+  max_grad_norm: 20.0
+  # 20 cycles: 60 * 2 / 6.
+  total_optimization_steps: 60
+  warmup_steps: 4
+  save_step: 8
+  rl_config:
+    state_probe: auto
+    gamma: 0.97
+    n_rollout: 6
+    n_adv: 48
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    ref_kl: true
+    ref_kl_coeff: 0.0
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "flow_sde_probe_mini_ck1000"
+  output_dir: /Projects/spatial_training/dump/flow_rl
+  subset_label: "everything"
+  shard_size: 0
+  eval_every: 0        # no interleaved eval: this run is an instrument, not a curve
+  eval_set_size: 0
+  eval_ode: true

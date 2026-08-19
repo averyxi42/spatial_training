@@ -178,6 +178,7 @@ class TurnFlowActionRegressorWithProbe(TurnFlowActionRegressor):
     # and a class attribute would satisfy normal lookup first, permanently shadowing
     # the real probe (observed: zero probe grads, silent). Use getattr with default.
     probe_token_id = None         # pinned on first batch; constancy asserted after
+    probe_worker_offset = None    # probe position in the worker's end-of-turn frame
 
     def forward(self, input_ids, targets, attention_mask=None, num_turns=None,
                 num_items_in_batch=None, distance_targets=None, return_targets=None,
@@ -232,6 +233,27 @@ class TurnFlowActionRegressorWithProbe(TurnFlowActionRegressor):
                 f"probe readout token id varies across turns ({ids.tolist()} vs pinned "
                 f"{self.probe_token_id}); readout_offset {off} does not land on a "
                 "constant-identity token in this template")
+        # Persist-once: express the probe position in the rollout worker's frame.
+        # The worker's per-turn logit index is `content_start + content_len - 2` in
+        # dense coords (its crop drops the last content token); the probe position is
+        # `indices[0] + off`. Their difference is the offset the worker must apply --
+        # it absorbs shift_left AND the template content length, so the RL side never
+        # re-derives either. Asserted constant across turns.
+        for row, prow in zip(rows, probe_rows):
+            for sp, pp in zip(row, prow):
+                # sp.end is the SHIFTED end when shift_left is on; the worker's crop
+                # arithmetic lives in UNSHIFTED coords (its logit index is
+                # unshifted_content_end - 2). Un-shift before differencing -- the -1
+                # this once produced put the readout on '\n' instead of 'assistant',
+                # and only the worker's token-id assert caught it (parity 2026-08-18).
+                unshifted_end = int(sp.end) + (1 if sp.shifted else 0)
+                w_off = int(pp.indices[0]) - (unshifted_end - 2)
+                if self.probe_worker_offset is None:
+                    type(self).probe_worker_offset = w_off
+                elif w_off != self.probe_worker_offset:
+                    raise RuntimeError(
+                        f"worker-frame probe offset varies across turns ({w_off} vs "
+                        f"{self.probe_worker_offset}); template content length is not constant")
         probe_rows = to_sparse_indices(probe_rows, keep, strict=True)
         flat = [p for row in probe_rows for p in row]
         h = _torch.stack([hidden[p.batch_idx, int(p.indices[0])] for p in flat])
@@ -249,16 +271,31 @@ class TurnFlowActionRegressorWithProbe(TurnFlowActionRegressor):
                 v.detach() * n_turns_t
             out[k] = v.detach()
         out["probe_turns"] = n_turns_t
+        for k, v in probe.metrics(
+                h.unsqueeze(0).detach(),
+                None if distance_targets is None else distance_targets.reshape(1, -1),
+                None if return_targets is None else return_targets.reshape(1, -1),
+        ).items():
+            out[k] = v.detach()
         return out
 
 
 from transformers import TrainerCallback as _TrainerCallback
 
 
+
+
+def _probe_save_extras(model):
+    """Convention pins for downstream consumers; None until a batch has run."""
+    return {"worker_value_readout_offset": getattr(model, "probe_worker_offset", None),
+            "probe_token_id": getattr(model, "probe_token_id", None)}
+
 class _ProbeTrainerMixin:
     """Accumulate/drain the probe losses alongside the whitelisted metrics."""
 
-    _PROBE_KEYS = ("probe_distance_loss_sum", "probe_value_loss_sum", "probe_turns")
+    _PROBE_KEYS = ("probe_distance_loss_sum", "probe_value_loss_sum", "probe_turns",
+                   "probe_dist_abs_err_sum", "probe_dist_err_sum", "probe_dist_n",
+                   "probe_value_abs_err_sum", "probe_value_n")
 
     def _accumulate(self, outputs):
         super()._accumulate(outputs)
@@ -277,6 +314,13 @@ class _ProbeTrainerMixin:
                               ("probe_value_loss_sum", "probe_value_loss")):
                 if key in sums:
                     out[f"{prefix}{name}"] = float(sums[key] / n.clamp(min=1))
+        dn = sums.get("probe_dist_n")
+        if dn is not None and float(dn) > 0:
+            out[f"{prefix}probe_dist_mae_m"] = float(sums["probe_dist_abs_err_sum"] / dn)
+            out[f"{prefix}probe_dist_bias_m"] = float(sums["probe_dist_err_sum"] / dn)
+        vn = sums.get("probe_value_n")
+        if vn is not None and float(vn) > 0:
+            out[f"{prefix}probe_value_mae"] = float(sums["probe_value_abs_err_sum"] / vn)
         return out
 
 
@@ -292,7 +336,8 @@ class _SaveProbeCallback(_TrainerCallback):
                 and state.is_world_process_zero:
             ckpt = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
             if os.path.isdir(ckpt):
-                save_state_probe(ckpt, self._model.state_probe)
+                save_state_probe(ckpt, self._model.state_probe,
+                                 extra=_probe_save_extras(self._model))
         return control
 # --- END PROBE -----------------------------------------------------------------------
 
@@ -1004,7 +1049,8 @@ def main():
     # --- PROBE ---
     if args.probe and is_main:
         save_state_probe(os.path.join(args.output_dir, "final"),
-                         getattr(model, "state_probe"))
+                         getattr(model, "state_probe"),
+                         extra=_probe_save_extras(model))
     if torch.cuda.is_available() and is_main:
         print(f"Peak GPU memory: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 

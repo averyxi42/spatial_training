@@ -20,11 +20,14 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import ray
+import torch
 
 from longnav.config_schema import RLConfig
 from longnav.utils.factories import ExpBootstrapper, get_console_logger, get_shard_iterator
 from longnav.utils.rl_core import collate_trajectories
 from longnav.utils.rollout_core import collect_rollouts
+
+_LAST_PROBE_COUNTERFACTUAL = None  # see compute_advantages_and_returns
 
 
 @dataclass
@@ -269,6 +272,35 @@ def compute_advantages_and_returns(
     traj_batch["returns"] = returns
     global_return_mean = returns[traj_batch["response_mask"] == 1].mean().item()
 
+    # ---- probe counterfactual (frozen state-probe values present, e.g. the mini
+    # parity run). PAIRED on the same buffer: variance of the advantage under the
+    # probe baseline vs the configured kernel baseline vs no baseline, plus each
+    # baseline's MSE against the realized returns. Purely observational -- what
+    # trains is unchanged. Handed to stream_results_and_log via the module-level
+    # slot below because the public 2-tuple return is pinned by tests; the driver
+    # is single-threaded between these two calls.
+    global _LAST_PROBE_COUNTERFACTUAL
+    _LAST_PROBE_COUNTERFACTUAL = None
+    if values is not None:
+        vm = traj_batch["response_mask"] == 1
+        r = returns[vm].float()
+        pv = values[vm].float()
+        cf = {
+            "probe/value_mse": ((pv - r) ** 2).mean().item(),
+            "probe/adv_var_probe": (r - pv).var().item(),
+            "probe/adv_var_naive": r.var().item(),
+        }
+        if "baseline" in traj_batch.keys():
+            kb = traj_batch["baseline"][vm].float()
+            cf["probe/kernel_mse"] = ((kb - r) ** 2).mean().item()
+            cf["probe/adv_var_kernel"] = (r - kb).var().item()
+        def _corr(a, b):
+            a = a - a.mean(); b = b - b.mean()
+            return float((a * b).sum() / (a.norm() * b.norm()).clamp_min(1e-8))
+        cf["probe/corr_value_return"] = _corr(pv, r)
+        _LAST_PROBE_COUNTERFACTUAL = cf
+        print(f"PROBE COUNTERFACTUAL: {cf}")
+
     print(f"Advantage Mean: {advantages.mean().item():.4f}, Std: {advantages.std().item():.4f}")
 
     return traj_batch, global_return_mean
@@ -393,6 +425,28 @@ def stream_results_and_log(
                     **({"rollout/oracle_success": float(traj_stats["oracle_success"].max().item())}
                        if "oracle_success" in traj_stats.keys() else {}),
                 }
+                if "probe_distance_m" in traj_stats.keys() and \
+                        "distance_to_goal" in traj_stats.keys():
+                    pd = traj_stats["probe_distance_m"].float()
+                    td = traj_stats["distance_to_goal"].float()
+                    fin = torch.isfinite(td)
+                    if bool(fin.any()):
+                        rollout_stats["probe/dist_mae_m"] = (pd[fin] - td[fin]).abs().mean().item()
+                        rollout_stats["probe/dist_bias_m"] = (pd[fin] - td[fin]).mean().item()
+                        near = td <= 1.0
+                        if bool(near.any()):
+                            rollout_stats["probe/p_stop_near"] = \
+                                traj_stats["probe_p_stop"][near].float().mean().item()
+                        if bool((~near & fin).any()):
+                            rollout_stats["probe/p_stop_far"] = \
+                                traj_stats["probe_p_stop"][~near & fin].float().mean().item()
+                if "values" in traj_stats.keys():
+                    rollout_stats["probe/value_mae_ep"] = \
+                        (traj_stats["values"].float() - traj_stats["returns"].float()).abs().mean().item()
+                global _LAST_PROBE_COUNTERFACTUAL
+                if completed_count == 0 and _LAST_PROBE_COUNTERFACTUAL:
+                    rollout_stats |= _LAST_PROBE_COUNTERFACTUAL
+                    _LAST_PROBE_COUNTERFACTUAL = None
                 try:
                     critic_mse = ((traj_stats["baseline"] - traj_stats["returns"]) ** 2).mean()
                     naive_mse = ((traj_stats["returns"] - global_return_mean) ** 2).mean().item()

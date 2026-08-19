@@ -216,7 +216,12 @@ class StateProbeConfig:
     def from_dict(cls, d: Any) -> "StateProbeConfig":
         if isinstance(d, cls):
             return d
-        return cls(**dict(d))
+        # The config json also carries consumer-facing pins (worker_value_readout_offset,
+        # probe_token_id -- see save_state_probe's `extra`); they are not construction
+        # arguments, so filter to declared fields instead of exploding on them.
+        import dataclasses
+        names = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in dict(d).items() if k in names})
 
 
 class StateProbe(nn.Module):
@@ -251,12 +256,51 @@ class StateProbe(nn.Module):
                                      return_targets, mask)
         return out
 
+    @torch.no_grad()
+    def metrics(self, hidden: torch.Tensor,
+                distance_targets: Optional[torch.Tensor] = None,
+                return_targets: Optional[torch.Tensor] = None) -> dict:
+        """Interpretable-scale accuracy, as sums + counts so any accumulation
+        (grad-accum, DDP, eval loop) averages exactly. Masking matches `loss`:
+        non-finite targets (sidecar gaps) contribute nothing. `bias` is signed
+        (pred - target): the log-spaced distance bins can skew long-range
+        predictions low, and a mean absolute error alone would hide that."""
+        out = {}
+        if self.distance_head is not None and distance_targets is not None:
+            y = distance_targets.float()
+            m = torch.isfinite(y)
+            if bool(m.any()):
+                pred = self.distance_head.expectation(
+                    self.distance_head(hidden.to(self.distance_head.dtype))).float()
+                err = (pred - y)[m]
+                out["probe_dist_abs_err_sum"] = err.abs().sum()
+                out["probe_dist_err_sum"] = err.sum()
+                out["probe_dist_n"] = m.float().sum()
+        if self.value_head is not None and return_targets is not None:
+            y = return_targets.float()
+            m = torch.isfinite(y)
+            if bool(m.any()):
+                pred = self.value_head.expectation(
+                    self.value_head(hidden.to(self.value_head.dtype))).float()
+                err = (pred - y)[m]
+                out["probe_value_abs_err_sum"] = err.abs().sum()
+                out["probe_value_n"] = m.float().sum()
+        return out
 
-def save_state_probe(out_dir, probe: StateProbe) -> None:
+
+def save_state_probe(out_dir, probe: StateProbe, extra: Optional[dict] = None) -> None:
+    """`extra` carries facts only the TRAINER knows but the RL/parity side needs
+    verbatim -- e.g. `worker_value_readout_offset` (the probe position expressed in
+    the rollout worker's end-of-turn frame, absorbing shift_left and the template
+    content length) and `probe_token_id` (the pinned identity of the readout token).
+    Persisting them is what lets a consumer ASSERT the convention instead of
+    re-deriving it and being silently off by one."""
     out = Path(out_dir)
     torch.save(probe.state_dict(), out / STATE_PROBE_FILE)
     cfg = {"readout_offset": probe.cfg.readout_offset, "grad_scale": probe.cfg.grad_scale,
            "distance": probe.cfg.distance, "value": probe.cfg.value}
+    if extra:
+        cfg.update(extra)
     (out / STATE_PROBE_CONFIG_FILE).write_text(json.dumps(cfg, indent=2))
 
 

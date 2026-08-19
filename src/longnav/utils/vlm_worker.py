@@ -78,6 +78,7 @@ class VLMWorker:
         self._is_merged = None
         self._is_lora = None
         self.value_readout_offset = 0   # set by setup_training from value_head config
+        self.probe_expected_token_id = None  # pinned id from state_probe_config.json
         # Warmup the CUDA allocator
         if load_model:
             self.load_model()
@@ -449,6 +450,13 @@ class VLMWorker:
         if self.value_readout_offset:
             _vi = self.cumulative_inputs['input_ids'].shape[1]-1 + self.value_readout_offset
             assert _vi >= 0, f"value readout_offset {self.value_readout_offset} underflows turn"
+            _exp = getattr(self, "probe_expected_token_id", None)
+            if _exp is not None:
+                _tok = int(self.cumulative_inputs['input_ids'][0, _vi])
+                assert _tok == int(_exp), (
+                    f"probe readout lands on token id {_tok}, but the checkpoint "
+                    f"pinned {_exp}: worker_value_readout_offset disagrees with the "
+                    "template this worker tokenized (chat template or prefix drift)")
             self.value_logit_indices.append(_vi)
         turn_inputs = {k: v.to(self.device) for k, v in turn_inputs.items() if v is not None}
         t = time.time()
@@ -586,6 +594,51 @@ try:
     PEFT_AVAILABLE = True
 except ImportError:
     PEFT_AVAILABLE = False
+
+class StateProbeValueAdapter(nn.Module):
+    """Presents a frozen SFT-cotrained StateProbe as the worker's value head.
+
+    `forward()` returns the VALUE head's logits so the existing
+    `values -> _vh.value(values)` pipe applies unchanged; the DISTANCE head is
+    evaluated on the SAME hidden slice in the same call and cached on
+    `last_distance_m` / `last_p_stop` (meter-space expectation and
+    P(d <= stop_radius_m)). The packed post-episode recompute makes exactly one
+    forward per episode, and rollout_core reads the cache immediately after
+    consuming `values` -- stateful, but single-producer single-consumer within
+    one episode, and the parity script pins the numbers.
+
+    The input hidden is DETACHED: the probe is a frozen instrument here, and
+    detaching severs any gradient path into the backbone through it (there is
+    no value loss in this configuration, but a graph edge costs memory and
+    invites accidents).
+    """
+    is_distributional = True
+    stop_radius_m = 1.0
+
+    def __init__(self, probe):
+        super().__init__()
+        self.probe = probe
+        self.last_distance_m = None
+        self.last_p_stop = None
+
+    @property
+    def dtype(self):
+        # _forward_embeds casts the gathered hidden to `value_head.dtype` before
+        # calling; forward() re-casts per head anyway, so this is just the outer cast.
+        return self.probe.value_head.dtype
+
+    def forward(self, h):
+        h = h.detach()
+        p = self.probe
+        if p.distance_head is not None:
+            dl = p.distance_head(h.to(p.distance_head.dtype))
+            self.last_distance_m = p.distance_head.expectation(dl).float().cpu()
+            self.last_p_stop = p.distance_head.p_within(dl, self.stop_radius_m).float().cpu()
+        return p.value_head(h.to(p.value_head.dtype))
+
+    def value(self, logits):
+        return self.probe.value_head.expectation(logits)
+
 
 class DistributionalValueHead(nn.Module):
     """Categorical value head trained with cross-entropy (HL-Gauss targets).
@@ -897,6 +950,38 @@ class VLMTrainingMixin:
                         dtype=getattr(torch, vh_cfg.dtype)
                     ).to(self.model.device)
                 self.value_readout_offset = int(getattr(vh_cfg, "readout_offset", 0))
+            sp_mode = getattr(config.rl_config, "state_probe", None)
+            if sp_mode:
+                if config.rl_config.value_head is not None:
+                    raise ValueError(
+                        "rl_config.state_probe and rl_config.value_head are mutually "
+                        "exclusive: both claim the worker's value readout slot")
+                sp_dir = (self.policy_head_config.get("checkpoint_dir")
+                          if sp_mode == "auto" else sp_mode)
+                import json as _json, os as _os
+                from longnav.utils.state_probe import (
+                    load_state_probe, STATE_PROBE_CONFIG_FILE)
+                probe = load_state_probe(sp_dir, input_dim=hidden_size)
+                probe.eval()
+                for _p in probe.parameters():
+                    _p.requires_grad_(False)
+                sp_meta = _json.loads(open(
+                    _os.path.join(sp_dir, STATE_PROBE_CONFIG_FILE)).read())
+                w_off = sp_meta.get("worker_value_readout_offset")
+                if w_off is None:
+                    raise ValueError(
+                        f"{sp_dir}/state_probe_config.json lacks "
+                        "worker_value_readout_offset -- the probe was saved by a "
+                        "trainer that did not persist the worker-frame convention; "
+                        "re-derive it with the parity script rather than guessing")
+                if int(w_off) == 0:
+                    raise ValueError(
+                        "worker_value_readout_offset == 0 is unsupported: the worker "
+                        "gates index recording on `if self.value_readout_offset:` and "
+                        "a zero offset is falsy there")
+                self.model.value_head = StateProbeValueAdapter(probe).to(self.model.device)
+                self.value_readout_offset = int(w_off)
+                self.probe_expected_token_id = sp_meta.get("probe_token_id")
             from verl.trainer.ppo.core_algos import get_policy_loss_fn
             self.policy_loss_fn = get_policy_loss_fn(config.rl_config.policy_loss.name)
             if getattr(config.rl_config, 'ref_kl', False) and self.policy_head_config['type'] == "continuous":
@@ -1004,7 +1089,18 @@ class VLMTrainingMixin:
             # a full-rank trainable module (not an adapter) and saves it in the checkpoint.
             if config.peft_config.modules_to_save is None:
                 config.peft_config.modules_to_save = []
-            if "value_head" not in config.peft_config.modules_to_save:
+            # Only a TRAINABLE critic belongs in modules_to_save. A frozen
+            # StateProbeValueAdapter must NOT be wrapped: ModulesToSaveWrapper routes
+            # forward through a deep COPY, so the adapter's distance/p_stop cache lands
+            # on the copy while the drain reads the original -- probe keys silently
+            # vanish from all but (wrap-timing-dependent) the first trajectory, and
+            # collate_trajectories KeyErrors on the mixed key set (probe_mini cycle 0,
+            # 2026-08-18). Historically this append was a no-op when no value_head
+            # module existed, so gating it on the trainable-critic config changes no
+            # prior run.
+            _rl = getattr(self, "rl_algo_config", None)
+            if _rl is not None and getattr(_rl, "value_head", None) is not None \
+                    and "value_head" not in config.peft_config.modules_to_save:
                 config.peft_config.modules_to_save.append("value_head")
             if self.policy_head_config['type'] == "continuous" and "action_head" not in config.peft_config.modules_to_save:
                 config.peft_config.modules_to_save.append("action_head")
@@ -1090,9 +1186,10 @@ class VLMTrainingMixin:
         
     def _training_forward(self,embeds_inputs):
         # Forward via DDP wrapper (triggers sync)
-        compute_values = self.rl_algo_config.value_head is not None
+        compute_values = (self.rl_algo_config.value_head is not None
+                          or bool(getattr(self.rl_algo_config, "state_probe", None)))
         forward_kwargs = {"embeds_inputs": embeds_inputs, "compute_values": compute_values}
-        if compute_values:
+        if self.rl_algo_config.value_head is not None:
             forward_kwargs["value_grad_scale"] = self.rl_algo_config.value_head.value_grad_scale
         policy_stats,vpreds, = self.ddp_model(**forward_kwargs)
         return policy_stats,vpreds
