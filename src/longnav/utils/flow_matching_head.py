@@ -352,10 +352,11 @@ def flow_interpolate(
 
 
 # --------------------------------------------------------------------------------------
-# RTC prefix conditioning (docs/RTC_TRAINING.md). These four functions are THE single
+# RTC prefix conditioning (docs/RTC_TRAINING.md). These functions are THE single
 # construction site for the commitment mask, the per-tick time vector, the row pinning
-# and the delay draw: the SFT loss, `euler_integrate` and the flow-SDE head all condition
-# through them, so the training-time masking is the same code everywhere it appears.
+# and the delay draw: the SFT loss and `euler_integrate` condition through them today,
+# and the flow-SDE head is DESIGNED to (RTC_TRAINING.md section 7 -- the RL side is
+# deliberately unbuilt), so the training-time masking stays one implementation.
 # --------------------------------------------------------------------------------------
 def prefix_mask_from_len(prefix_len: torch.Tensor, n_ticks: int) -> torch.Tensor:
     """`(N,)` committed-row counts `d` -> `(N, n_ticks)` bool, True at rows `[0, d)`.
@@ -976,6 +977,14 @@ class FlowActionCodec(nn.Module):
         if self.decode not in self.DECODES:
             raise ValueError(f"decode must be one of {self.DECODES}, got {self.decode!r}")
         if self.decode == "context":
+            if prefix is not None and len(prefix):
+                # Refuse, don't ignore: the passthrough decodes nothing, so a
+                # commitment handed to it would vanish silently -- the exact stub
+                # failure LATENCY_MASKING.md section 9 warns about.
+                raise ValueError(
+                    "decode='context' is the offline passthrough and cannot "
+                    "condition on a prefix"
+                )
             return context
         ctx = context
         noise = None

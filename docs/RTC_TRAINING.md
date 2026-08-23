@@ -162,8 +162,9 @@ no new parameters, no behavior change when no prefix is passed:
    on ground truth — is the paper's accepted shift.
 
 One implementation, three consumers: the mask and the per-tick time vector are
-constructed in a single helper in `flow_matching_head.py`, called by the SFT
-loss, by `euler_integrate`, and by the SDE head. The training-time masking is
+constructed in a single helper block in `flow_matching_head.py`, called by the
+SFT loss and by `euler_integrate` today, and designed for the SDE head to call
+when the RL side is built (section 7) -- the training-time masking is then
 literally the same code in SFT and RL.
 
 ## 7. What the RL scorer masks, and why
