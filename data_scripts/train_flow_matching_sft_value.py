@@ -787,6 +787,13 @@ def parse_args():
                         "v2 AR decoder calibrated). '1,1,1' disables scaling, which is the "
                         "design document's literal recipe and is expected to train badly -- "
                         "see flow_matching_head's ACTION SCALING note")
+    f.add_argument("--rtc-delay-max", type=int, default=0,
+                   help="RTC training-time conditioning (docs/RTC_TRAINING.md); mirrors the "
+                        "base trainer's flag. 0 disables. Probe-only rows are unaffected: "
+                        "their targets are zero-filled and action_weight already zeroes "
+                        "their action loss")
+    f.add_argument("--rtc-delay-dist", choices=("uniform", "exp"), default="uniform")
+    f.add_argument("--rtc-zero-frac", type=float, default=0.0)
 
     pre.add_argument("--latent-cvae", action="store_true",
                      help="convert the deterministic readout into a stochastic INTENT: "
@@ -995,6 +1002,9 @@ def parse_args():
         stratified_time=not mine.no_stratified_time,
         antithetic_noise=mine.antithetic_noise,
         action_scales=tuple(scales),
+        rtc_delay_max=mine.rtc_delay_max,
+        rtc_delay_dist=mine.rtc_delay_dist,
+        rtc_zero_frac=mine.rtc_zero_frac,
     )
     if args.output_dir == "dump/vector_sft":
         raise SystemExit(

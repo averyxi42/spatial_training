@@ -212,6 +212,21 @@ def parse_args():
                         "v2 AR decoder calibrated). '1,1,1' disables scaling, which is the "
                         "design document's literal recipe and is expected to train badly -- "
                         "see flow_matching_head's ACTION SCALING note")
+    f.add_argument("--rtc-delay-max", type=int, default=0,
+                   help="RTC training-time conditioning (docs/RTC_TRAINING.md): per example "
+                        "draw a commitment length d in [0, this], feed the first d rows "
+                        "clean at per-tick t=0, and take loss on the postfix only. 0 (the "
+                        "default) is the historical objective bit for bit. Must stay <= "
+                        "H - gap (10 at the shipped 20/10 config) so the postfix is never "
+                        "empty. The value rides in the checkpoint's fm_config, which is "
+                        "how downstream knows the checkpoint understands a prefix")
+    f.add_argument("--rtc-delay-dist", choices=("uniform", "exp"), default="uniform",
+                   help="law for the per-example d draw. uniform is the paper's real-world "
+                        "recipe; exp halves the weight per tick (its simulated setting)")
+    f.add_argument("--rtc-zero-frac", type=float, default=0.0,
+                   help="extra probability mass at d=0 on top of the law: resume-from-rest "
+                        "must be trained, not hoped for (the freezing hazard, "
+                        "docs/RTC_TRAINING.md section 8)")
 
     pre.add_argument("--latent-cvae", action="store_true",
                      help="convert the deterministic readout into a stochastic INTENT: "
@@ -401,6 +416,9 @@ def parse_args():
         stratified_time=not mine.no_stratified_time,
         antithetic_noise=mine.antithetic_noise,
         action_scales=tuple(scales),
+        rtc_delay_max=mine.rtc_delay_max,
+        rtc_delay_dist=mine.rtc_delay_dist,
+        rtc_zero_frac=mine.rtc_zero_frac,
     )
     if args.output_dir == "dump/vector_sft":
         raise SystemExit(
