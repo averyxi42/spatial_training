@@ -1446,11 +1446,36 @@ class TurnVectorSFTTrainer(Trainer):
             self._accumulate(outputs)
 
         # Sum every accumulator across ranks before turning them into rates.
+        #
+        # The key set must be AGREED across ranks before any reduce, and iterated in a
+        # rank-independent order. `self._sums` is an ordinary dict, so iterating it
+        # directly means iterating INSERTION order, and accumulators that are only
+        # emitted for some rows (`state_probe.metrics` skips a component's stop keys
+        # entirely when a row carries no finite label) are inserted at different points
+        # -- or not at all -- on different ranks. The per-tensor all-reduces then pair
+        # DIFFERENT KEYS across ranks and every affected metric comes out stable,
+        # plausible and wrong: on this run pointnav's eval stop rate reduced to
+        # 1787/4752 = 0.376, a sum across four ranks of `stop_pos` against `stop_n`
+        # against `stop_fn`, when no row in that corpus exceeds 0.167. Training is
+        # unaffected -- this reduce serves eval metrics only.
         if self.args.world_size > 1:
-            self._sums = {
-                k: self.accelerator.reduce(v.to(self.args.device), reduction="sum")
-                for k, v in self._sums.items()
-            }
+            import torch.distributed as _dist
+            local = sorted(self._sums)
+            keys = local
+            if _dist.is_available() and _dist.is_initialized():
+                gathered = [None] * _dist.get_world_size()
+                _dist.all_gather_object(gathered, local)
+                keys = sorted({k for part in gathered for k in part})
+            reduced = {}
+            for k in keys:
+                v = self._sums.get(k)
+                # A rank missing the key contributes zero rather than desynchronising
+                # the collective -- every rank must call reduce the same number of
+                # times, in the same order, or this deadlocks instead of merely lying.
+                v = (torch.zeros((), device=self.args.device) if v is None
+                     else v.to(self.args.device))
+                reduced[k] = self.accelerator.reduce(v, reduction="sum")
+            self._sums = reduced
         metrics = self._drain_metrics(prefix=f"{metric_key_prefix}_")
         self._save_stop_scores(metric_key_prefix)
         # `eval_loss` is the key `load_best_model_at_end` / early stopping look for.

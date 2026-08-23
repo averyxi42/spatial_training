@@ -208,6 +208,8 @@ class StateProbeConfig:
     distance: Optional[dict] = field(default_factory=lambda: {
         "hidden_dims": [1024, 512], "n_bins": 64, "d_max": 40.0,
         "hl_sigma_ratio": 0.75, "loss_weight": 1.0})
+    stop: Optional[dict] = None      # {"hidden_dims": [256], "pos_weight": 15.0,
+                                     #  "radius_m": 1.0, "loss_weight": 1.0}
     value: Optional[dict] = field(default_factory=lambda: {
         "hidden_dims": [1024, 512], "n_bins": 51, "v_min": -8.0, "v_max": 24.0,
         "hl_sigma_ratio": 0.75, "loss_weight": 1.0, "gamma": 0.97})
@@ -224,6 +226,63 @@ class StateProbeConfig:
         return cls(**{k: v for k, v in dict(d).items() if k in names})
 
 
+class BinaryStopHead(nn.Module):
+    """P(within stop radius) from the readout hidden, BCE.
+
+    Deliberately NOT the flow head's stop head: `flow_matching_head` states three times
+    that it has no stop head and none should be added, and its context vector is the
+    ACTION conditioning, not a state summary. This one reads the same readout hidden the
+    distance and value heads read, so it inherits the convention that is already
+    parity-checked end to end (offset -2, token-identity pinned).
+
+    Trained with plain `BCEWithLogitsLoss` and a MILD `pos_weight`: the consumer needs a
+    calibrated probability to threshold, and AP/AUC are invariant to pos_weight while
+    calibration is not -- a weight at the full negative:positive ratio (~38:1 at the
+    2.6% positive rate measured on the on-policy corpus) puts the operating point on a
+    brittle part of the curve. Fit the threshold on held-out SCENES, not on train.
+    """
+
+    def __init__(self, input_dim: int, hidden_dims: Sequence[int] = (256,),
+                 pos_weight: Optional[float] = 15.0, dropout: float = 0.0,
+                 dtype: Any = torch.float32):
+        super().__init__()
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype)
+        layers: List[nn.Module] = [nn.LayerNorm(input_dim, dtype=dtype)]
+        curr = input_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(curr, h, dtype=dtype), nn.GELU(), nn.Dropout(dropout)]
+            curr = h
+        last = nn.Linear(curr, 1, dtype=dtype)
+        nn.init.zeros_(last.weight); nn.init.zeros_(last.bias)   # start at p=0.5, no prior
+        layers.append(last)
+        self.mlp = nn.Sequential(*layers)
+        self.dtype = dtype
+        self.pos_weight = None if pos_weight is None else float(pos_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x.to(self.dtype)).squeeze(-1)
+
+    def loss(self, logits: torch.Tensor, y: torch.Tensor,
+             mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Masked-mean BCE. NaN labels are masked, matching the other heads."""
+        finite = torch.isfinite(y)
+        m = finite if mask is None else (mask.bool().to(y.device) & finite)
+        if not bool(m.any()):
+            return logits.sum() * 0.0
+        pw = (None if self.pos_weight is None
+              else torch.tensor(self.pos_weight, device=logits.device, dtype=torch.float32))
+        bce = nn.functional.binary_cross_entropy_with_logits(
+            logits.float(), torch.where(finite, y, torch.zeros_like(y)).float(),
+            pos_weight=pw, reduction="none")
+        mf = m.float()
+        return (bce * mf).sum() / mf.sum().clamp_min(1.0)
+
+    @staticmethod
+    def probability(logits: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(logits.float())
+
+
 class StateProbe(nn.Module):
     """Both heads over one readout hidden. Loss = weighted sum of per-head CE."""
 
@@ -232,17 +291,24 @@ class StateProbe(nn.Module):
         self.cfg = cfg
         self.distance_head = None
         self.value_head = None
+        self.stop_head = None
         if cfg.distance is not None:
             kw = {k: v for k, v in cfg.distance.items() if k != "loss_weight"}
             self.distance_head = LogDistanceHead(input_dim, dtype=dtype, **kw)
         if cfg.value is not None:
             kw = {k: v for k, v in cfg.value.items() if k not in ("loss_weight", "gamma")}
             self.value_head = ValueDistHead(input_dim, dtype=dtype, **kw)
+        self.stop_head = None
+        if cfg.stop is not None:
+            kw = {k: v for k, v in cfg.stop.items()
+                  if k not in ("loss_weight", "radius_m")}
+            self.stop_head = BinaryStopHead(input_dim, dtype=dtype, **kw)
 
     def losses(self, hidden: torch.Tensor,
                distance_targets: Optional[torch.Tensor] = None,
                return_targets: Optional[torch.Tensor] = None,
-               mask: Optional[torch.Tensor] = None) -> dict:
+               mask: Optional[torch.Tensor] = None,
+               stop_targets: Optional[torch.Tensor] = None) -> dict:
         g = float(self.cfg.grad_scale)
         h = hidden if g >= 1.0 else (hidden * g + hidden.detach() * (1.0 - g))
         out = {}
@@ -254,12 +320,16 @@ class StateProbe(nn.Module):
             out["probe/value_loss"] = self.cfg.value["loss_weight"] * \
                 self.value_head.loss(self.value_head(h.to(self.value_head.dtype)),
                                      return_targets, mask)
+        if self.stop_head is not None and stop_targets is not None:
+            out["probe/stop_loss"] = self.cfg.stop.get("loss_weight", 1.0) * \
+                self.stop_head.loss(self.stop_head(h), stop_targets, mask)
         return out
 
     @torch.no_grad()
     def metrics(self, hidden: torch.Tensor,
                 distance_targets: Optional[torch.Tensor] = None,
-                return_targets: Optional[torch.Tensor] = None) -> dict:
+                return_targets: Optional[torch.Tensor] = None,
+                stop_targets: Optional[torch.Tensor] = None) -> dict:
         """Interpretable-scale accuracy, as sums + counts so any accumulation
         (grad-accum, DDP, eval loop) averages exactly. Masking matches `loss`:
         non-finite targets (sidecar gaps) contribute nothing. `bias` is signed
@@ -276,6 +346,21 @@ class StateProbe(nn.Module):
                 out["probe_dist_abs_err_sum"] = err.abs().sum()
                 out["probe_dist_err_sum"] = err.sum()
                 out["probe_dist_n"] = m.float().sum()
+        if self.stop_head is not None and stop_targets is not None:
+            y = stop_targets.float()
+            m = torch.isfinite(y)
+            if bool(m.any()):
+                p = self.stop_head.probability(self.stop_head(hidden))[m]
+                yy = y[m]
+                out["probe_stop_n"] = m.float().sum()
+                out["probe_stop_pos"] = yy.sum()
+                # calibration in one number: mean predicted vs actual positive rate.
+                # A gap here is the failure mode that ruins a threshold rule even when
+                # ranking is good, so it is reported from the first eval, not derived later.
+                out["probe_stop_psum"] = p.sum()
+                out["probe_stop_tp"] = ((p >= 0.5) & (yy > 0.5)).float().sum()
+                out["probe_stop_fp"] = ((p >= 0.5) & (yy <= 0.5)).float().sum()
+                out["probe_stop_fn"] = ((p < 0.5) & (yy > 0.5)).float().sum()
         if self.value_head is not None and return_targets is not None:
             y = return_targets.float()
             m = torch.isfinite(y)
@@ -298,7 +383,8 @@ def save_state_probe(out_dir, probe: StateProbe, extra: Optional[dict] = None) -
     out = Path(out_dir)
     torch.save(probe.state_dict(), out / STATE_PROBE_FILE)
     cfg = {"readout_offset": probe.cfg.readout_offset, "grad_scale": probe.cfg.grad_scale,
-           "distance": probe.cfg.distance, "value": probe.cfg.value}
+           "distance": probe.cfg.distance, "value": probe.cfg.value,
+           "stop": probe.cfg.stop}
     if extra:
         cfg.update(extra)
     (out / STATE_PROBE_CONFIG_FILE).write_text(json.dumps(cfg, indent=2))

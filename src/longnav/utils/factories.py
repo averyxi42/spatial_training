@@ -353,6 +353,18 @@ class ExpBootstrapper:
         )
         if training:
             futures = RLWorkerFactory._enable_training(workers,self.typed_cfg.resources,self.typed_cfg.training)
+        elif getattr(self.typed_cfg.training.rl_config, "state_probe", None):
+            # EVAL WITH A PROBE: the probe belongs to the checkpoint, not to the
+            # optimizer, but it was previously only loaded inside setup_training --
+            # which this path deliberately skips. Attach it here so `longnav.scripts.eval`
+            # can measure the distance/value heads without borrowing the trainer.
+            futures = [w.attach_state_probe.remote(self.typed_cfg.training.rl_config)
+                       for w in workers]
+            import ray as _ray
+            attached = _ray.get(futures)
+            print(f"[eval] state probe attached on {sum(bool(a) for a in attached)}/"
+                  f"{len(workers)} workers")
+            futures = []
             ray.get(futures)
         else:
             print("⚠️ Skipping training setup for RL workers.")

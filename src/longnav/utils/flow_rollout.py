@@ -131,7 +131,15 @@ def load_flow_policy(
     if pin_flow_noise is not None:
         model.codec.pin_flow_noise(int(pin_flow_noise))
     print(f"[flow] {model.codec.describe()}", flush=True)
-    return VectorRolloutPolicy(model, processor, cfg)
+    policy = VectorRolloutPolicy(model, processor, cfg)
+    # A flow checkpoint's stop head, when it has one, lives on the state probe -- the
+    # flow head itself has none by design. Silent no-op on a checkpoint without one.
+    # getattr because the tests substitute a stub policy rather than load a
+    # multi-billion-parameter VLM; a real VectorRolloutPolicy always has the method.
+    attach = getattr(policy, "attach_state_probe", None)
+    if callable(attach):
+        attach(checkpoint_dir)
+    return policy
 
 
 def seed_latent(policy: VectorRolloutPolicy, seed: Optional[int]) -> None:

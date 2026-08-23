@@ -732,7 +732,11 @@ class VectorRolloutPolicy:
         if self._pose_spec is not None:
             out += (f"\n  pose: step(..., obs_pose=(x, y, theta)) fills "
                     f"{self._pose_spec.token}, relative to this episode's first pose")
-        if self.model.stop_head is not None:
+        if self.model.stop_head is None and getattr(self, "_probe", None) is not None:
+            out += ("\n  stop head: state-probe BCE head at readout offset "
+                    f"{self._probe_offset} -> last_stats['stop_prob'], ['stop_logit']; "
+                    "the harness owns the threshold")
+        elif self.model.stop_head is not None:
             c = self.model.stop_head.cfg
             out += (f"\n  stop head: inference={c.inference} temperature={c.temperature} "
                     f"threshold={c.threshold} -> last_stats['stop_prob'], ['stop']")
@@ -764,7 +768,54 @@ class VectorRolloutPolicy:
         model = TurnVectorRegressor.from_pretrained(
             checkpoint_dir, processor, dtype=cfg.dtype, device=cfg.device
         )
-        return cls(model, processor, cfg)
+        policy = cls(model, processor, cfg)
+        policy.attach_state_probe(checkpoint_dir)
+        return policy
+
+    # ---------------------------------------------------------------------------------
+    def attach_state_probe(self, checkpoint_dir) -> bool:
+        """Load a co-trained state probe from the checkpoint, if it has one.
+
+        The flow head has NO stop head of its own -- `flow_matching_head` says so
+        explicitly -- so `model.stop_head` is None for every flow checkpoint and the
+        `stop_prob` block below never fired. A stop head trained as part of the state
+        probe lives somewhere else entirely (`state_probe.stop_head`) and reads a
+        different tensor: the hidden at the PROBE readout position, not the pooled
+        motion context. Without this, a checkpoint can be trained with a stop head that
+        `--stop-head` then refuses as "this checkpoint has no stop head".
+
+        The position convention is the checkpoint's, not this file's opinion:
+        `worker_value_readout_offset` is written by the trainer relative to the
+        end-of-turn logit index, and `probe_token_id` pins the identity of the token it
+        must land on. Both are ASSERTED per step -- an off-by-one here once put the
+        readout on '\n' instead of 'assistant', and only the token-id check caught it.
+        """
+        from pathlib import Path as _P
+        import json as _json
+        d = _P(checkpoint_dir)
+        self._probe = None
+        self._probe_offset = None
+        self._probe_token_id = None
+        if not (d / "state_probe.pt").exists():
+            return False
+        from longnav.utils.state_probe import load_state_probe, STATE_PROBE_CONFIG_FILE
+        meta = _json.loads((d / STATE_PROBE_CONFIG_FILE).read_text())
+        hs = int(getattr(self.model.backbone.config, "text_config",
+                         self.model.backbone.config).hidden_size)
+        probe = load_state_probe(str(d), input_dim=hs)
+        if getattr(probe, "stop_head", None) is None:
+            return False
+        off = meta.get("worker_value_readout_offset")
+        if off is None:
+            raise ValueError(
+                f"{d}/{STATE_PROBE_CONFIG_FILE} lacks worker_value_readout_offset; the "
+                "probe was saved by a trainer that predates the readout contract and "
+                "its position cannot be re-derived here.")
+        dev = next(self.model.parameters()).device
+        self._probe = probe.to(dev).eval()
+        self._probe_offset = int(off)
+        self._probe_token_id = meta.get("probe_token_id")
+        return True
 
     # ---------------------------------------------------------------------------------
     def reset(self, goal_text: Optional[str] = None, system_prompt: Optional[str] = None,
@@ -958,7 +1009,33 @@ class VectorRolloutPolicy:
         # policy that silently truncated its own rollout would be indistinguishable from
         # one that crashed.
         stop_prob = stop = None
-        if self.model.stop_head is not None:
+        probe = getattr(self, "_probe", None)
+        if self.model.stop_head is None and probe is not None:
+            # Probe readout: the end-of-turn logit index is the last emitted position,
+            # and the probe sits `worker_value_readout_offset` from it.
+            pos = -1 + int(self._probe_offset)
+            if -pos > int(ids.shape[1]):
+                raise RuntimeError(
+                    f"probe offset {self._probe_offset} underflows this turn "
+                    f"({ids.shape[1]} tokens)")
+            if self._probe_token_id is not None:
+                tok = int(ids[0, pos])
+                if tok != int(self._probe_token_id):
+                    raise RuntimeError(
+                        f"probe readout lands on token id {tok}, but the checkpoint "
+                        f"pinned {self._probe_token_id}; the rollout template does not "
+                        "match the one the probe was trained against.")
+            with torch.no_grad():
+                h = outputs["last_hidden_state"][:, pos, :]
+                logit = probe.stop_head(h.to(next(probe.stop_head.parameters()).dtype))
+                stop_logit = float(logit.reshape(-1)[0])
+                stop_prob = float(probe.stop_head.probability(logit).reshape(-1)[0])
+            self._probe_stop_logit = stop_logit
+            # Reported, never acted on here: the caller decides whether an episode ends.
+            # `stop` stays None so no threshold is invented -- the harness owns that,
+            # and it must be fitted on held-out scenes rather than assumed to be 0.5,
+            # since any pos_weight != 1 shifts the operating point.
+        elif self.model.stop_head is not None:
             pooled = self.model.head.pooled_context(states)
             logit = self.model.stop_head(pooled)
             stop_prob = float(self.model.stop_head.probability(logit)[0])
@@ -975,6 +1052,7 @@ class VectorRolloutPolicy:
             "dense_tokens": self.dense_tokens,
             "latency_s": time.perf_counter() - t0,
             "stop_prob": stop_prob,
+            "stop_logit": getattr(self, "_probe_stop_logit", None),
             "stop": stop,
             # The value that was actually injected, not the raw pose that was passed in.
             # A decodability probe has to correlate the pooled state against what the

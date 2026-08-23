@@ -1,0 +1,163 @@
+# @package _global_
+# CRITIC-BASELINE ARM -- the paired follow-up to the gamma-0.97 falsifier.
+#
+# gamma097 resolved NEGATIVE (docs/GAMMA097_RESULTS.md): gamma alone, on the time-kernel
+# baseline, produced no gain over ck791 (sample400 paired t=-1.95 on oracle SR). The
+# pre-registered interpretation was a variance floor the kernel cannot cut. This run
+# changes EXACTLY the variance mechanism and nothing else in the algorithm:
+#
+#   baseline        time kernel (sigma 40)  ->  frozen state critic
+#                   (reinforce_plus_plus_state_critic; unbiased for any state function).
+#                   Offline, on 64 held-out on-policy episodes, the composed critic cuts
+#                   advantage variance 23% below the kernel (5.12 vs 6.63; corr(v,G)
+#                   0.556 [0.454, 0.652]) -- docs/STOP_HEAD_PLAN.md 2026-08-19.
+#   base policy     cotrain-v3 ck-12000  ->  cotrain-v4 ck-1000 (value-SFT lineage; the
+#                   critic was refit ON ck-1000's hiddens, so base and critic MUST move
+#                   together -- pointing this critic at another backbone is undefined).
+#                   The composed dir checkpoint-1000_RLCOMPOSED carries the flow head,
+#                   the adapter (merged as base), the co-trained distance head, and the
+#                   REFIT joint value head, with the worker-frame readout pins.
+#
+# Unchanged from gamma097 (the control surface): gamma 0.97, pool trainset64, n_rollout
+# 24, n_adv 256, a=0.9, frozen action head, lr 2e-6, KL measure-only, eval26 pinned,
+# exclude [plant], bootstrap_truncated false (a critic makes it attractive; NOT enabled,
+# one change at a time).
+#
+# PRE-REGISTERED READOUT (fixed before first look):
+#   PRIMARY   eval26 slope (Newey-West t on success and oSPL) at ~150 cycles, read
+#             against gamma097's flat curve on the SAME instrument. gamma097's whole
+#             425-cycle post-relaunch curve stayed at 0.696/0.44; any resolved positive
+#             slope here is attributable to the baseline swap (modulo the v4-ck1000 base,
+#             see below).
+#   HEALTH    (a) PROBE COUNTERFACTUAL per cycle: probe/adv_var_probe must sit BELOW
+#             adv_var_kernel on live rollouts. If it does not, the offline result did
+#             not transfer and the eval readout is VOID, not evidence.
+#             (b) training G0 at gamma 0.97 must move off the warm start.
+#   CONFOUND  the base differs from gamma097's (v4-ck1000 vs v3-ck12000). v4-ck1000 is
+#             1000 steps of continued training on the same mixture from v3-ck12000, and
+#             its SFT eval turn losses matched v3's curve; a large policy delta is not
+#             expected but a positive result should be sample400'd against ck791 before
+#             attribution talk. ON RECORD: if eval26 stays flat here too, the variance
+#             story loses standing and the residual suspects are exploration and the
+#             z0-dominated outcome-variance structure.
+#   STALENESS the critic is frozen and was fit on gamma097-policy rollouts. As this run's
+#             policy departs, probe/adv_var_probe may drift up. The refit machinery
+#             (docs/STOP_HEAD_PLAN.md) re-fits in minutes from this run's own rollout
+#             archive; a mid-run critic refresh is allowed ONLY as a documented,
+#             cycle-stamped event.
+
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v4_probe_mix/checkpoint-1000_RLCOMPOSED/adapter
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v4_probe_mix/checkpoint-1000_RLCOMPOSED
+    gap: 10
+    sde_n: 3
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+
+sim:
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train100x80
+  exclude_categories: [plant]
+  train_uids: /Projects/spatial_training/dump/eval_system/episode_sets/trainset64_gamma097.txt
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 0.4
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: false
+  reward_lost_steps: 25
+
+rollout:
+  max_steps: 175
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  # RESUME (flip event): same run, cycle counter + buffer from checkpoint_95.
+  checkpoint: /Projects/spatial_training/dump/flow_rl/flow_sde_critic097_warm64/checkpoints/checkpoint_95
+  load_optim: true
+  load_sched: true
+  learning_rate: 2.0e-6
+  action_head_learning_rate: 0.0
+  grad_accum_steps: 2
+  max_grad_norm: 20.0
+  total_optimization_steps: 20000
+  warmup_steps: 32
+  save_step: 8
+  rl_config:
+    state_probe: auto
+    # PHASE 0: the kernel trains; the critic only LOGS. The 1-GPU smoke (2026-08-19)
+    # measured the offline-refit critic at Var 7.8-8.4 vs the kernel's 3.0-3.7 on live
+    # rollouts of THIS base -- the gamma097 archive contains no SFT-policy states, so
+    # no offline refit can cover cycle-0 distribution. The per-cycle PROBE
+    # COUNTERFACTUAL gauge (honest kernel reference) is the switch criterion: refit the
+    # critic from this run's own rollout archive (docs/STOP_HEAD_PLAN.md machinery),
+    # and flip this key to reinforce_plus_plus_state_critic ONLY when the refit
+    # critic's logged adv-var sits at-or-below the kernel's for a sustained window.
+    # The flip is a cycle-stamped, documented event (resume restores the buffer, whose
+    # rows already carry probe values throughout phase 0).
+    # FLIP EVENT 2026-08-19, cycle 96: estimator kernel -> state_critic, critic =
+    # c097-v3 (retrained on 717 phase-0 episodes; holdout tie vs kernel, P=0.367).
+    # USER DECISION: a tie is free to adopt and the critic's edge should grow with
+    # policy sharpening (gamma097-late-policy evidence: corr 0.57, -23% vs kernel).
+    # Buffer note: resumed buffer rows carry PHASE-0 critic values for ~11 cycles
+    # until flushed (256/24); any state baseline is unbiased so this is a transient
+    # variance inconsistency, not bias.
+    advantage_estimator: reinforce_plus_plus_state_critic
+    time_kernel_sigma: 40.0
+    time_alignment: start
+    time_loto: false
+    gamma: 0.97
+    n_rollout: 24
+    n_adv: 256
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    ref_kl: true
+    ref_kl_coeff: 0.0
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "flow_sde_critic097_warm64"
+  output_dir: /Projects/spatial_training/dump/flow_rl
+  subset_label: "everything"
+  shard_size: 0
+  eval_every: 4
+  eval_set_size: 32
+  eval_uids_file: /Projects/spatial_training/dump/eval_system/episode_sets/fullpool_evalset_servable26.txt
+  eval_ode: true

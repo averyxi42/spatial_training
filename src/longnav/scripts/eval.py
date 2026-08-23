@@ -23,6 +23,8 @@ def main(cfg: RLConfig):
 
     from longnav.utils.rollout_core import collect_rollouts
     from longnav.utils.train_loop import bootstrap_all
+    from longnav.utils.probe_eval_report import (aggregate, format_summary,
+                                                 write_episode_records)
 
     print(f"Model ID: {cfg.vlm.model_id}")
 
@@ -64,6 +66,10 @@ def main(cfg: RLConfig):
             pickle.dump(obj,f)
 
     # ------------------------------------------- rollouts ------------------------------------------
+    run_dir = os.path.join(bootstrapper.typed_cfg.task.output_dir,
+                           bootstrapper.typed_cfg.task.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    written = 0
     batch_size = 32 # fixed batch size decoupled from RL logic for eval
     for i in range(max(math.ceil(len(all_episodes)/batch_size),1)):
         logger.info("Starting rollout collection!")
@@ -71,11 +77,27 @@ def main(cfg: RLConfig):
         if len(rollout_list) == 0:
             print("rollout list empty, exiting")
             break
+        # Per-episode probe records, written as each BATCH lands so a long eval has an
+        # early read and nothing accumulates in memory. Aggregation is pure
+        # post-processing over these files (probe_eval_report.aggregate), so it can be
+        # run here at the end or standalone against the finished run directory.
+        if getattr(bootstrapper.typed_cfg.training.rl_config, "state_probe", None):
+            n = write_episode_records(run_dir, rollout_list, result_list)
+            written += n
+            try:
+                print(format_summary(aggregate(run_dir, write=False)), flush=True)
+            except Exception as exc:               # never let reporting kill an eval
+                print(f"[probe] interim summary unavailable ({exc})", flush=True)
         # save for analysis
         # pickle_obj(rollout_list, f"rollout_{i}")
         # pickle_obj(result_list, f"result_{i}")
         # pickle_obj(log_list,f"logpaths_{i}")
     ray.get(log_list)
+    if written:
+        summary = aggregate(run_dir)
+        print("\n===== FINAL =====")
+        print(format_summary(summary), flush=True)
+        print(f"records: {os.path.join(run_dir, 'probe_records.jsonl')}")
     cleanup()
 
 if __name__ == "__main__":

@@ -453,6 +453,55 @@ def compute_reinforce_plus_plus_time_kernel_advantage(
         advantages = advantages * response_mask
     return advantages, returns, baseline
 
+@register_adv_est("reinforce_plus_plus_state_critic")
+def compute_reinforce_plus_plus_state_critic_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    values: Optional[torch.Tensor] = None,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """REINFORCE++ with a FROZEN state-critic baseline.
+
+    `values` is the per-step output of the state probe's value head
+    (rl_config.state_probe), computed in the packed post-episode recompute and
+    collated into the batch. Any deterministic state function is an unbiased
+    baseline, so a stale or off-distribution critic costs variance, never bias --
+    the per-cycle PROBE COUNTERFACTUAL log is the live gauge of that cost against
+    the kernel. Discounted returns, degenerate-batch guard and masked whitening
+    are copied from the time-kernel estimator verbatim.
+
+    HARD requirement on `values`: a silent fallback to another baseline would
+    quietly turn a critic arm into a kernel arm and the comparison would lie.
+    """
+    assert config is not None
+    if values is None:
+        raise ValueError(
+            "reinforce_plus_plus_state_critic requires per-step values; set "
+            "rl_config.state_probe so the worker computes them (a run without "
+            "values must use a kernel/naive estimator instead)")
+    gamma = config.gamma
+    with torch.no_grad():
+        returns = torch.zeros_like(token_level_rewards)
+        running_return = 0
+        for t in reversed(range(token_level_rewards.shape[1])):
+            running_return = token_level_rewards[:, t] + gamma * running_return
+            returns[:, t] = running_return
+            running_return = running_return * response_mask[:, t]
+
+        baseline = values.to(returns.dtype) * response_mask
+        advantages = returns - baseline
+        _m = response_mask.bool()
+        if _m.any() and float(advantages[_m].std()) < 1e-6:
+            print("WARNING: degenerate advantage batch (std ~ 0); zeroing advantages "
+                  "for this cycle instead of whitening into NaN")
+            advantages = torch.zeros_like(advantages)
+        else:
+            advantages = verl_F.masked_whiten(advantages, response_mask)
+        advantages = advantages * response_mask
+    return advantages, returns, baseline
+
+
 @register_adv_est("reinforce_plus_plus_linear_time_aware")
 def compute_reinforce_plus_plus_linear_time_aware_advantage(
     token_level_rewards: torch.Tensor, 

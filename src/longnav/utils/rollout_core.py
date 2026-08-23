@@ -422,6 +422,28 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
         '''
         model_inputs = None
 
+        # EVAL WITH A PROBE ATTACHED: the log-prob machinery is skipped for speed, but
+        # the distance/value heads read the same packed hidden and are the point of an
+        # eval run that measures them. One extra forward per EPISODE (not per step), and
+        # only when a probe is actually configured -- a plain policy eval is unchanged.
+        if eval and getattr(self, "state_probe_attached", False):
+            import torch
+            with torch.no_grad():
+                self.rl_embeds_inputs = self._pack_embeds()
+                _, values = self._forward_embeds(self.rl_embeds_inputs, True)
+                _vh = getattr(getattr(self, "model", None), "value_head", None)
+                if values is not None:
+                    if getattr(_vh, "is_distributional", False):
+                        values = _vh.value(values)
+                    self.rl_trajectory["values"] = values.squeeze().float().cpu().numpy()
+                if getattr(_vh, "last_distance_m", None) is not None:
+                    self.rl_trajectory["probe_distance_m"] = _vh.last_distance_m.squeeze().numpy()
+                    self.rl_trajectory["probe_p_stop"] = _vh.last_p_stop.squeeze().numpy()
+                    _vh.last_distance_m = None
+                    _vh.last_p_stop = None
+            self.rl_embeds_inputs = None
+            return self.rl_trajectory, model_inputs
+
         if not eval: # skip logprobs calculation during eval for speed.
             embeds = self._pack_embeds()
             self.rl_embeds_inputs = embeds

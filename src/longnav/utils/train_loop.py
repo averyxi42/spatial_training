@@ -290,14 +290,41 @@ def compute_advantages_and_returns(
             "probe/adv_var_probe": (r - pv).var().item(),
             "probe/adv_var_naive": r.var().item(),
         }
-        if "baseline" in traj_batch.keys():
-            kb = traj_batch["baseline"][vm].float()
+        # HONEST kernel reference: under a critic estimator, traj_batch["baseline"]
+        # IS the critic, so reading it as "the kernel" compares the critic to itself
+        # (observed: critic smoke 2026-08-19, kernel_mse == value_mse identically).
+        # Fit the time kernel counterfactually on the same buffer instead, matching
+        # the estimator's configuration.
+        try:
+            from longnav.utils.rl_core import BinnedKernelCritic
+            _rlc = cfg.training.rl_config
+            _t = torch.arange(returns.shape[1], device=returns.device).unsqueeze(0) \
+                .expand(returns.shape[0], -1)
+            if getattr(_rlc, "time_alignment", "start") == "end":
+                _t = _t - traj_batch["response_mask"].sum(-1).long().unsqueeze(1)
+            _tf = _t[vm]
+            _kc = BinnedKernelCritic(n_bins=1024, device=returns.device)
+            _kc.fit(_tf, r, sigma=getattr(_rlc, "time_kernel_sigma", 40.0))
+            kb = _kc.predict(_tf).float()
             cf["probe/kernel_mse"] = ((kb - r) ** 2).mean().item()
             cf["probe/adv_var_kernel"] = (r - kb).var().item()
+        except Exception as _e:   # the gauge must never kill training
+            print(f"counterfactual kernel fit failed: {_e}")
         def _corr(a, b):
             a = a - a.mean(); b = b - b.mean()
             return float((a * b).sum() / (a.norm() * b.norm()).clamp_min(1e-8))
         cf["probe/corr_value_return"] = _corr(pv, r)
+        # buffer-level explained variance, plus its between/within-episode split
+        # (the per-minibatch critic/explained_variance is within ONE episode only).
+        cf["probe/explained_var_pooled"] = float(1.0 - (r - pv).var() / r.var().clamp_min(1e-5))
+        _rm = traj_batch["response_mask"]
+        _ep_mean_g = (returns * _rm).sum(-1) / _rm.sum(-1).clamp_min(1)
+        _ep_mean_v = (values * _rm).sum(-1) / _rm.sum(-1).clamp_min(1)
+        cf["probe/explained_var_between"] = float(
+            1.0 - (_ep_mean_g - _ep_mean_v).var() / _ep_mean_g.var().clamp_min(1e-5))
+        _rw = (returns - _ep_mean_g.unsqueeze(1))[vm]
+        _vw = (values - _ep_mean_v.unsqueeze(1))[vm]
+        cf["probe/explained_var_within"] = float(1.0 - (_rw - _vw).var() / _rw.var().clamp_min(1e-5))
         _LAST_PROBE_COUNTERFACTUAL = cf
         print(f"PROBE COUNTERFACTUAL: {cf}")
 

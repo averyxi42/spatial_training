@@ -23,6 +23,17 @@ Usage (GPU 4; longnav_vlm env):
       data_scripts/eval_value_heads_offline.py \
       --ckpt dump/pose_injection/run_cotrain_v4_probe_mix/checkpoint-800
 """
+
+raise SystemExit(
+    "RETIRED 2026-08-23. This script consumed frames recovered by decoding rollout "
+    "video.mp4 files. Those videos carry a rendered HUD printing distance_to_goal, goal "
+    "and step, so every corpus and every hidden-state cache built through this path had "
+    "the labels in the pixels. mine_rollout_frames.py has been deleted and its outputs "
+    "purged. If you need on-policy observations, have the rollout WRITE its frames, and "
+    "evaluate on HM3D val -- never on scenes any corpus in this lineage trained on."
+)
+
+
 import argparse
 import collections
 import json
@@ -48,6 +59,11 @@ ap.add_argument("--goal-manifest", default=None,
                 help="json of {episode_tag: goal_text}; when set, episode-paths entries "
                      "are bare tags (no rollout dir, no summary.json) -- used for "
                      "expert-distribution sets built from formatted corpus rows")
+ap.add_argument("--strip-step-labels", action="store_true",
+                help="rewrite 'Observation $step:' -> 'Observation:' in the rollout "
+                     "templates, matching a cotrain-v5 (nostep) checkpoint. The cached "
+                     "frames and distance labels are unaffected -- only the text the "
+                     "model reads changes.")
 ap.add_argument("--out-suffix", default="",
                 help="suffix for the output json name (e.g. '_expert')")
 args = ap.parse_args()
@@ -63,6 +79,19 @@ from longnav.utils.vlm_worker import StateProbeValueAdapter
 
 RUN = yaml.safe_load(open(f"{BASE}/dump/flow_rl/flow_sde_gamma097_warm64/config.yaml"))
 rollout = dict(RUN["rollout"])
+if args.strip_step_labels:
+    def _strip(tmpl):
+        out = []
+        for m in tmpl:
+            c = [dict(y, text=y["text"].replace("Observation $step:", "Observation:")
+                                        .replace("Observation 0:", "Observation:"))
+                 if isinstance(y, dict) and y.get("type") == "text" and y.get("text") else y
+                 for y in m["content"]]
+            out.append({**m, "content": c})
+        return out
+    rollout["convo_start_template"] = _strip(rollout["convo_start_template"])
+    rollout["convo_turn_template"] = _strip(rollout["convo_turn_template"])
+    print("step labels stripped from rollout templates", flush=True)
 
 # ---------------- labels: one row per (episode, step) from the miner ------------------
 rows_by_ep = collections.defaultdict(dict)
@@ -92,7 +121,7 @@ print(f"ckpt {CKPT}  offset {w.value_readout_offset}  pin {w.probe_expected_toke
       flush=True)
 
 # ---------------- replay each pinned conversation through the packed forward ----------
-V, D, P, G, DT, T = [], [], [], [], [], []   # flat per-step series across episodes
+V, D, P, G, DT, T, EP, H = [], [], [], [], [], [], [], []
 n_done = 0
 goal_manifest = json.load(open(args.goal_manifest)) if args.goal_manifest else None
 for ep_path in ep_paths:
@@ -126,7 +155,12 @@ for ep_path in ep_paths:
             msgs = substitute_convo_template(rollout["convo_turn_template"],
                                              {"action": "", "step": k + 1})
         embeds = w._pack_embeds()
+        _cap = {}
+        _hk = w.language_model.register_forward_hook(
+            lambda m, i, o: _cap.__setitem__("h", o.last_hidden_state.detach()))
         _, values = w._forward_embeds(dict(embeds), True)
+        _hk.remove()
+        H_ep = _cap["h"][0, embeds["value_logits_to_keep"]].float().cpu().numpy()
         ad = w.model.value_head
         v = ad.value(values).squeeze().float().cpu().numpy().reshape(-1)
         d = ad.last_distance_m.squeeze().numpy().reshape(-1)
@@ -138,7 +172,7 @@ for ep_path in ep_paths:
         if r["return"] is None:
             continue
         V.append(float(v[k])); D.append(float(d[k])); P.append(float(p[k]))
-        G.append(float(r["return"]))
+        G.append(float(r["return"])); EP.append(n_done); H.append(H_ep[k])
         DT.append(float(r["distance"]) if r["distance"] is not None else np.nan)
         T.append(k)
     n_done += 1
@@ -178,6 +212,9 @@ res = {
 }
 os.makedirs(SET_DIR, exist_ok=True)
 out = os.path.join(SET_DIR, os.path.basename(CKPT.rstrip("/")) + args.out_suffix + ".json")
+# per-step series alongside, for bootstrap CIs / later re-analysis without a GPU
+np.savez(out.replace(".json", "_series.npz"), V=V, D=D, P=P, G=G, DT=DT, T=T,
+         ep_id=np.asarray(EP), H=np.asarray(H, dtype=np.float16))
 json.dump(res, open(out, "w"), indent=2)
 print(json.dumps(res, indent=2))
 print(f"-> {out}")

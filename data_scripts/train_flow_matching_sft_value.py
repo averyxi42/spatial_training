@@ -88,6 +88,7 @@ from longnav.utils.model_metrics import attach_model_metrics  # noqa: E402
 from longnav.utils.flow_matching_head import (  # noqa: E402
     ACTION_SCALES, DEFAULT_DT_NATIVE, FlowMatchingConfig, FlowMatchingSFTTrainer,
     NUM_INFERENCE_STEPS, TurnFlowActionRegressor,
+    FLOW_METRIC_KEYS,
 )
 from longnav.utils.vector_sft import (  # noqa: E402
     DataConfig, LossConfig, LoraSpec, ModelConfig, TurnVectorCollator,
@@ -127,6 +128,39 @@ class _RecordingRng:
         return getattr(self._rng, name)
 
 
+def _probe_ddp_scale():
+    """Cancel the world-size inflation transformers applies to the loss.
+
+    With `average_tokens_across_devices=True` the Trainer multiplies the loss by
+    `num_processes` so that DDP's subsequent gradient AVERAGING recovers a true global
+    mean. That cancels exactly for the flow loss, whose denominator is the GLOBAL turn
+    count (`vector_sft`). The probe loss is a per-rank masked mean with no global
+    denominator, so the multiply does not cancel and the probe term enters the optimizer
+    at `world_size x` its nominal weight -- on the ddp4 runs, `--probe-grad-scale 0.3`
+    actually acted as ~1.2, and any single-GPU smoke understated probe pressure 4x.
+    Dividing here makes the flags mean what they say."""
+    try:
+        import torch.distributed as _dist
+        if _dist.is_available() and _dist.is_initialized():
+            w = int(_dist.get_world_size())
+            if w > 1:
+                return 1.0 / float(w)
+    except Exception:
+        pass
+    return 1.0
+
+
+def _finite_count(x):
+    """Number of turns whose target is finite -- the correct denominator for that
+    component's mean loss. Using the total turn count instead lets NaN-target turns
+    (shuffled rows' returns, pointnav's ~21% distance gaps) contribute 0 to the
+    numerator while still counting in the denominator, which silently DEFLATES the
+    logged loss."""
+    if x is None:
+        return _torch.tensor(0.0)
+    return _torch.isfinite(x).sum().float().detach().cpu()
+
+
 class ProbeCollator(_BaseCollator):
     """Base collator + per-turn `distance_targets` / `return_targets`, sliced with the
     SAME window the base applied to the action targets."""
@@ -148,7 +182,8 @@ class ProbeCollator(_BaseCollator):
         start = rec.draws[0] if rec.draws else 0
         n_kept = int(out["targets"].shape[0])
         for col, key in ((self.distance_column, "distance_targets"),
-                         (self.return_column, "return_targets")):
+                         (self.return_column, "return_targets"),
+                         ("stop_targets", "stop_targets")):
             raw = ex.get(col)
             if raw is None:
                 continue
@@ -160,6 +195,45 @@ class ProbeCollator(_BaseCollator):
             vals = [float("nan") if v is None else float(v)
                     for v in raw[start:start + n_kept]]
             out[key] = _torch.tensor(vals, dtype=_torch.float32)
+        # PROBE-ONLY rows (on-policy rollouts, shuffled or not) carry no expert action:
+        # their action_chunks block is all-NaN and exists only for the shape contract.
+        # Flag it so forward() can drop the turn loss; see the assert there.
+        # PER-FRAME stop labels REPLACE the base collator's structural ones (whose
+        # positive is the window's final turn). Whether that substitution actually
+        # happened is a property of the DATA, checked once at build time in
+        # build_onpolicy_distance_dataset.py -- NOT here: a single shuffled row can
+        # legitimately have its only positive last (probability 1/n under a uniform
+        # permutation), and asserting per row killed a run at step 46.
+        # DDP: the stop head must forward on EVERY rank every step or the reducer
+        # waits forever on the ranks that skipped it. Components differ in whether they
+        # carry stop labels (the demo corpora do not, today), so when a stop head exists
+        # and the column is absent we emit an all-NaN one. NaN targets are masked inside
+        # the head and are proven zero-grad-safe (tests/test_gradient_isolation.py I2/I3),
+        # so this costs nothing and removes the hang.
+        if getattr(self, "require_stop", False) and "stop_targets" not in out:
+            out["stop_targets"] = _torch.full((n_kept,), float("nan"),
+                                              dtype=_torch.float32)
+        po = bool(ex.get("probe_only", False))
+        # DDP needs every rank to run the SAME ops. Branching on row type inside forward
+        # made ranks enter different collectives and deadlock at step 0 (2026-08-22;
+        # isolation showed demos-only and on-policy-only each fine, only the MIXTURE
+        # hung). So the row type is a MULTIPLIER, not a branch. Targets are sanitised
+        # here -- rank-local, no collective -- after the NaN tripwire is checked.
+        if po:
+            t = out.get("targets")
+            if t is not None:
+                if _torch.isfinite(t).any():
+                    raise ValueError(
+                        "probe_only row has finite action targets; the builder writes "
+                        "NaN on purpose. Refusing rather than training on rollout "
+                        "actions.")
+                out["targets"] = _torch.zeros_like(t)   # unused: action_weight is 0
+        out["action_weight"] = _torch.tensor(0.0 if po else 1.0, dtype=_torch.float32)
+        out["probe_only"] = po
+        # Carried so saved scores can be split ordered vs shuffled AFTER the fact. The
+        # shuffled half is the only clock-free reading of the head, and pooling the two
+        # into one number makes it invisible -- which is exactly what happened to v8.
+        out["turns_shuffled"] = bool(ex.get("turns_shuffled", False))
         return out
 
 
@@ -180,10 +254,32 @@ class TurnFlowActionRegressorWithProbe(TurnFlowActionRegressor):
     probe_token_id = None         # pinned on first batch; constancy asserted after
     probe_worker_offset = None    # probe position in the worker's end-of-turn frame
 
+    #: Off by default: this is diagnostics, and a run that does not ask for it must
+    #: behave exactly as before. Set by the trainer from --probe-save-scores.
+    probe_save_scores = False
+
+    @property
+    def probe_score_buffer(self):
+        """Per-INSTANCE buffer. A class-level list would be shared by every model ever
+        constructed in the process (and survive across evals), which is the kind of
+        shared mutable state that shows up as scores from the wrong eval."""
+        buf = self.__dict__.get("_probe_score_buffer")
+        if buf is None:
+            buf = self.__dict__["_probe_score_buffer"] = []
+        return buf
+
     def forward(self, input_ids, targets, attention_mask=None, num_turns=None,
                 num_items_in_batch=None, distance_targets=None, return_targets=None,
-                **backbone_inputs):
+                probe_only=False, action_weight=None, stop_targets=None,
+                turns_shuffled=False, **backbone_inputs):
         probe = getattr(self, "state_probe", None)
+        # Probe-only rows are handled by SCALING the action loss (see the collator),
+        # so no code path here depends on the row type -- that dependence is exactly
+        # what deadlocked DDP. The one check left is rank-uniform and config-level.
+        if probe_only and probe is None:
+            raise ValueError(
+                "probe_only row reached a run with no state probe: nothing would train. "
+                "Use --probe, or drop the on-policy component from the mixture.")
         if probe is None:
             return super().forward(input_ids, targets, attention_mask=attention_mask,
                                    num_turns=num_turns,
@@ -202,7 +298,38 @@ class TurnFlowActionRegressorWithProbe(TurnFlowActionRegressor):
                                   **backbone_inputs)
         finally:
             handle.remove()
-        if distance_targets is None and return_targets is None:
+        if action_weight is not None:
+            # Uniform on every rank: multiply, never branch. w=0 for probe-only rows,
+            # 1 otherwise. The sum-style keys are scaled the same way because the
+            # trainer recomputes turn_loss as loss_sum / n_turns and would otherwise
+            # report the unmasked action loss. Denominators are NOT zeroed: a window of
+            # only probe-only rows would divide by zero.
+            _w = action_weight.to(out["loss"].device).reshape(())
+            out["loss"] = out["loss"] * _w
+            # The generation METRICS must be scaled by the same weight as the losses.
+            # They are computed under no_grad against the collator's ZERO-SUBSTITUTED
+            # action chunk, so on a probe-only row `pose_rmse_*`/`pose_mae_*`/
+            # `rotation_flip` measure generated motion against an all-zero target and
+            # get logged as if real (v6 logged pose_rmse_dx=0.1984 for a component with
+            # no actions at all), while `rmse_*`/`turn_loss` log a fake-perfect 0. No
+            # gradient path -- purely a reporting lie, but one that made a contaminated
+            # run look healthy.
+            for _k in ("loss_sum", "motion_loss_sum", "stop_loss_sum",
+                       "sum_sq_err", "sum_abs_err") + tuple(FLOW_METRIC_KEYS):
+                if _k in out and _torch.is_tensor(out[_k]):
+                    out[_k] = out[_k] * _w
+            out["turn_loss"] = out["loss"].detach()
+            if not bool(_torch.isfinite(out["loss"])):
+                # NOT an assert: asserts vanish under `python -O`, and this is the only
+                # guard between one NaN target and a step in which EVERY parameter's
+                # gradient is NaN (the shared backbone spreads it -- proven in
+                # tests/test_gradient_isolation.py I5). 0.0 * NaN is NaN, so the
+                # action_weight multiplier does not contain it.
+                raise RuntimeError(
+                    "scaled action loss is not finite; a NaN/Inf action target reached "
+                    "the flow objective. The collator zero-substitutes probe-only rows, "
+                    "so this means a row is malformed rather than probe-only.")
+        if distance_targets is None and return_targets is None and stop_targets is None:
             return out
         o = captured["outputs"]
         hidden = o["last_hidden_state"]
@@ -261,20 +388,51 @@ class TurnFlowActionRegressorWithProbe(TurnFlowActionRegressor):
             h.unsqueeze(0),
             None if distance_targets is None else distance_targets.reshape(1, -1),
             None if return_targets is None else return_targets.reshape(1, -1),
+            stop_targets=None if stop_targets is None else stop_targets.reshape(1, -1),
         )
         n_turns_t = _torch.tensor(float(len(flat)))
+        _ddp = _probe_ddp_scale()
+        # Per-component denominators: a component whose targets are all NaN on this row
+        # (shuffled rows' returns, by design) contributes 0/0, not 0/n.
+        _counts = {"probe/distance_loss": _finite_count(distance_targets),
+                   "probe/value_loss": _finite_count(return_targets),
+                   "probe/stop_loss": _finite_count(stop_targets)}
         for k, v in losses.items():
-            out["loss"] = out["loss"] + v
-            # sum-style keys for ProbeTrainer._accumulate (turn-weighted, like
-            # motion_loss_sum); the raw key stays for anyone reading outputs directly.
-            out[k.replace("probe/", "probe_").replace("_loss", "_loss_sum")] = \
-                v.detach() * n_turns_t
+            out["loss"] = out["loss"] + v * _ddp
+            # sum-style keys for ProbeTrainer._accumulate (weighted by the number of
+            # turns that actually contributed); the raw key stays for anyone reading
+            # outputs directly.
+            _base = k.replace("probe/", "probe_").replace("_loss", "")
+            _n = _counts.get(k, n_turns_t)
+            out[f"{_base}_loss_sum"] = v.detach() * _n
+            out[f"{_base}_loss_turns"] = _n
             out[k] = v.detach()
         out["probe_turns"] = n_turns_t
+        if not bool(_torch.isfinite(out["loss"])):
+            # Second tripwire: the one above runs BEFORE the probe losses are summed, so
+            # a NaN originating in a probe head would have gone uncaught.
+            raise RuntimeError(
+                "loss is not finite after adding probe losses; a probe head produced "
+                f"NaN/Inf ({ {k: float(v) for k, v in losses.items()} })")
+        # Raw per-turn stop scores, kept for an offline fit. Aggregate counts cannot
+        # answer the question that actually decides a stop head -- what TPR is available
+        # at an FPR of ~1e-3 -- because a false positive ENDS the episode while a false
+        # negative costs nothing, so the usable operating point sits far off the 0.5
+        # threshold every logged precision/recall is measured at. The extra cost is one
+        # 2-layer MLP over the turns already in memory.
+        if getattr(self, "probe_save_scores", False) and stop_targets is not None \
+                and getattr(probe, "stop_head", None) is not None:
+            with _torch.no_grad():
+                _lg = probe.stop_head(h.to(next(probe.stop_head.parameters()).dtype))
+            self.probe_score_buffer.append((
+                _lg.detach().float().cpu().numpy().reshape(-1),
+                stop_targets.detach().float().cpu().numpy().reshape(-1),
+                bool(turns_shuffled), bool(probe_only)))
         for k, v in probe.metrics(
                 h.unsqueeze(0).detach(),
                 None if distance_targets is None else distance_targets.reshape(1, -1),
                 None if return_targets is None else return_targets.reshape(1, -1),
+                stop_targets=None if stop_targets is None else stop_targets.reshape(1, -1),
         ).items():
             out[k] = v.detach()
         return out
@@ -293,7 +451,11 @@ def _probe_save_extras(model):
 class _ProbeTrainerMixin:
     """Accumulate/drain the probe losses alongside the whitelisted metrics."""
 
-    _PROBE_KEYS = ("probe_distance_loss_sum", "probe_value_loss_sum", "probe_turns",
+    _PROBE_KEYS = ("probe_stop_loss_sum", "probe_stop_n", "probe_stop_pos",
+                   "probe_stop_psum", "probe_stop_tp", "probe_stop_fp", "probe_stop_fn",
+                   "probe_distance_loss_sum", "probe_value_loss_sum", "probe_turns",
+                   "probe_distance_loss_turns", "probe_value_loss_turns",
+                   "probe_stop_loss_turns",
                    "probe_dist_abs_err_sum", "probe_dist_err_sum", "probe_dist_n",
                    "probe_value_abs_err_sum", "probe_value_n")
 
@@ -310,18 +472,85 @@ class _ProbeTrainerMixin:
         out = super()._drain_metrics(prefix=prefix)
         n = sums.get("probe_turns")
         if n is not None:
-            for key, name in (("probe_distance_loss_sum", "probe_distance_loss"),
-                              ("probe_value_loss_sum", "probe_value_loss")):
-                if key in sums:
-                    out[f"{prefix}{name}"] = float(sums[key] / n.clamp(min=1))
+            for key, name, tkey in (
+                    ("probe_distance_loss_sum", "probe_distance_loss", "probe_distance_loss_turns"),
+                    ("probe_value_loss_sum", "probe_value_loss", "probe_value_loss_turns"),
+                    ("probe_stop_loss_sum", "probe_stop_loss", "probe_stop_loss_turns")):
+                if key not in sums:
+                    continue
+                # Denominator is the number of turns that CONTRIBUTED, not every probe
+                # turn. Falling back to probe_turns would restore the deflation this
+                # fixes, so a missing count means the component is absent -- skip it
+                # rather than log a diluted number.
+                den = sums.get(tkey)
+                if den is None or float(den) <= 0:
+                    continue
+                out[f"{prefix}{name}"] = float(sums[key] / den)
         dn = sums.get("probe_dist_n")
         if dn is not None and float(dn) > 0:
             out[f"{prefix}probe_dist_mae_m"] = float(sums["probe_dist_abs_err_sum"] / dn)
             out[f"{prefix}probe_dist_bias_m"] = float(sums["probe_dist_err_sum"] / dn)
+        sn = sums.get("probe_stop_n")
+        if sn is not None and float(sn) > 0:
+            n = float(sn); pos = float(sums.get("probe_stop_pos", 0.0))
+            tp = float(sums.get("probe_stop_tp", 0.0)); fp = float(sums.get("probe_stop_fp", 0.0))
+            fn = float(sums.get("probe_stop_fn", 0.0))
+            out[f"{prefix}probe_stop_pos_rate"] = pos / n
+            # mean predicted probability vs the actual positive rate: the calibration gap
+            # that breaks a threshold rule even when ranking is fine.
+            out[f"{prefix}probe_stop_pred_rate"] = float(sums.get("probe_stop_psum", 0.0)) / n
+            out[f"{prefix}probe_stop_precision"] = tp / max(tp + fp, 1.0)
+            out[f"{prefix}probe_stop_recall"] = tp / max(tp + fn, 1.0)
         vn = sums.get("probe_value_n")
         if vn is not None and float(vn) > 0:
             out[f"{prefix}probe_value_mae"] = float(sums["probe_value_abs_err_sum"] / vn)
+        self._write_probe_scores(prefix)
         return out
+
+    def _write_probe_scores(self, prefix: str):
+        """Dump this eval's raw per-turn stop logits, labels and row flags.
+
+        PER RANK, not gathered: every rank holds a different slice of the eval set and a
+        rank-0-only dump would silently discard three quarters of it. Concatenating the
+        files offline is trivial; recovering the missing rows is not.
+
+        Why raw logits rather than the aggregate counts already logged: a stop head is
+        judged at the operating point it will be DEPLOYED at, and for this task that is
+        an FPR near 1e-3 -- a false positive ends the episode in failure, a false
+        negative costs nothing because the agent gets ~144 more frames inside the radius.
+        Precision/recall at the head's implicit 0.5 threshold say nothing about whether
+        such a point exists on the ROC. Logits also keep temperature a free parameter of
+        the later fit, and `turns_shuffled` keeps the clock-free half separable -- pooled
+        into one number it is invisible, which is what happened to v8.
+        """
+        model = getattr(self, "model", None)
+        model = getattr(model, "module", model)
+        buf = getattr(model, "_probe_score_buffer", None) if model is not None else None
+        if not buf:
+            return
+        # EVAL drains only. `_drain_metrics` also runs on the training stream at every
+        # logging step, which would write thousands of files across a 12k-step run --
+        # and the buffer must still be CLEARED there, or training turns would be carried
+        # into the next eval's dump and silently mixed with it.
+        if not prefix.startswith("eval"):
+            buf.clear()
+            return
+        import numpy as _np
+        rows = list(buf)
+        buf.clear()
+        out_dir = Path(self.args.output_dir) / "probe_stop_scores"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rank = int(getattr(self.args, "process_index", 0) or 0)
+        _np.savez_compressed(
+            out_dir / f"{prefix}step{int(self.state.global_step)}_rank{rank}.npz",
+            logits=_np.concatenate([r[0] for r in rows]),
+            labels=_np.concatenate([r[1] for r in rows]),
+            # one entry per TURN, so a row's flags survive concatenation
+            shuffled=_np.concatenate([_np.full(len(r[0]), r[2], dtype=bool) for r in rows]),
+            probe_only=_np.concatenate([_np.full(len(r[0]), r[3], dtype=bool) for r in rows]),
+            row_id=_np.concatenate([_np.full(len(r[0]), i, dtype=_np.int32)
+                                    for i, r in enumerate(rows)]),
+        )
 
 
 
@@ -355,8 +584,16 @@ def build_optimizer_param_groups(model, args):
     fresh = list(model.head.parameters()) + list(model.decoder.parameters())
     # --- PROBE --- fresh heads belong with the other fresh modules at --head-lr
     _probe = getattr(model, "state_probe", None)
+    _probe_params = []
     if _probe is not None:
-        fresh += list(_probe.parameters())
+        # --probe-head-lr, when given, puts the probe heads in their OWN group; without
+        # it they ride with the other fresh modules at --head-lr. The flag used to be
+        # parsed, copied onto args, and never read -- a silent no-op, the mirror of the
+        # silent-freeze failure the comments below warn about.
+        if getattr(args, "probe_head_lr", None) is not None:
+            _probe_params = [q for q in _probe.parameters() if q.requires_grad]
+        else:
+            fresh += list(_probe.parameters())
     # The latent split and the posterior are exactly as randomly-initialised as the head, so
     # they belong on --head-lr with it. Leaving either out would SILENTLY FREEZE it, and a
     # frozen split is indistinguishable from "the CVAE conversion did nothing".
@@ -380,7 +617,8 @@ def build_optimizer_param_groups(model, args):
     # indistinguishable from "the injection did not help" -- the experiment's conclusion.
     fresh += list(model.modality_embedder.parameters())
     fresh = [p for p in fresh if p.requires_grad]
-    fresh_ids = {id(p) for p in fresh} | {id(p) for p in _no_decay}
+    fresh_ids = ({id(p) for p in fresh} | {id(p) for p in _no_decay}
+                 | {id(p) for p in _probe_params})
     other = [p for p in model.parameters() if p.requires_grad and id(p) not in fresh_ids]
     # `other` is empty when --latent-freeze-trunk froze the backbone and adapters, which is
     # the whole point of the staged run; an empty group is a footgun, not a configuration.
@@ -397,6 +635,12 @@ def build_optimizer_param_groups(model, args):
             "params": _no_decay,
             "lr": args.head_lr if args.head_lr is not None else args.lr,
             "weight_decay": 0.0,
+        })
+    if _probe_params:
+        groups.append({
+            "params": _probe_params,
+            "lr": float(args.probe_head_lr),
+            "weight_decay": args.weight_decay,
         })
     return groups
 
@@ -419,6 +663,53 @@ def parse_args():
                           "sandwich readout. Checkpoint contract with the RL side's "
                           "ValueHeadConfig.readout_offset")
     pre.add_argument("--probe-grad-scale", type=float, default=0.1)
+    pre.add_argument("--stop-radius", type=float, default=1.0,
+                     help="metres; must equal the corpus's stop_radius_m stamp AND the "
+                          "eval --success-distance. Checked, not assumed -- a head "
+                          "trained at one radius and scored at another is the silent "
+                          "failure this stamp exists to catch.")
+    pre.add_argument("--stop-head", action="store_true",
+                     help="train the binary stop head (StopHead + BCE) on the per-frame "
+                          "`stop_targets` column (d <= stop radius). NOT the structural "
+                          "episode-end label: that one defines the positive as the "
+                          "window's last turn, which is wrong for oracle-terminated "
+                          "rollouts and does not survive turn shuffling.")
+    pre.add_argument("--stop-pos-weight", type=float, default=15.0,
+                     help="BCEWithLogits pos_weight. Deliberately NOT the full neg:pos "
+                          "ratio (~38:1 at a 2.6%% positive rate): AP/AUC are invariant "
+                          "to it but CALIBRATION is not, and the operating threshold "
+                          "would sit on a brittle part of the curve. The consumer needs "
+                          "a probability, so keep the tilt mild and fit the threshold on "
+                          "held-out scenes.")
+    pre.add_argument("--stop-hidden", type=int, default=256)
+    pre.add_argument("--probe-init", default=None,
+                     help="warm-start the state probe's weights from a checkpoint dir "
+                          "containing state_probe.pt. --init-from does NOT cover the probe: "
+                          "warm_start restores the modules the MODEL declares, and the probe "
+                          "is attached beside it. Config (bins, ranges, readout offset) comes "
+                          "from THIS run's flags, and a mismatch with the checkpoint's config "
+                          "is refused rather than reshaped.")
+    pre.add_argument("--eval-sample-seed", type=int, default=None,
+                     help="draw the --eval-max-samples eval rows at random under this "
+                          "seed instead of taking the FIRST N. The head of a corpus is "
+                          "not a sample of it: the first 64 objectnav rows are one "
+                          "scene, and the first on-policy rows are all ordered though "
+                          "the split is ~48%% shuffled. Unset keeps the historical "
+                          "first-N behaviour so old runs reproduce.")
+    pre.add_argument("--probe-save-scores", action="store_true",
+                     help="dump raw per-turn stop logits + labels + the ordered/shuffled "
+                          "flag at every eval, one npz per rank under "
+                          "<output-dir>/probe_stop_scores. Cheap (one small MLP over "
+                          "turns already in memory) and the ONLY way to get AUC/AP, "
+                          "TPR at a deployable FPR, and the ordered-vs-shuffled split "
+                          "-- none are recoverable from the aggregate counts.")
+    pre.add_argument("--no-distance-head", action="store_true",
+                     help="omit the distance head entirely. With --no-value-head this "
+                          "makes the probe stop-only: the head that makes a checkpoint "
+                          "DEPLOYABLE, without co-training two heads that have shown no "
+                          "skill on unseen scenes (HM3D val: distance MAE 3.32 m against "
+                          "a 3.19 m constant).")
+    pre.add_argument("--no-value-head", action="store_true")
     pre.add_argument("--probe-distance-weight", type=float, default=1.0)
     pre.add_argument("--probe-value-weight", type=float, default=1.0)
     pre.add_argument("--probe-gamma", type=float, default=None,
@@ -641,10 +932,19 @@ def parse_args():
     args.probe = mine.probe
     args.probe_offset = mine.probe_offset
     args.probe_grad_scale = mine.probe_grad_scale
+    args.probe_init = mine.probe_init
+    args.stop_head = mine.stop_head
+    args.stop_pos_weight = mine.stop_pos_weight
+    args.stop_hidden = mine.stop_hidden
     args.probe_distance_weight = mine.probe_distance_weight
     args.probe_value_weight = mine.probe_value_weight
     args.probe_gamma = mine.probe_gamma
     args.probe_head_lr = mine.probe_head_lr
+    args.probe_save_scores = mine.probe_save_scores
+    args.eval_sample_seed = mine.eval_sample_seed
+    args.no_distance_head = mine.no_distance_head
+    args.no_value_head = mine.no_value_head
+    args.stop_radius = mine.stop_radius
     args.probe_datasets = mine.probe_datasets
     # --- END PROBE ---
     args.latent_cvae = mine.latent_cvae
@@ -735,6 +1035,11 @@ def main():
         # ModelConfig. Inert unless passed. There is no `--stop-head` counterpart here on
         # purpose -- see flow_matching_head's NO STOP / DEADBAND section.
         modality_specs=base._modality_specs(args.modality_specs),
+        # NO stop head on the flow head: flow_matching_head states three times that it
+        # has none and none should be added, and it never calls one (measured: DDP
+        # reported its parameters receiving no gradient). The stop head lives on the
+        # STATE PROBE instead -- it is a question about the state, not about the action
+        # conditioning -- see state_probe.BinaryStopHead.
     )
     data_cfg = DataConfig(
         target_column=args.target_column,
@@ -760,6 +1065,7 @@ def main():
         if is_main:
             print(train_ds.describe())
         # --- PROBE --- explicit per-component contract (see --probe-datasets help)
+        _stop_by_component = {}
         if args.probe and args.probe_datasets is not None:
             wanted = {n.strip() for n in args.probe_datasets.split(",") if n.strip()}
             unknown = wanted - {sp.name for sp in specs}
@@ -767,19 +1073,33 @@ def main():
                 raise SystemExit(f"--probe-datasets names unknown components: {sorted(unknown)}")
             for sp in specs:
                 cols = set(base.load_split(sp.path, sp.split or args.train_split).column_names)
-                has = {"distance_targets", "return_targets"} <= cols
-                if sp.name in wanted and not has:
+                # stop_targets counts as a probe column: a component carrying ONLY stop
+                # labels would otherwise slip past this both-ways contract unnamed, and
+                # cross-component schema uniformity is what the DDP head-coverage
+                # argument rests on.
+                present = {"distance_targets", "return_targets", "stop_targets"} & cols
+                has = bool(present)
+                _stop_by_component[sp.name] = "stop_targets" in cols
+                if sp.name in wanted and not present:
                     raise SystemExit(
                         f"--probe-datasets includes {sp.name!r} but its dataset carries no "
-                        "distance/return target columns; join them first "
-                        "(add_distance_targets.py)")
+                        "distance/return/stop target columns; join them first "
+                        "(add_distance_targets.py / add_stop_targets.py)")
                 if sp.name not in wanted and has:
                     raise SystemExit(
                         f"component {sp.name!r} carries probe target columns but is not in "
                         "--probe-datasets; name it or point at the un-joined dataset -- "
                         "silent inclusion is the failure mode this flag exists to prevent")
+            _with_stop = sorted(k for k, v in _stop_by_component.items()
+                                if v and k in wanted)
+            _without = sorted(k for k, v in _stop_by_component.items()
+                              if not v and k in wanted)
             if is_main:
-                print(f"[probe] training value/distance on components: {sorted(wanted)}")
+                print(f"[probe] training probe heads on components: {sorted(wanted)}")
+                if _with_stop:
+                    print(f"[probe] stop labels present on: {_with_stop}"
+                          + (f"; ABSENT on {_without} (NaN-filled by the collator so the "
+                             "head still forwards on every rank)" if _without else ""))
     else:
         train_ds = base.load_split(args.train_dataset, args.train_split)
     eval_ds = None
@@ -798,7 +1118,8 @@ def main():
             for spec in specs:
                 try:
                     eval_ds[spec.name] = base.load_split(
-                        spec.path, args.eval_split, args.eval_max_samples
+                        spec.path, args.eval_split, args.eval_max_samples,
+                        sample_seed=args.eval_sample_seed,
                     )
                 except (KeyError, ValueError, FileNotFoundError) as exc:
                     # A component without the eval split is skipped by name rather than
@@ -818,7 +1139,7 @@ def main():
         else:
             eval_ds = base.load_split(
                 args.eval_dataset or args.train_dataset, args.eval_split,
-                args.eval_max_samples,
+                args.eval_max_samples, sample_seed=args.eval_sample_seed,
             )
     chunk_shape = base.infer_target_shape(train_ds, args.target_column)   # (T, 3)
     if chunk_shape[-1] != 3:
@@ -862,26 +1183,89 @@ def main():
 
     # --- PROBE ---
     if args.probe:
-        if args.probe_gamma is None:
-            raise SystemExit("--probe requires --probe-gamma (no default: it must match "
-                             "the dataset's return_gamma stamp)")
-        stamped_gamma = row0.get("return_gamma")
-        if stamped_gamma is None:
-            raise SystemExit("--probe: the dataset has no return_gamma column; format "
-                             "it with --distance-column/--return-gamma first")
-        if abs(float(stamped_gamma) - float(args.probe_gamma)) > 1e-9:
-            raise SystemExit(f"--probe-gamma {args.probe_gamma} != dataset return_gamma "
-                             f"{stamped_gamma}; the value head's targets would not mean "
-                             "what its config claims")
+        # gamma describes the VALUE head's targets only -- a stop-only probe has no
+        # discount and must not be blocked by a stamp it never reads.
+        if not args.no_value_head:
+            if args.probe_gamma is None:
+                raise SystemExit("--probe requires --probe-gamma (no default: it must match "
+                                 "the dataset's return_gamma stamp)")
+            stamped_gamma = row0.get("return_gamma")
+            if stamped_gamma is None:
+                raise SystemExit("--probe: the dataset has no return_gamma column; format "
+                                 "it with --distance-column/--return-gamma first")
+            if abs(float(stamped_gamma) - float(args.probe_gamma)) > 1e-9:
+                raise SystemExit(f"--probe-gamma {args.probe_gamma} != dataset return_gamma "
+                                 f"{stamped_gamma}; the value head's targets would not mean "
+                                 "what its config claims")
         probe_cfg = StateProbeConfig(
             readout_offset=args.probe_offset, grad_scale=args.probe_grad_scale)
-        probe_cfg.distance["loss_weight"] = args.probe_distance_weight
-        probe_cfg.value["loss_weight"] = args.probe_value_weight
-        probe_cfg.value["gamma"] = float(args.probe_gamma)
+        if args.no_distance_head:
+            probe_cfg.distance = None
+        else:
+            probe_cfg.distance["loss_weight"] = args.probe_distance_weight
+        if args.no_value_head:
+            probe_cfg.value = None
+        else:
+            probe_cfg.value["loss_weight"] = args.probe_value_weight
+            probe_cfg.value["gamma"] = float(args.probe_gamma)
+        if probe_cfg.distance is None and probe_cfg.value is None and not args.stop_head:
+            raise SystemExit(
+                "--probe with every head disabled; drop --probe instead so the run is "
+                "the original trainer bit for bit")
+        if args.stop_head:
+            stamped_r = row0.get("stop_radius_m")
+            if stamped_r is None:
+                raise SystemExit(
+                    "--stop-head: the dataset has no stop_radius_m column; join per-frame "
+                    "stop labels first (add_stop_targets.py --radius ...). The structural "
+                    "'last observation of the episode' label is NOT a substitute -- it is "
+                    "wrong on chained-goal PointNav and wrong at deployment.")
+            if abs(float(stamped_r) - float(args.stop_radius)) > 1e-9:
+                raise SystemExit(
+                    f"--stop-radius {args.stop_radius} != dataset stop_radius_m "
+                    f"{stamped_r}; the head would be trained on a different arrival "
+                    "predicate than its config claims")
+            probe_cfg.stop = {"hidden_dims": [args.stop_hidden],
+                              "pos_weight": args.stop_pos_weight,
+                              "radius_m": float(args.stop_radius), "loss_weight": 1.0}
         _hs = int(model.backbone.config.text_config.hidden_size
                   if hasattr(model.backbone.config, "text_config")
                   else model.backbone.config.hidden_size)
         model.state_probe = StateProbe(_hs, probe_cfg, dtype=_torch.float32)
+        model.probe_save_scores = bool(args.probe_save_scores)
+        if args.probe_init:
+            import json as _json
+            from longnav.utils.state_probe import STATE_PROBE_CONFIG_FILE as _SPC
+            _ck = _json.loads(open(os.path.join(args.probe_init, _SPC)).read())
+            for _k, _want in (("readout_offset", args.probe_offset),):
+                if int(_ck.get(_k, _want)) != int(_want):
+                    raise ValueError(
+                        f"--probe-init {args.probe_init} was trained with {_k}="
+                        f"{_ck.get(_k)} but this run declares {_want}; the readout would "
+                        "mean a different position. Refusing rather than reshaping.")
+            for _k in (() if probe_cfg.distance is None else ("n_bins", "d_max")):
+                if _ck.get("distance", {}).get(_k) != probe_cfg.distance.get(_k):
+                    raise ValueError(
+                        f"--probe-init distance head {_k} mismatch: checkpoint "
+                        f"{_ck.get('distance', {}).get(_k)} vs this run "
+                        f"{probe_cfg.distance.get(_k)}")
+            _sd = _torch.load(os.path.join(args.probe_init, "state_probe.pt"),
+                              map_location="cpu")
+            # strict=False ONLY to allow a head this run declares that the checkpoint
+            # predates (the stop head). Everything the checkpoint DOES carry must land,
+            # and anything missing beyond the new head is a real mismatch -- refuse
+            # rather than silently start a half-initialised probe.
+            _missing, _unexpected = model.state_probe.load_state_dict(_sd, strict=False)
+            _bad = [k for k in _missing if not k.startswith("stop_head.")]
+            if _bad or _unexpected:
+                raise ValueError(
+                    f"--probe-init mismatch beyond the newly declared stop head: "
+                    f"missing {_bad[:6]}, unexpected {list(_unexpected)[:6]}")
+            if is_main:
+                _fresh = " (stop head starts fresh)" if _missing else ""
+                print(f"[probe] warm-started from {args.probe_init} "
+                      f"({len(_sd)} tensors){_fresh}; grad_scale is THIS run's "
+                      f"({args.probe_grad_scale})")
         if is_main:
             print(f"[probe] offset {args.probe_offset}, grad_scale "
                   f"{args.probe_grad_scale}, gamma {args.probe_gamma}, hidden {_hs}")
@@ -962,11 +1346,18 @@ def main():
     # processor's tokenizer.
     specs = model_cfg.modality_specs
     # --- PROBE --- ProbeCollator only when co-training; otherwise the original
+    # A stop head must forward on every rank every step (DDP reducer); components
+    # without stop labels get a NaN column from the collator rather than skipping it.
+    _need_stop = bool(args.probe and getattr(model, "state_probe", None) is not None
+                      and getattr(model.state_probe, "stop_head", None) is not None)
     _Coll = ProbeCollator if args.probe else TurnVectorCollator
     train_collator = _Coll(processor, data_cfg, train=True, seed=args.seed,
                                         modality_specs=specs)
     eval_collator = _Coll(processor, data_cfg, train=False, seed=args.seed,
                                        modality_specs=specs)
+    if _need_stop:
+        train_collator.require_stop = True
+        eval_collator.require_stop = True
 
     if not args.no_preflight and is_main:
         model.to("cuda" if torch.cuda.is_available() else "cpu")

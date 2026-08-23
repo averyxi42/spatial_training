@@ -1,5 +1,39 @@
 # Stop head: preliminary plan
 
+> **RETRACTION (2026-08-23). Every on-policy number in this document is invalid.**
+>
+> The observations were recovered by decoding rollout `video.mp4` files
+> (`data_scripts/mine_rollout_frames.py`). **Those videos carry a rendered HUD printing
+> `distance_to_goal: <full float>`, `goal: <name>` and `step: <n>`.** A distance or stop
+> head fit on them reads text; it does not see. The tell was a run reaching precision
+> 1.000 and distance MAE 0.207 m on nominally held-out scenes.
+>
+> Independently: the "held-out" split was drawn from the on-policy rollout archive, i.e.
+> HM3D **train** scenes, 11 of whose 12 scenes are in the PointNav corpus these
+> checkpoints trained on. **Evaluation must use HM3D val** — the instruction was given and
+> not followed.
+>
+> Deleted 2026-08-23: the mined frame stores, the `*_series.npz` hidden caches, the
+> `refit_value_head_*.pt` heads, the `onpolicy_distance` corpora, and the
+> `run_cotrain_v6_onpolicy` / `run_cotrain_v7_stop` runs. Summaries preserved for the
+> record only in `dump/eval_system/QUARANTINE_contaminated/`.
+>
+> The one clean distance measurement for this lineage is live rollouts on HM3D val
+> (`dump/probe_eval/probe_eval_v6ck2400_hm3dval/`): **MAE 3.32 m against a 3.19 m
+> constant-prediction baseline — no skill on unseen scenes**, AUC 0.856 at 1 m, and the
+> clock shortcut (partial corr with step at fixed true distance) unchanged at -0.130.
+>
+> Mechanics also repudiated, independent of the leak: do not run the RL trainer
+> (`train_eval_rl`, `lr 0` or otherwise) to collect evaluation rollouts — use
+> `scripts/eval_objectnav_policy.py` or `longnav.scripts.eval`; and do not re-run forward
+> passes offline over saved frames — compute distance/p_stop/value INLINE in the rollout's
+> own forward pass and return them with the action.
+>
+> What survives: the *structural* findings that were measured on live rollouts or on the
+> demonstration corpora — the clock shortcut, the train/rollout distribution mismatch, and
+> the stop-rule ceiling arithmetic.
+
+
 **2026-08-18.** Prompted by the navverse cross-benchmark results: our continuous arms run
 with oracle auto-stop (a fairness asterisk on every published number), and the discrete
 family's measured stop gaps -- reaching-vs-stopping -- are worth +8 to +16 pp SR on that
@@ -219,3 +253,53 @@ Next read: `flow_sde_probe_mini_ck1000` auto-launches when checkpoint-1000 lands
 kernel's makes the value-baseline case on-policy; still above at ck-2000+ routes
 through calibration on the 294k mined on-policy frames
 (`data/mined_rollout_frames/gamma097_g097`) before any ceiling conclusion.
+
+## 2026-08-19 — the on-policy critic exists: post-hoc head refit beats the kernel
+
+> **INVALID (retracted 2026-08-23).** Every figure in this section is computed from
+> hidden states cached over HUD-bearing mined frames. The "on-policy" arms were fitting a
+> printed number. The 23%-below-kernel claim, the three-arm table, and the post-hoc refit
+> recipe are all withdrawn; the saved heads have been deleted.
+
+Offline instrument (`data_scripts/eval_value_heads_offline.py`, pinned 64-episode
+on-policy eval set + 64-episode expert set, per-step series + readout hiddens
+cached as npz): the co-trained value head is representation-limited at ck-200 but
+the REPRESENTATION keeps improving (achievable expert corr 0.404@ck200 ->
+0.507@ck1000 by fresh-head refit) while the co-trained head lags (0.432 -> 0.391).
+grad_scale does not throttle head gradients (straight-through), so raising it was
+rejected: the backbone side already works at 0.1.
+
+Scaled refit (512 disjoint on-policy episodes, 26,362 cached hiddens at ck-1000;
+three arms, inner-val early stopping, episode-bootstrap CIs on the held-out
+eval-64):
+
+| arm            | eval64 corr           | eval64 Var(G-v)        | expert-test corr |
+|----------------|-----------------------|------------------------|------------------|
+| expert-only    | 0.120 [0.030, 0.212]  | 8.65                   | 0.460            |
+| on-policy-only | 0.555 [0.456, 0.643]  | 5.08 [3.80, 6.53]      | -0.012           |
+| joint          | 0.556 [0.454, 0.652]  | 5.12 [3.79, 6.58]      | 0.391            |
+
+Reference on the same set: kernel 6.63, naive 7.05. The JOINT head cuts advantage
+variance 23% below the time kernel (28% below naive) while keeping expert-side
+fit -- no tradeoff. Heads saved: `dump/eval_system/value_offline/
+refit_value_head_{expert_only,on_policy_only,joint}.pt`.
+
+Recipe now: co-train SFT for the representation; fit the head POST-HOC on cached
+hiddens (expert + mined on-policy); refresh per checkpoint in minutes. Remaining
+to package: distance-head refit (stop side) the same way, then a composed
+state_probe dir the RL `state_probe:` config can point at.
+
+## Operational note: offline passes are sharded (2026-08-21)
+
+Every offline GPU pass in this workflow -- `data_scripts/eval_value_heads_offline.py`
+(hidden caching, checkpoint scoring, distance-band analysis) -- runs as **4+ parallel
+shards**, one process per GPU, via `split -n l/4` on the episode-paths file. Two
+incidents in one session made this a rule rather than a preference: a 5-checkpoint
+scoring loop run sequentially while 4 GPUs idled, and a 60-episode band analysis run
+on ONE GPU while both SFT arms saturated the fleet (~4x slower than the earlier
+4-shard passes, which had also had an idle fleet).
+
+When training owns the fleet, spread the shards over different GPU *pairs* (0,2,4,6)
+so no single DDP rank absorbs the entire slowdown; each GPU normally has 50+ GB free.
+The ~2 min model reload per shard is dwarfed by the parallel win, so never serialize
+to avoid reloads.

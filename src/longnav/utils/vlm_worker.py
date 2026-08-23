@@ -79,6 +79,7 @@ class VLMWorker:
         self._is_lora = None
         self.value_readout_offset = 0   # set by setup_training from value_head config
         self.probe_expected_token_id = None  # pinned id from state_probe_config.json
+        self.state_probe_attached = False
         # Warmup the CUDA allocator
         if load_model:
             self.load_model()
@@ -887,6 +888,55 @@ class VLMWrapper(nn.Module):
 
 class VLMTrainingMixin:
 
+
+    def attach_state_probe(self, rl_cfg, hidden_size=None):
+        """Load the frozen state probe and expose it as the worker's value head.
+
+        Called from setup_training for a TRAINING run and directly from the eval
+        bootstrap for an eval run: the probe is a property of the checkpoint, not of
+        the optimizer, and eval.py's `bootstrap_vlms_rl(training=False)` deliberately
+        skips setup_training. `state_probe_attached` is what the eval postprocess
+        checks before spending a forward pass on the heads.
+        """
+        if hidden_size is None:
+            hidden_size = self.language_model.config.hidden_size
+        self.rl_algo_config = rl_cfg
+        sp_mode = getattr(rl_cfg, "state_probe", None)
+        if sp_mode:
+            if rl_cfg.value_head is not None:
+                raise ValueError(
+                    "rl_config.state_probe and rl_config.value_head are mutually "
+                    "exclusive: both claim the worker's value readout slot")
+            sp_dir = (self.policy_head_config.get("checkpoint_dir")
+                      if sp_mode == "auto" else sp_mode)
+            import json as _json, os as _os
+            from longnav.utils.state_probe import (
+                load_state_probe, STATE_PROBE_CONFIG_FILE)
+            probe = load_state_probe(sp_dir, input_dim=hidden_size)
+            probe.eval()
+            for _p in probe.parameters():
+                _p.requires_grad_(False)
+            sp_meta = _json.loads(open(
+                _os.path.join(sp_dir, STATE_PROBE_CONFIG_FILE)).read())
+            w_off = sp_meta.get("worker_value_readout_offset")
+            if w_off is None:
+                raise ValueError(
+                    f"{sp_dir}/state_probe_config.json lacks "
+                    "worker_value_readout_offset -- the probe was saved by a "
+                    "trainer that did not persist the worker-frame convention; "
+                    "re-derive it with the parity script rather than guessing")
+            if int(w_off) == 0:
+                raise ValueError(
+                    "worker_value_readout_offset == 0 is unsupported: the worker "
+                    "gates index recording on `if self.value_readout_offset:` and "
+                    "a zero offset is falsy there")
+            self.model.value_head = StateProbeValueAdapter(probe).to(self.model.device)
+            self.value_readout_offset = int(w_off)
+            self.probe_expected_token_id = sp_meta.get("probe_token_id")
+
+        self.state_probe_attached = bool(getattr(rl_cfg, "state_probe", None))
+        return self.state_probe_attached
+
     def setup_training(self, config: VLMTrainingConfig, rank: int,
     world_size: int,
     master_addr: str,
@@ -942,6 +992,20 @@ class VLMTrainingMixin:
                         dropout=vh_cfg.dropout,
                         dtype=getattr(torch, vh_cfg.dtype),
                     ).to(self.model.device)
+                    _init_w = getattr(vh_cfg, "init_weights", None)
+                    if _init_w:
+                        # warm-start the trainable head from an offline-fit state dict
+                        # (MLP keys match state_probe.ValueDistHead; bin-geometry buffers
+                        # differ by name and are recomputed at construction, so strict=False
+                        # loads exactly the learned weights and nothing else).
+                        _sd = torch.load(_init_w, map_location="cpu")
+                        _missing, _unexpected = self.model.value_head.load_state_dict(
+                            _sd, strict=False)
+                        _loaded = [k for k in _sd if k not in _unexpected]
+                        assert any("mlp" in k or "net" in k or "weight" in k for k in _loaded), \
+                            f"value_head init_weights loaded nothing learnable from {_init_w}"
+                        print(f"value_head warm-started from {_init_w} "
+                              f"({len(_loaded)} tensors; skipped buffers {_unexpected})")
                 else:
                     self.model.value_head = ValueHead(
                         input_dim=hidden_size,
@@ -950,38 +1014,7 @@ class VLMTrainingMixin:
                         dtype=getattr(torch, vh_cfg.dtype)
                     ).to(self.model.device)
                 self.value_readout_offset = int(getattr(vh_cfg, "readout_offset", 0))
-            sp_mode = getattr(config.rl_config, "state_probe", None)
-            if sp_mode:
-                if config.rl_config.value_head is not None:
-                    raise ValueError(
-                        "rl_config.state_probe and rl_config.value_head are mutually "
-                        "exclusive: both claim the worker's value readout slot")
-                sp_dir = (self.policy_head_config.get("checkpoint_dir")
-                          if sp_mode == "auto" else sp_mode)
-                import json as _json, os as _os
-                from longnav.utils.state_probe import (
-                    load_state_probe, STATE_PROBE_CONFIG_FILE)
-                probe = load_state_probe(sp_dir, input_dim=hidden_size)
-                probe.eval()
-                for _p in probe.parameters():
-                    _p.requires_grad_(False)
-                sp_meta = _json.loads(open(
-                    _os.path.join(sp_dir, STATE_PROBE_CONFIG_FILE)).read())
-                w_off = sp_meta.get("worker_value_readout_offset")
-                if w_off is None:
-                    raise ValueError(
-                        f"{sp_dir}/state_probe_config.json lacks "
-                        "worker_value_readout_offset -- the probe was saved by a "
-                        "trainer that did not persist the worker-frame convention; "
-                        "re-derive it with the parity script rather than guessing")
-                if int(w_off) == 0:
-                    raise ValueError(
-                        "worker_value_readout_offset == 0 is unsupported: the worker "
-                        "gates index recording on `if self.value_readout_offset:` and "
-                        "a zero offset is falsy there")
-                self.model.value_head = StateProbeValueAdapter(probe).to(self.model.device)
-                self.value_readout_offset = int(w_off)
-                self.probe_expected_token_id = sp_meta.get("probe_token_id")
+            self.attach_state_probe(config.rl_config, hidden_size)
             from verl.trainer.ppo.core_algos import get_policy_loss_fn
             self.policy_loss_fn = get_policy_loss_fn(config.rl_config.policy_loss.name)
             if getattr(config.rl_config, 'ref_kl', False) and self.policy_head_config['type'] == "continuous":

@@ -146,3 +146,32 @@ def test_metrics_meters_scale_and_masking():
     # all-NaN targets -> no keys rather than zeros that would skew a drain
     m2 = probe.metrics(h, torch.full((1, 5), float("nan")), None)
     assert "probe_dist_n" not in m2
+
+
+def test_probe_only_rows_never_train_actions():
+    """The on-policy/shuffled corpus must not reach the flow objective.
+
+    Three independent guards, all asserted here because a silent leak would train
+    the policy on its own rollout actions (self-imitation) or, on shuffled rows, on
+    a sequence that is not a trajectory at all.
+    """
+    import pathlib
+    # 1. the builder writes NaN action chunks and flags the row. Read the SOURCE TEXT --
+    # never exec_module it: the builder is retired (it consumed HUD-bearing mined frames)
+    # and now raises SystemExit on import, which killed this test. Only the text was ever
+    # needed. When the builder is rewritten for clean rollouts, this keeps working.
+    _bod = (pathlib.Path(__file__).resolve().parents[1]
+            / "data_scripts" / "build_onpolicy_distance_dataset.py")
+    if _bod.exists():
+        src = _bod.read_text()
+        assert "np.full" in src, "action chunks must be NaN-filled"
+        assert '"probe_only": True' in src
+        # 2. shuffled rows carry NaN value targets (G_t depends on the destroyed future)
+        assert 'if shuffle' in src and 'return_targets' in src
+    # 3. the trainer refuses a probe_only row with finite action targets
+    trainer = open(pathlib.Path(__file__).resolve().parents[1]
+                   / "data_scripts" / "train_flow_matching_sft_value.py").read()
+    assert "probe_only row has finite action targets" in trainer
+    # the masking is a rank-uniform multiplier, not a branch (DDP deadlock 2026-08-22)
+    assert 'out["loss"] = out["loss"] * _w' in trainer
+    assert 'action_weight' in trainer

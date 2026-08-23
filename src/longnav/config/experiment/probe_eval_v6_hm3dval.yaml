@@ -1,0 +1,99 @@
+# @package _global_
+# Distance/value-head measurement on HM3D **val**, run through `longnav.scripts.eval`
+# -- the RL loop minus training, which is the tool for this. Not the trainer, not an
+# offline re-forward over saved frames, not MP4 mining.
+#
+# UNSEEN by this lineage end to end: the RL pool is HM3D train, the SFT demonstration
+# corpus is MP3D, and the on-policy probe corpus was mined from HM3D-train rollouts.
+# This matters because the previous attempt scored v6 on episodes that were 94% inside
+# its own training split and returned a meaningless 0.15 m MAE.
+#
+# The probe rides the rollout: `state_probe: auto` loads state_probe.pt from the policy
+# head's checkpoint (attached on the eval bootstrap now, not only in setup_training),
+# and the eval postprocess runs the heads on the packed hidden -- ONE extra forward per
+# episode, no frames written, no second pass. Per-episode records with the full
+# per-step series stream to probe_records.jsonl as each batch lands;
+# `longnav.utils.probe_eval_report.aggregate` summarises them at the end or standalone.
+#
+# Templates carry NO step label, matching the v5/v6 (nostep) lineage.
+
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+resources:
+  num_vlms: 2
+  num_sims: 2
+  vlm_gpu_fraction: 0.25
+  sim_gpu_fraction: 0.10
+  vlm_conda_env: longnav_vlm
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v6_onpolicy/checkpoint-2400/adapter
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v6_onpolicy/checkpoint-2400
+    gap: 10
+    sde_n: 3
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+
+sim:
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1/val
+  exclude_categories: [plant]
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 0.4
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: false
+  reward_lost_steps: 25
+
+rollout:
+  max_steps: 175
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  checkpoint: null
+  rl_config:
+    state_probe: auto      # the only line that turns probe measurement on
+    gamma: 0.97
+    n_rollout: 24
+    n_adv: 48
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "probe_eval_v6ck2400_hm3dval"
+  output_dir: /Projects/spatial_training/dump/probe_eval
+  jobtype: eval
+  eval_ode: true

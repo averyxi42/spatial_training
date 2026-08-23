@@ -1,0 +1,145 @@
+# @package _global_
+# GAE(lambda=0.95) ARM -- warm-started from the actor-critic MC run at cycle 415.
+#
+# WHY: on that run's own buffer (256 episodes / 29k steps, offline sweep 2026-08-21),
+# return variance is 63% WITHIN-episode, and no state-conditioned baseline touches it:
+# time kernel within-EV -0.017, live critic +0.054, per-episode-mean 0 by construction.
+# Within-episode returns are dominated by sampling noise realized AFTER each step
+# (ceiling test: true geodesic distance explains ~13% of within-episode variance;
+# adding future information triples it). Bootstrapping is the only mechanism that
+# truncates that tail. Measured on the same buffer, lam=0.95 cuts total advantage
+# variance 54% (3.32 -> 1.53) and the within-episode part 43%, keeping corr 0.91 with
+# the current MC advantage.
+#
+# THE RISK, ON RECORD: bootstrapping assumes the critic already knows which episodes
+# are good. Between-episode advantage variance drops 1.038 -> 0.232, but the critic
+# explains only 40% of between-episode return variance, and a constant per-episode
+# value error cancels inside a TD residual ((1-gamma)e ~ 0.03e per step) rather than
+# transferring. So ~60% of between-episode signal is DISCARDED, not explained. If this
+# arm underperforms the MC run, that is the first suspect, and lam=0.99 is the retreat.
+#
+# WARM START (user decision): weights + optimizer + scheduler + the 256-episode
+# advantage buffer from checkpoint_415. The MC run's policy was flat but its critic is
+# the best we have (pooled EV +0.154, between +0.403), and GAE depends on critic
+# quality more than MC does -- starting from a random or SFT-only critic would confound
+# the lambda test with critic warmup.
+#
+# NOT CHANGED: gamma 0.97, pool trainset64, n_rollout 24, n_adv 256, a=0.9, frozen
+# action head, lr 2e-6, KL measure-only, eval26 pinned, base v4-ck1000.
+# bootstrap_truncated stays FALSE for comparability with the MC run, even though 40% of
+# episodes hit the 175-step cap and time-limit bootstrapping is arguably more correct
+# under GAE -- that is the designated NEXT arm, not a second change inside this one.
+#
+# READOUT: eval26 slope vs the MC run's own series on the same instrument (MC arm:
+# oSPL slope +0.050 pts/pass CI [+0.006,+0.098], success flat, base 0.610/0.353).
+# HEALTH: probe/adv_var_probe still below the kernel gauge; train/vf_loss finite and
+# falling on the new TD(lambda) targets (GAE returns replace MC returns as the value
+# target -- expect a level shift in vf_loss, not a regression).
+
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v4_probe_mix/checkpoint-1000_RLCOMPOSED/adapter
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v4_probe_mix/checkpoint-1000_RLCOMPOSED
+    gap: 10
+    sde_n: 3
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+
+sim:
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train100x80
+  exclude_categories: [plant]
+  train_uids: /Projects/spatial_training/dump/eval_system/episode_sets/trainset64_gamma097.txt
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 0.4
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: false
+  reward_lost_steps: 25
+
+rollout:
+  max_steps: 175
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  checkpoint: /Projects/spatial_training/dump/flow_rl/flow_sde_critic_ac_warm64/checkpoints/checkpoint_415
+  load_optim: true
+  load_sched: true
+  learning_rate: 2.0e-6
+  action_head_learning_rate: 0.0
+  grad_accum_steps: 2
+  max_grad_norm: 20.0
+  total_optimization_steps: 20000
+  warmup_steps: 32
+  save_step: 8
+  rl_config:
+    advantage_estimator: gae_ppo
+    lam: 0.95
+    value_head:
+      kind: distributional
+      hidden_dims: [1024, 512]
+      n_bins: 51
+      v_min: -8.0
+      v_max: 24.0
+      hl_sigma_ratio: 0.75
+      dropout: 0.0
+      dtype: float32
+      readout_offset: -2
+      learning_rate: 1.0e-4
+      value_grad_scale: 0.1
+      cliprange_value: 0.2
+    gamma: 0.97
+    n_rollout: 24
+    n_adv: 256
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    ref_kl: true
+    ref_kl_coeff: 0.0
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "flow_sde_gae095_warm"
+  output_dir: /Projects/spatial_training/dump/flow_rl
+  subset_label: "everything"
+  shard_size: 0
+  eval_every: 4
+  eval_set_size: 32
+  eval_uids_file: /Projects/spatial_training/dump/eval_system/episode_sets/fullpool_evalset_servable26.txt
+  eval_ode: true

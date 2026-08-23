@@ -227,7 +227,7 @@ def _csv(text, cast=str):
     return tuple(cast(x) for x in text.split(",") if x != "")
 
 
-def load_split(path, split, max_samples=None):
+def load_split(path, split, max_samples=None, sample_seed=None):
     from datasets import load_dataset, load_from_disk
 
     if os.path.isdir(os.path.expanduser(path)):
@@ -237,7 +237,17 @@ def load_split(path, split, max_samples=None):
     else:
         ds = load_dataset(path, split=split)
     if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
+        # A seeded random subset, not the first N. The head of a corpus is not a sample
+        # of it: on the on-policy stop corpus the first 4 validation rows are all
+        # ORDERED though the split is 47.5% shuffled, and the first 64 objectnav rows
+        # come from a SINGLE scene -- so the eval measured one scene and hid the
+        # clock-free half entirely. `sample_seed=None` keeps the historical first-N
+        # behaviour for reproducing older runs.
+        n = min(max_samples, len(ds))
+        if sample_seed is None:
+            ds = ds.select(range(n))
+        else:
+            ds = ds.shuffle(seed=int(sample_seed)).select(range(n))
     return ds
 
 
