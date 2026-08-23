@@ -557,9 +557,16 @@ class TurnVectorCollator:
         out["targets"] = targets
         out["num_turns"] = torch.tensor(targets.shape[0], dtype=torch.long)
         if self.stop_labels:
-            # Derived from the row's own turn count rather than read from a column: the
-            # episode end IS the definition of a stop here, so giving it a second
-            # representation in the dataset would only create something to disagree with.
+            # MOTION-stop labelling, for `stop_head.py`'s head only. Derived from the
+            # row's own turn count rather than read from a column: for that head the
+            # episode end IS the definition of a stop, so a second representation in the
+            # dataset would only create something to disagree with.
+            #
+            # The EPISODE-stop head does not use this. `ProbeCollator` overwrites
+            # `stop_targets` from the dataset's own per-frame column, which is the metric
+            # `distance_to_goal <= success_radius` -- see the comment there and
+            # `data_scripts/add_stop_targets.py`. If you are reading this while wondering
+            # how stops are labelled today, the answer is the column, not this line.
             out["stop_targets"] = episode_stop_labels(
                 targets.shape[0], start, n_total_turns
             )

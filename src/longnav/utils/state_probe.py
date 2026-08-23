@@ -227,6 +227,20 @@ class StateProbeConfig:
 
 
 class BinaryStopHead(nn.Module):
+    """EPISODE-stop classifier: "is the agent at the goal, should the episode end?"
+
+    NOT the motion-stop head in `stop_head.py`, which asks "should the base stop
+    driving?" off the action latent and has been deemed unnecessary (the flow head models
+    the whole conditional distribution instead and declares no stop head at all). This one
+    reads the PROBE readout hidden and is trained per frame against
+    `distance_to_goal <= success_radius` -- a metric label, not the structural
+    "final observation of the episode" one, which is wrong for chained-goal PointNav
+    (several arrivals per episode) and wrong at deployment (the head must fire on
+    ARRIVAL, not when a trajectory happens to end).
+
+    Its output is what terminates an episode under `--stop-head`, replacing the oracle
+    `--auto-stop` every result before it relied on.
+    """
     """P(within stop radius) from the readout hidden, BCE.
 
     Deliberately NOT the flow head's stop head: `flow_matching_head` states three times
