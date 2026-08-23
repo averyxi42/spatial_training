@@ -929,8 +929,16 @@ class VectorRolloutPolicy:
     @torch.inference_mode()
     def step(self, image, user_text: Optional[str] = None,
              modality: Optional[Dict[str, Any]] = None,
-             obs_pose: Optional[Any] = None) -> torch.Tensor:
+             obs_pose: Optional[Any] = None,
+             prefix: Optional[Any] = None) -> torch.Tensor:
         """Encode one observation and return its action chunk, shaped `target_shape`.
+
+        `prefix` is the RTC commitment: `(d, 3)` PHYSICAL per-tick differentials the
+        robot is already executing while this chunk is generated; the decode conditions
+        on them (rows [0, d) of the result equal them exactly -- see
+        `FlowActionCodec.generate` and docs/RTC_TRAINING.md). Passed through to the
+        normalizer only when non-empty, so a head whose codec predates the concept
+        fails with a TypeError rather than silently ignoring the commitment.
 
         Composition is done in *token ids*, not text: the user block comes from the
         processor (which expands the image placeholder), and the assistant pieces are the
@@ -1000,8 +1008,11 @@ class VectorRolloutPolicy:
         head_dtype = next(self.model.head.parameters()).dtype
         states = hidden.to(head_dtype)
         vector = self.model.head(states)
+        decode_kwargs = {}
+        if prefix is not None and len(prefix):
+            decode_kwargs["prefix"] = torch.as_tensor(prefix, dtype=torch.float64)
         chunk = self.model.normalizer.denormalize(
-            vector.view(-1, *self.model.target_shape)
+            vector.view(-1, *self.model.target_shape), **decode_kwargs
         )[0].float().cpu()
 
         # The stop readout, on the same pooled context the motion head just used. Reported
