@@ -1,6 +1,13 @@
 # RTC training: conditioning the chunk on the commitment
 
-Status: design approved, implementation on branch `rtc`. Companion to
+Status: SFT and harness-eval sides BUILT on branch `rtc` (both repos,
+2026-08-23): the core flow-module extension (per-tick time, prefix pinning,
+postfix loss), the SFT trainer flags, the shared `ChunkScheduler` in
+`objectnav_eval`, the harness runner/wire, and the rollout-policy prefix path.
+**The RL side (section 7) is design only** -- deliberately deferred; extra
+subtleties are under discussion and nothing in `flow_sde_policy`,
+`rollout_core` or the RL env actor has been touched. The flow-module helpers
+were built to be the reusable substrate that work will consume. Companion to
 `habitat_physical_nav/docs/LATENCY_MASKING.md`, which owns the harness-side
 schedule this document builds against; the split is deliberate and mirrored
 there (§Scope). Method follows the training-time variant of real-time chunking
