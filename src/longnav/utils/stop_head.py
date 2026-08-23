@@ -1,12 +1,59 @@
 """
-A stop classifier on the turn's context vector.
+A MOTION-stop classifier on the turn's context vector.
+
+TWO DIFFERENT THINGS ARE CALLED "THE STOP HEAD" IN THIS PROJECT. They answer different
+questions, read different tensors, and are trained on different labels:
+
+===============  ====================================  ==============================
+                 THIS FILE (motion stop)               state_probe.BinaryStopHead
+                                                       (EPISODE stop)
+===============  ====================================  ==============================
+question         "should the base stop DRIVING now?"   "is the agent AT the goal --
+                                                       should the EPISODE terminate?"
+reads            the action head's pooled context      the probe readout hidden
+                 vector (the action latent)            (`worker_value_readout_offset`)
+label            the episode's final observation       per frame, `distance_to_goal
+                 (structural, one positive/episode)    <= success_radius` (a metric)
+lives on         `model.stop_head`                     `model.state_probe.stop_head`
+status           **deemed unnecessary** -- the flow    the ACTIVE line of work; it is
+                 head models the whole conditional     what makes a checkpoint
+                 distribution instead, and declares    deployable, since every eval
+                 no stop head at all                   before it ran on an ORACLE stop
+===============  ====================================  ==============================
+
+The flow-matching head therefore has NO `model.stop_head`
+(`flow_matching_head.py`, "NO STOP HEAD here"), and a flow checkpoint's stop classifier,
+when it has one, is always the state probe's. `objectnav_eval.bridge._StopHeadControl`
+handles both and reports which it found.
+
+Everything below describes the motion-stop head only.
 
 The motion head says *where to go*; nothing in it says *when to stop*. This adds a second
 readout on the same pooled per-turn state, trained as binary classification against the
 episode end.
 
-Labels
-------
+Labels  (SUPERSEDED -- read this first)
+--------------------------------------
+**The final-frame heuristic described below is NOT how stops are labelled any more.** It
+is retained because it is what THIS head -- the deprecated motion-stop head -- was
+trained on, and removing the description would make the old checkpoints unreadable.
+
+The episode-stop head in `state_probe.BinaryStopHead` labels every frame independently
+with the METRIC `distance_to_goal <= success_radius` (`data_scripts/add_stop_targets.py`,
+column `stop_targets`, radius stamped as `stop_radius_m`). That replaced the structural
+label for three reasons, each of which the heuristic gets wrong:
+
+* PointNav episodes chain several goals, so they ARRIVE several times; "the last frame"
+  labels one of those arrivals and calls the rest negative.
+* At deployment the head must fire ON ARRIVAL, not when a trajectory happens to end. In
+  on-policy rollouts collected without `--auto-stop` the agent reaches the goal and keeps
+  moving, so the final frame is often not near the goal at all.
+* A structural label does not survive turn shuffling -- a permutation moves the positive
+  to a random slot, which teaches position-reading, the exact cue shuffling exists to
+  destroy.
+
+Everything from here to the end of this section describes the SUPERSEDED labelling.
+
 These are human-terminated expert demonstrations: the demonstrator drove until they judged
 the episode complete and then stopped, so **the final observation of an episode is the
 stop** and every earlier one is not. That is the label, taken as given. Occasional expert

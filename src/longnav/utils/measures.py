@@ -97,9 +97,31 @@ class OracleSuccess(Measure):
     #     super().__init__()
 
     def __init__(self, *args: Any, config: Any, **kwargs: Any):
-        print(f"in oracle success init: args = {args}, kwargs = {kwargs}")
         self._config = config
         super().__init__()
+
+    def _success_distance(self) -> float:
+        """The configured success radius, however this habitat version passes config.
+
+        Read from config rather than hardcoded. This measure previously used a literal
+        3.0 m with the config-driven line commented out directly above it, so every
+        RL-side `oracle_success` was computed at THREE METRES while the harness scored
+        the same quantity at the task's own radius (1.0 m). The two were never the same
+        number, and the RL one was much larger. Fixed 2026-08-23; RL oracle-success
+        figures recorded before that date are not comparable to anything after it.
+        """
+        cfg = self._config
+        for get in (lambda: cfg["success_distance"],
+                    lambda: cfg.success_distance):
+            try:
+                v = get()
+            except Exception:
+                continue
+            if v is not None:
+                return float(v)
+        raise ValueError(
+            "OracleSuccess cannot read success_distance from its config; refusing to "
+            "fall back to a literal, which is the bug this replaced.")
 
     def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
         return self.cls_uuid
@@ -113,8 +135,7 @@ class OracleSuccess(Measure):
 
     def update_metric(self, *args: Any, task: EmbodiedTask, **kwargs: Any):
         d = task.measurements.measures[DistanceToGoal.cls_uuid].get_metric()
-        # self._metric = float(self._metric or d < self._config["success_distance"])
-        self._metric = float(self._metric or d < 3.0)
+        self._metric = float(self._metric or d < self._success_distance())
 
 
 @registry.register_measure

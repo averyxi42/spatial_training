@@ -72,6 +72,33 @@ def roc_stats(logit, label):
     return out
 
 
+def first_crossing_success(logit, label, row_id, thr):
+    """Simulated deployment stopping, on the ORDERED rows, with no simulator.
+
+    The saved label IS "within success_radius at this frame", and an ordered row is a
+    real trajectory in temporal order, so "where would the head have stopped, and would
+    that have been a success" is a lookup: take the first turn whose score crosses `thr`
+    and read its label. That is exactly the first-crossing measure the closed-loop
+    harness computes, evaluated against a FIXED set of trajectories.
+
+    Fixed trajectories is the point, not a limitation: it isolates the stop head. A
+    closed-loop number moves when either the head or the policy changes, so it cannot
+    say which improved; this moves only when the head does. It is a proxy for the
+    deployed number, not a substitute -- the trajectories are the collecting policy's,
+    and rows are 175-turn CHUNKS, so a chunk that starts mid-episode begins already
+    near the goal and is easier than a real episode start.
+    """
+    ok = tot = 0
+    for r in np.unique(row_id):
+        m = row_id == r
+        lg, lb = logit[m], label[m]
+        fired = np.nonzero(np.isfinite(lg) & (lg >= thr))[0]
+        tot += 1
+        if fired.size and lb[fired[0]] == 1:
+            ok += 1
+    return ok / max(tot, 1), tot
+
+
 def main():
     ap_ = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -86,6 +113,11 @@ def main():
         lg = np.concatenate([p["logits"] for p in parts])
         lb = np.concatenate([p["labels"] for p in parts])
         sh = np.concatenate([p["shuffled"] for p in parts])
+        # row ids are per-file; offset them so rows from different ranks stay distinct
+        rid, off = [], 0
+        for p_ in parts:
+            rid.append(p_["row_id"] + off); off += int(p_["row_id"].max()) + 1
+        rid = np.concatenate(rid)
         print(f"\n=== step {step}  ({len(parts)} ranks, {lg.size} turns) ===")
         for name, mask in (("pooled", np.ones_like(sh)),
                            ("ordered", ~sh), ("shuffled (clock-free)", sh)):
@@ -100,6 +132,19 @@ def main():
             print(f"  {'':22s} TPR@FPR: "
                   + "  ".join(f"{t}={s[f'tpr@fpr{t}']:.3f}"
                               for t in (0.01, 0.003, 0.001, 0.0003)))
+            if name == "ordered":
+                # Predicted deployment stopping, swept over the head's own quantiles so
+                # the operating point is comparable across checkpoints even as the score
+                # distribution drifts (it moved pred_rate 0.23 -> 0.53 in 200 steps).
+                q = [0.90, 0.95, 0.98, 0.99]
+                cells = []
+                for qq in q:
+                    thr = float(np.quantile(lg[mask][np.isfinite(lg[mask])], qq))
+                    fc, nrows = first_crossing_success(lg[mask], lb[mask],
+                                                       rid[mask], thr)
+                    cells.append(f"q{qq}={fc:.3f}")
+                print(f"  {'':22s} first-crossing success ({nrows} rows): "
+                      + "  ".join(cells))
     print("\nDeployability: TPR at FPR 1e-3 is the number to watch. Anything above ~0.1 "
           "there is enough -- the agent gets many frames inside the radius, so recall is "
           "nearly free and false positives are what destroy success.")
