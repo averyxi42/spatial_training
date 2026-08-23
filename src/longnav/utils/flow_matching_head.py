@@ -335,41 +335,144 @@ def flow_interpolate(
     and is constant in `t` along a path, which is why integrating it with `dt = -1/num_steps`
     (see `euler_integrate`) walks back down to the data.
 
-    `actions`, `noise`: (N, T, 3). `time`: (N,). Returns two (N, T, 3) tensors.
+    `actions`, `noise`: (N, T, 3). `time`: (N,), or (N, T) for a PER-TICK noise level --
+    the RTC prefix case (see `prefix_time`), where rows at `t = 0` land exactly on
+    `actions`, i.e. the clean committed rows. Returns two (N, T, 3) tensors.
     """
-    if time.dim() != 1 or time.shape[0] != actions.shape[0]:
+    if time.dim() == 1 and time.shape[0] == actions.shape[0]:
+        t = time.to(actions.dtype)[:, None, None]
+    elif time.dim() == 2 and time.shape == actions.shape[:2]:
+        t = time.to(actions.dtype)[:, :, None]
+    else:
         raise ValueError(
-            f"time must be (N,) with N == actions.shape[0]; got {tuple(time.shape)} "
+            f"time must be (N,) or (N, T) matching actions; got {tuple(time.shape)} "
             f"against {tuple(actions.shape)}"
         )
-    t = time.to(actions.dtype)[:, None, None]
     return t * noise + (1.0 - t) * actions, noise - actions
+
+
+# --------------------------------------------------------------------------------------
+# RTC prefix conditioning (docs/RTC_TRAINING.md). These four functions are THE single
+# construction site for the commitment mask, the per-tick time vector, the row pinning
+# and the delay draw: the SFT loss, `euler_integrate` and the flow-SDE head all condition
+# through them, so the training-time masking is the same code everywhere it appears.
+# --------------------------------------------------------------------------------------
+def prefix_mask_from_len(prefix_len: torch.Tensor, n_ticks: int) -> torch.Tensor:
+    """`(N,)` committed-row counts `d` -> `(N, n_ticks)` bool, True at rows `[0, d)`.
+
+    Raises on `d >= n_ticks`: a fully-committed chunk has nothing left to generate, and
+    the schedule's `d <= H - gap < H` makes it unreachable -- reaching it means the
+    caller's delay bound is wrong, not that the loss should quietly divide by zero.
+    """
+    prefix_len = prefix_len.long()
+    if bool((prefix_len < 0).any()) or bool((prefix_len >= n_ticks).any()):
+        raise ValueError(
+            f"prefix_len must lie in [0, {n_ticks - 1}] (d <= H - gap < H), got "
+            f"[{int(prefix_len.min())}, {int(prefix_len.max())}]"
+        )
+    ticks = torch.arange(n_ticks, device=prefix_len.device)
+    return ticks[None, :] < prefix_len[:, None]
+
+
+def prefix_time(time: torch.Tensor, prefix_mask: torch.Tensor) -> torch.Tensor:
+    """Per-tick flow time with `t = 0` -- CLEAN, on this repo's reversed axis -- at the
+    committed rows. `time`: (N,) or (N, T); `prefix_mask`: (N, T) bool. Returns (N, T).
+
+    The RTC paper's Algorithm 1 writes `1.0` here because its time axis points the other
+    way. Transcribing it literally pins the prefix at pure noise, runs fine, and prints a
+    plausible wrong number (docs/RTC_TRAINING.md, the reversed-time trap).
+    """
+    if time.dim() == 1:
+        time = time[:, None].expand(prefix_mask.shape)
+    return torch.where(prefix_mask, torch.zeros_like(time), time)
+
+
+def pin_prefix(x: torch.Tensor, prefix: torch.Tensor,
+               prefix_mask: torch.Tensor) -> torch.Tensor:
+    """Overwrite the committed rows of `x` with `prefix`. `x`, `prefix`: (N, T, D);
+    `prefix_mask`: (N, T). `prefix` is full-width, zero-padded past the committed rows;
+    rows outside the mask pass through untouched."""
+    return torch.where(prefix_mask[..., None], prefix, x)
+
+
+def postfix_mean(values: torch.Tensor, prefix_mask: torch.Tensor) -> torch.Tensor:
+    """Mean of `values` (N, T, D) over the NON-committed elements only -> (N,).
+
+    The postfix-only loss reduction, as a mask MULTIPLIER. No DDP hazard hides here:
+    `prefix_mask_from_len` guarantees d < T, so the postfix is never empty and every
+    parameter receives gradient on every row (prefix-position tick_embed included, via
+    the bidirectional attention from postfix outputs).
+    """
+    keep = (~prefix_mask)[..., None].to(values.dtype).expand_as(values)
+    return (values * keep).flatten(1).sum(dim=1) / keep.flatten(1).sum(dim=1)
+
+
+def sample_prefix_len(
+    n: int, delay_max: int, *, dist: str = "uniform", zero_frac: float = 0.0,
+    device=None, generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """`(n,)` int64 commitment lengths in `[0, delay_max]`, drawn ONLINE per example.
+
+    No dataset column exists or is needed: the prefix target is the chunk's own first
+    `d` rows (docs/RTC_TRAINING.md section 6.4). `uniform` matches the paper's
+    real-world recipe; `exp` is its simulated setting, weights halving per tick.
+    `zero_frac` adds deliberate mass at `d = 0` on top of either law -- resume-from-rest
+    must be trained, not hoped for (the freezing hazard, doc section 8).
+    """
+    if dist == "uniform":
+        d = torch.randint(0, delay_max + 1, (n,), device=device, generator=generator)
+    elif dist == "exp":
+        w = 0.5 ** torch.arange(delay_max + 1, dtype=torch.float32, device=device)
+        d = torch.multinomial(w.expand(n, -1), 1, generator=generator).squeeze(1)
+    else:
+        raise ValueError(f"dist must be 'uniform' or 'exp', got {dist!r}")
+    if zero_frac > 0.0:
+        zero = torch.rand(n, device=device, generator=generator) < zero_frac
+        d = torch.where(zero, torch.zeros_like(d), d)
+    return d.long()
 
 
 def euler_integrate(
     velocity_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     noise: torch.Tensor,
     num_steps: int,
+    prefix: Optional[torch.Tensor] = None,
+    prefix_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Forward-Euler integration from t = 1 (noise) down to t = 0 (actions).
 
-    openpi's loop verbatim, minus the real-time-chunking hook this project does not use:
-    `dt = -1/num_steps`, `time = 1 + step*dt`, `x <- x + dt * v(x, time)`. The NEGATIVE `dt`
-    is the whole reversed-axis convention in one character; with `u_t = noise - actions` the
-    exact field carries `noise` to `actions` in a single step of size 1, which is what
+    openpi's loop verbatim, WITH the real-time-chunking hook: `dt = -1/num_steps`,
+    `time = 1 + step*dt`, `x <- x + dt * v(x, time)`. The NEGATIVE `dt` is the whole
+    reversed-axis convention in one character; with `u_t = noise - actions` the exact
+    field carries `noise` to `actions` in a single step of size 1, which is what
     `tests/test_flow_matching_head.py` checks end to end.
 
+    `prefix` (`(N, T, D)` in the field's own scaled space, zero-padded past the committed
+    rows) and `prefix_mask` (`(N, T)` bool, True at committed rows) condition the
+    generation on already-decided actions: those rows are pinned to the prefix before the
+    loop and after every update, and the field sees per-tick time `0.0` there --
+    already-denoised data to be consistent with, not noise to transport
+    (docs/RTC_TRAINING.md section 6). `prefix=None` is the historical unconditioned
+    loop, bit for bit.
+
     `velocity_fn(x_t, time)` receives `x_t` of `noise`'s shape and `time` as a float32
-    tensor of shape (N,), and must return a velocity of `x_t`'s shape and dtype.
+    tensor of shape (N,) -- or (N, T) when a prefix is present -- and must return a
+    velocity of `x_t`'s shape and dtype.
     """
     if num_steps < 1:
         raise ValueError(f"num_steps must be >= 1, got {num_steps}")
+    if (prefix is None) != (prefix_mask is None):
+        raise ValueError("prefix and prefix_mask must be passed together")
     dt = -1.0 / num_steps
-    x_t = noise
+    x_t = noise if prefix is None else pin_prefix(noise, prefix, prefix_mask)
     for step in range(num_steps):
         time = torch.full((noise.shape[0],), 1.0 + step * dt,
                           dtype=torch.float32, device=noise.device)
+        if prefix is not None:
+            time = prefix_time(time, prefix_mask)
         x_t = x_t + dt * velocity_fn(x_t, time)
+        if prefix is not None:
+            x_t = pin_prefix(x_t, prefix, prefix_mask)
     return x_t
 
 
@@ -483,6 +586,16 @@ class FlowMatchingConfig:
     #: per-dimension divisor applied to the differentials before flow matching; see the
     #: module docstring's ACTION SCALING section. `(1, 1, 1)` disables it.
     action_scales: Tuple[float, float, float] = ACTION_SCALES
+    #: RTC training-time conditioning (docs/RTC_TRAINING.md). 0 disables it entirely --
+    #: the historical objective, bit for bit. When > 0, each training example draws a
+    #: commitment length d in [0, rtc_delay_max], sees its first d rows clean at per-tick
+    #: t = 0, and takes loss on the postfix only. Riding in this config means it lands in
+    #: the checkpoint's `fm_config`, which is the ONE flag downstream uses to decide
+    #: whether a checkpoint understands a prefix; keep it <= H - gap (10 at the shipped
+    #: 20/10 config) so the postfix is never empty -- checked against n_ticks at forward.
+    rtc_delay_max: int = 0
+    rtc_delay_dist: str = "uniform"
+    rtc_zero_frac: float = 0.0
 
     def __post_init__(self):
         self.action_scales = tuple(float(s) for s in self.action_scales)
@@ -490,6 +603,14 @@ class FlowMatchingConfig:
             raise ValueError(f"action_scales must be 3 positive floats, got {self.action_scales}")
         if self.k_samples < 1:
             raise ValueError(f"k_samples must be >= 1, got {self.k_samples}")
+        if self.rtc_delay_max < 0:
+            raise ValueError(f"rtc_delay_max must be >= 0, got {self.rtc_delay_max}")
+        if self.rtc_delay_dist not in ("uniform", "exp"):
+            raise ValueError(
+                f"rtc_delay_dist must be 'uniform' or 'exp', got {self.rtc_delay_dist!r}"
+            )
+        if not 0.0 <= self.rtc_zero_frac <= 1.0:
+            raise ValueError(f"rtc_zero_frac must be in [0, 1], got {self.rtc_zero_frac}")
         if self.stratified_time and abs(self.time_beta - 1.0) > 1e-9:
             raise ValueError(
                 "stratified_time requires time_beta == 1.0 (the Beta(alpha, 1) inverse CDF "
@@ -646,7 +767,9 @@ class FlowActionDecoder(nn.Module):
     def forward(self, context: torch.Tensor, x_t: torch.Tensor, time: torch.Tensor,
                 incoming: Optional[torch.Tensor] = None) -> torch.Tensor:
         """`context`: (N, context_dim). `x_t`: (N, T, 3) in SCALED action space. `time`:
-        (N,) in [0, 1], where 1 is noise. Returns (N, T, 3), the velocity at `x_t`.
+        (N,) in [0, 1], where 1 is noise -- or (N, T) when the noise level differs per
+        tick (RTC prefix conditioning: committed rows sit at 0.0, the rest at the shared
+        integration time). Returns (N, T, 3), the velocity at `x_t`.
 
         Every one of the N rows is independent; the K-sample expansion is done by the caller
         (`TurnFlowActionRegressor.forward`) precisely so this stays a plain batched forward.
@@ -665,9 +788,22 @@ class FlowActionDecoder(nn.Module):
         ctx_tok = context.view(N, C, d)                      # reshape only -- no projection
 
         act = self.action_in_proj(x_t)                       # (N, T, d)
-        t_emb = sinusoidal_time_embedding(
-            time, d, self.min_period, self.max_period).to(act.dtype)
-        t_emb = t_emb[:, None, :].expand_as(act)             # broadcast over ticks
+        if time.dim() == 1:
+            t_emb = sinusoidal_time_embedding(
+                time, d, self.min_period, self.max_period).to(act.dtype)
+            t_emb = t_emb[:, None, :].expand_as(act)         # one noise level, all ticks
+        elif time.shape == (N, T):
+            # Per-tick noise level (RTC): the SAME fixed featurization, evaluated per
+            # (row, tick) instead of broadcast. The chunk is no longer homogeneous in t,
+            # and which rows are already clean is exactly what the field needs to know;
+            # the fusion MLP below was per-token all along, so no parameters are involved.
+            t_emb = sinusoidal_time_embedding(
+                time.reshape(-1), d, self.min_period, self.max_period
+            ).to(act.dtype).view(N, T, d)
+        else:
+            raise ValueError(
+                f"time must be (N,) or (N, T) = ({N}, {T}), got {tuple(time.shape)}"
+            )
         fused = self.action_time_mlp_out(
             F.silu(self.action_time_mlp_in(torch.cat([act, t_emb], dim=-1)))
         )
@@ -765,16 +901,50 @@ class FlowActionCodec(nn.Module):
         return self.scale(decompose_chunk(chunk.double()))
 
     # -- generation ---------------------------------------------------------------------
+    def _prefix_tensors(
+        self, prefix: Optional[torch.Tensor], n: int, device,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """`(d, 3)` or `(N, d, 3)` PHYSICAL committed differentials -> the scaled
+        full-width `(N, T, 3)` prefix and `(N, T)` mask `euler_integrate` takes.
+        `None` or `d = 0` -> `(None, None)`, the unconditioned path."""
+        if prefix is None:
+            return None, None
+        p = torch.as_tensor(prefix, device=device, dtype=torch.float64)
+        if p.dim() == 2:
+            p = p[None].expand(n, -1, -1)
+        if p.dim() != 3 or p.shape[0] != n or p.shape[-1] != self.decoder.n_dims:
+            raise ValueError(
+                f"prefix must be (d, {self.decoder.n_dims}) or (N, d, "
+                f"{self.decoder.n_dims}), got {tuple(p.shape)} for N={n}"
+            )
+        d = p.shape[1]
+        if d == 0:
+            return None, None
+        T = self.decoder.n_ticks
+        mask = prefix_mask_from_len(
+            torch.full((n,), d, dtype=torch.long, device=device), T
+        )
+        full = torch.zeros(n, T, self.decoder.n_dims, device=device, dtype=torch.float32)
+        full[:, :d] = self.scale(p).float()
+        return full, mask
+
     @torch.no_grad()
     def generate(self, context: torch.Tensor, num_steps: Optional[int] = None,
                  generator: Optional[torch.Generator] = None,
                  noise: Optional[torch.Tensor] = None,
-                 incoming: Optional[torch.Tensor] = None) -> torch.Tensor:
+                 incoming: Optional[torch.Tensor] = None,
+                 prefix: Optional[torch.Tensor] = None) -> torch.Tensor:
         """(N, context_dim) -> (N, T, 3) PHYSICAL per-tick differentials.
 
         Draws `x_1 ~ N(0, I)` in the scaled space and integrates the field down to t = 0.
         `generator` (else `self.generator`, else the global RNG) seeds the draw; it must be a
         generator for `context.device`, since that is where the noise is allocated.
+
+        `prefix`: `(d, 3)` or `(N, d, 3)` PHYSICAL differentials -- the committed rows.
+        Rows `[0, d)` of the result equal the prefix exactly; the rest are generated
+        conditioned on them (frozen rows, per-tick time -- docs/RTC_TRAINING.md). Only a
+        checkpoint trained with `rtc_delay_max > 0` knows what a prefix means; callers
+        own that gate. `None` / `d = 0` is bit-identical to the unconditioned path.
 
         There is exactly ONE generation mode. No teacher forcing exists for this head, so
         this is both the training-time metric path and the deployed path -- which is the
@@ -787,12 +957,15 @@ class FlowActionCodec(nn.Module):
         if noise is None:
             noise = torch.randn(ctx.shape[0], dec.n_ticks, dec.n_dims,
                                 device=ctx.device, dtype=ctx.dtype, generator=gen)
+        prefix_full, prefix_mask = self._prefix_tensors(prefix, ctx.shape[0], ctx.device)
         x0 = euler_integrate(
-            lambda x_t, t: dec(ctx, x_t, t, incoming=incoming), noise, steps
+            lambda x_t, t: dec(ctx, x_t, t, incoming=incoming), noise, steps,
+            prefix=prefix_full, prefix_mask=prefix_mask,
         )
         return self.unscale(x0.double())
 
-    def denormalize(self, context: torch.Tensor) -> torch.Tensor:
+    def denormalize(self, context: torch.Tensor,
+                    prefix: Optional[torch.Tensor] = None) -> torch.Tensor:
         """(N, context_dim) -> (N, T, 3) anchor-relative chunk. The rollout entry point.
 
         `context` is `h`, the deterministic readout. With a latent installed it is mapped to
@@ -819,7 +992,7 @@ class FlowActionCodec(nn.Module):
                 f"latent_mode={self.latent_mode!r} on a codec with no latent split: there "
                 "is no `c` to sample. This checkpoint is deterministic."
             )
-        return compose_chunk(self.generate(ctx, noise=noise))
+        return compose_chunk(self.generate(ctx, noise=noise, prefix=prefix))
 
     def pin_flow_noise(self, seed: Optional[int]) -> None:
         """Freeze the ODE's base noise at `seed`, or clear it with `None`.
@@ -841,8 +1014,15 @@ class FlowActionCodec(nn.Module):
         ).to(dev)
 
     def generate_differentiable(self, context: torch.Tensor, num_steps: int,
-                                noise: torch.Tensor) -> torch.Tensor:
+                                noise: torch.Tensor,
+                                prefix: Optional[torch.Tensor] = None,
+                                prefix_mask: Optional[torch.Tensor] = None
+                                ) -> torch.Tensor:
         """`generate` WITHOUT `torch.no_grad`, in SCALED space, for the diversity regulariser.
+
+        `prefix` / `prefix_mask` are passed straight to `euler_integrate` and are therefore
+        already in SCALED, full-width form -- consistent with everything else about this
+        method living one level below the codec's physical-units surface.
 
         A separate method rather than a flag on `generate`, because every other caller wants
         the no-grad path and a flag that silently retains a graph through `num_steps` decoder
@@ -855,7 +1035,8 @@ class FlowActionCodec(nn.Module):
         """
         dec = self.decoder
         return euler_integrate(
-            lambda x_t, t: dec(context.float(), x_t, t), noise, int(num_steps)
+            lambda x_t, t: dec(context.float(), x_t, t), noise, int(num_steps),
+            prefix=prefix, prefix_mask=prefix_mask,
         )
 
     def denormalize_from_latent(self, c: torch.Tensor,
@@ -1088,10 +1269,30 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
                            scale=cfg.time_scale, offset=cfg.time_offset,
                            stratified=cfg.stratified_time, device=dev)
         noise = sample_noise(N, K, T, D, antithetic=cfg.antithetic_noise, device=dev)
+        # ---- RTC training-time conditioning (docs/RTC_TRAINING.md section 6). The
+        # commitment length is drawn ONLINE per example -- the prefix target is the
+        # chunk's own first d rows, so no dataset column exists -- and expanded over K,
+        # so all K (t, noise) draws of one context see the same commitment, matching
+        # rollout where d is one number per decision. With per-tick time at 0 the
+        # interpolant puts the clean actions themselves at the prefix rows.
+        rtc_mask = None
+        if cfg.rtc_delay_max > 0:
+            if cfg.rtc_delay_max >= T:
+                raise ValueError(
+                    f"rtc_delay_max={cfg.rtc_delay_max} must be < n_ticks={T}: the "
+                    "schedule guarantees d <= H - gap, so an all-prefix chunk means "
+                    "the config is wrong, not that the loss should divide by zero"
+                )
+            d_len = sample_prefix_len(N, cfg.rtc_delay_max, dist=cfg.rtc_delay_dist,
+                                      zero_frac=cfg.rtc_zero_frac, device=dev)
+            rtc_mask = prefix_mask_from_len(d_len, T).repeat_interleave(K, dim=0)
+            time = prefix_time(time, rtc_mask)                        # (N*K, T)
         x_t, u_t = flow_interpolate(act_k, noise, time)
         v_t = self.decoder(ctx_k, x_t, time)                          # (N*K, T, 3)
 
-        per_draw = F.mse_loss(v_t, u_t, reduction="none").flatten(1).mean(dim=1)
+        mse = F.mse_loss(v_t, u_t, reduction="none")
+        per_draw = (mse.flatten(1).mean(dim=1) if rtc_mask is None
+                    else postfix_mean(mse, rtc_mask))
         per_turn = per_draw.view(N, K).mean(dim=1)                    # average over K
         # ---- the mode-seeking ratio. Two draws from the PRIOR (not the posterior -- the
         # prior is what RL samples from), decoded under the SAME base noise so the numerator

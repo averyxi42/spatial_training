@@ -418,3 +418,121 @@ def test_velocity_field_is_smaller_than_the_ar_decoder_at_matched_shape():
                          n_heads=2, dim_ff=32, dropout=0.0, n_context_tokens=NCTX)
     fm = make()
     assert sum(p.numel() for p in fm.parameters()) < sum(p.numel() for p in ar.parameters())
+
+# ======================================================================================
+# RTC prefix conditioning (docs/RTC_TRAINING.md)
+# ======================================================================================
+def test_scalar_and_constant_per_tick_time_are_bit_identical():
+    """The (N,) path is the historical one; a constant (N, T) must reproduce it exactly,
+    because the per-tick change is a reshape of the same fixed featurization, not a new
+    computation. Any drift here would silently shift `h`-adjacent quantities the SDE
+    density amplifies by 1/sigma^2."""
+    dec = make()
+    torch.manual_seed(1)
+    ctx = torch.randn(3, CTX)
+    x_t = torch.randn(3, T, 3)
+    t_row = torch.rand(3)
+    with torch.no_grad():
+        v_scalar = dec(ctx, x_t, t_row)
+        v_tick = dec(ctx, x_t, t_row[:, None].expand(3, T))
+    assert torch.equal(v_scalar, v_tick)
+
+
+def test_per_tick_interpolation_puts_clean_actions_at_zero_rows():
+    """With per-tick time, rows at t = 0 are the actions themselves -- the clean committed
+    prefix -- and rows at t = 1 are pure noise, per the reversed-axis convention."""
+    torch.manual_seed(2)
+    actions, noise = torch.randn(2, T, 3), torch.randn(2, T, 3)
+    time = torch.rand(2, T)
+    time[:, :2], time[:, -1] = 0.0, 1.0
+    x_t, u_t = flow_interpolate(actions, noise, time)
+    assert torch.equal(x_t[:, :2], actions[:, :2])
+    assert torch.equal(x_t[:, -1], noise[:, -1])
+    assert torch.equal(u_t, noise - actions)
+
+
+def test_prefix_mask_and_time_construction():
+    from longnav.utils.flow_matching_head import prefix_mask_from_len, prefix_time
+
+    mask = prefix_mask_from_len(torch.tensor([0, 3]), T)
+    assert mask.tolist()[0] == [False] * T
+    assert mask.tolist()[1] == [True] * 3 + [False] * (T - 3)
+    t = prefix_time(torch.full((2,), 0.7), mask)
+    assert t.shape == (2, T)
+    assert torch.equal(t[1, :3], torch.zeros(3)) and float(t[1, 3]) == pytest.approx(0.7)
+    # d >= n_ticks is a caller bug (the schedule guarantees d <= H - gap < H), not a
+    # degenerate loss to average over.
+    with pytest.raises(ValueError, match="prefix_len"):
+        prefix_mask_from_len(torch.tensor([T]), T)
+    with pytest.raises(ValueError, match="prefix_len"):
+        prefix_mask_from_len(torch.tensor([-1]), T)
+
+
+def test_sample_prefix_len_support_and_laws():
+    from longnav.utils.flow_matching_head import sample_prefix_len
+
+    torch.manual_seed(3)
+    d = sample_prefix_len(512, 4)
+    assert d.dtype == torch.int64 and int(d.min()) >= 0 and int(d.max()) <= 4
+    assert torch.equal(sample_prefix_len(64, 4, zero_frac=1.0), torch.zeros(64).long())
+    d_exp = sample_prefix_len(2048, 4, dist="exp")
+    counts = torch.bincount(d_exp, minlength=5).float()
+    assert bool((counts[:-1] >= counts[1:]).all()), "exp weights must decay per tick"
+    with pytest.raises(ValueError, match="dist"):
+        sample_prefix_len(4, 4, dist="linear")
+
+
+def test_postfix_mean_ignores_committed_rows_only():
+    """The masked reduction IS the loss semantics: values at committed rows must not move
+    it, values anywhere else must."""
+    from longnav.utils.flow_matching_head import postfix_mean, prefix_mask_from_len
+
+    torch.manual_seed(4)
+    vals = torch.randn(2, T, 3)
+    mask = prefix_mask_from_len(torch.tensor([2, 0]), T)
+    out = postfix_mean(vals, mask)
+    assert torch.allclose(out[0], vals[0, 2:].mean())
+    assert torch.allclose(out[1], vals[1].mean())
+    poked = vals.clone()
+    poked[0, :2] += 100.0
+    assert torch.equal(postfix_mean(poked, mask), out)
+    poked[0, 2] += 1.0
+    assert not torch.equal(postfix_mean(poked, mask), out)
+
+
+def test_generate_prefix_rows_are_the_prefix_exactly():
+    """Rows [0, d) of a conditioned generation equal the committed differentials (up to the
+    float32 scale/unscale round trip); the rest are generated. And the conditioning is
+    real: a different prefix under the SAME base noise changes the postfix."""
+    codec = make_codec()
+    torch.manual_seed(5)
+    ctx = torch.randn(2, CTX)
+    noise = torch.randn(2, T, 3)
+    prefix_a = torch.randn(2, 3, 3, dtype=torch.float64) * 0.02
+    out_a = codec.generate(ctx, noise=noise, prefix=prefix_a)
+    assert torch.allclose(out_a[:, :3], prefix_a, atol=1e-7)
+    prefix_b = -prefix_a
+    out_b = codec.generate(ctx, noise=noise, prefix=prefix_b)
+    assert not torch.allclose(out_a[:, 3:], out_b[:, 3:])
+
+
+def test_empty_prefix_is_bit_identical_to_none():
+    """d = 0 (and None) is the historical unconditioned path, bit for bit -- the first
+    decision of every episode rides on this."""
+    codec = make_codec()
+    torch.manual_seed(6)
+    ctx = torch.randn(2, CTX)
+    noise = torch.randn(2, T, 3)
+    base = codec.generate(ctx, noise=noise)
+    empty = codec.generate(ctx, noise=noise, prefix=torch.zeros(2, 0, 3))
+    assert torch.equal(base, empty)
+
+
+def test_flow_matching_config_validates_rtc_fields():
+    FlowMatchingConfig(rtc_delay_max=4, rtc_delay_dist="exp", rtc_zero_frac=0.1)
+    with pytest.raises(ValueError, match="rtc_delay_max"):
+        FlowMatchingConfig(rtc_delay_max=-1)
+    with pytest.raises(ValueError, match="rtc_delay_dist"):
+        FlowMatchingConfig(rtc_delay_max=2, rtc_delay_dist="normal")
+    with pytest.raises(ValueError, match="rtc_zero_frac"):
+        FlowMatchingConfig(rtc_zero_frac=1.5)
