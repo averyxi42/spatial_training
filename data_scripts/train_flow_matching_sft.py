@@ -74,6 +74,26 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch  # noqa: E402
 from transformers import AutoProcessor, TrainingArguments  # noqa: E402
 
+# HF Trainer's --resume-from path loads the checkpoint's rng_state_*.pth with a bare
+# torch.load, which PyTorch >= 2.6 refuses (weights_only default) because the numpy RNG
+# state pickles numpy globals. These are our own checkpoints, so allowlist exactly what
+# they carry. The tuple form matters: the pickle names the numpy-2 module path
+# ("numpy._core...") while the live function's __module__ here is the 1.x name, and the
+# allowlist matches by pickled name. Failure to allowlist is tolerated silently because
+# the resume path then fails LOUDLY with torch's own explanatory error -- this block can
+# only widen what works, never mask a failure.
+try:  # noqa: SIM105
+    import numpy as _np
+    from numpy.core.multiarray import _reconstruct as _np_reconstruct
+    torch.serialization.add_safe_globals([
+        (_np_reconstruct, "numpy._core.multiarray._reconstruct"),
+        (_np.ndarray, "numpy.ndarray"),
+        (_np.dtype, "numpy.dtype"),
+        (_np.dtypes.UInt32DType, "numpy.dtypes.UInt32DType"),
+    ])
+except Exception:
+    pass
+
 import train_vector_sft as base  # noqa: E402
 from longnav.utils.latent_intent import LatentConfig  # noqa: E402
 from longnav.utils.mixture import MixtureSpec, build_mixture  # noqa: E402
