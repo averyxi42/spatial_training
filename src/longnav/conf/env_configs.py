@@ -156,6 +156,10 @@ class ContinuousObjectNavEnvConfig:
     # Spawn-snap policy: True (historical). The eval harness does NOT snap, and snapped
     # spawns can land mesh-disconnected (skipped episodes); parity evals set False.
     snap_start: bool = True
+    # Robot-footprint reachability screening: True (historical, right for training).
+    # False = the harness's serve-everything convention; parity evals need it, since the
+    # robot mesh screens out ~30 of sample101 that the harness scores as failures.
+    screen_reachability: bool = True
     rtc_delay_source: str = "none"
     rtc_delay: int = 0
     rtc_delay_max: int = 0

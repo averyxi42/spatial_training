@@ -78,6 +78,7 @@ class ContinuousObjectNavEnvActor:
         rtc_delay_seed: int = 0,
         rtc_overrun_rate: float = 0.0,
         snap_start: bool = True,
+        screen_reachability: bool = True,
         **kwargs: Any,
     ):
         self.episodes_path = episodes
@@ -152,6 +153,11 @@ class ContinuousObjectNavEnvActor:
         # unless deliberately re-based (changing it changes start distances and every
         # downstream number).
         self.snap_start = bool(snap_start)
+        # Robot-footprint reachability screening. True (historical) for training --
+        # unreachable goals enter training as zero-progress rollouts and teach that some
+        # goals pay nothing. False = the harness's serve-everything convention, required
+        # for cross-path parity on pinned sets (see _next_admissible_episode).
+        self.screen_reachability = bool(screen_reachability)
         # -- RTC latency masking (docs/RTC_RL.md; schedule from objectnav_eval) --------
         # "none" (default) is the historical env, bit for bit: no scheduler is ever
         # constructed, step() keeps its (gap, 3) contract, and no extra geodesic query
@@ -885,6 +891,13 @@ class ContinuousObjectNavEnvActor:
             episode = self._episodes[self._order[self._cursor]]
             self._cursor += 1
             self._ensure_scene(episode)
+            if not self.screen_reachability:
+                # Cross-path parity mode: serve EVERYTHING, like the harness's default.
+                # The harness scores all of sample101 on the dataset mesh; this env's
+                # robot-footprint screen drops ~30 of those 101 as goal_unreachable,
+                # which is the right call for TRAINING (below) and the wrong one for a
+                # comparison whose reference includes them as (almost certain) failures.
+                return episode, "unscreened"
             pf = self._screening_pathfinder()
             if self._screener is None or self._screener.robot_pathfinder is not pf:
                 # Screened against the ROBOT's reachability even when rewards are measured

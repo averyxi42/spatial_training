@@ -53,9 +53,11 @@ sim:
   reward_lost_steps: 25
   # A fixed episode stream so legs are paired episode-for-episode.
   seed: 0
-  # The harness convention: raw spawns, no navmesh snap. With the snap on, ~30% of
-  # sample101 lands mesh-disconnected and is skipped -- episodes the harness serves.
+  # The harness conventions, both: raw spawns (no navmesh snap), and NO robot-mesh
+  # reachability screen -- the pinned set includes ~30 episodes the robot mesh calls
+  # goal_unreachable, which the harness's reference numbers score as failures.
   snap_start: false
+  screen_reachability: false
   # RTC off by default (the historical env, bit for bit); legs override on the CLI.
   rtc_delay_source: none
   rtc_delay: 0
