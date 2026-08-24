@@ -71,6 +71,12 @@ class ContinuousObjectNavEnvActor:
         logger_actor: Any = None,
         video_tick_stride: int = 2,
         video_realtime_factor: float = 1.0,
+        rtc_delay_source: str = "none",
+        rtc_delay: int = 0,
+        rtc_delay_max: int = 0,
+        rtc_delay_base: float = 0.8,
+        rtc_delay_seed: int = 0,
+        rtc_overrun_rate: float = 0.0,
         **kwargs: Any,
     ):
         self.episodes_path = episodes
@@ -137,6 +143,25 @@ class ContinuousObjectNavEnvActor:
         self._exclude_categories = frozenset(
             c.strip().lower() for c in (exclude_categories or ()) if c and c.strip()
         )
+        # -- RTC latency masking (docs/RTC_RL.md; schedule from objectnav_eval) --------
+        # "none" (default) is the historical env, bit for bit: no scheduler is ever
+        # constructed, step() keeps its (gap, 3) contract, and no extra geodesic query
+        # runs. Any other source turns on the reciprocal schedule: the head sends the
+        # FULL (n_ticks, 3) chunk, this actor owns the slicing, the obs carries the
+        # committed prefix, and each step's reward is split at the splice point
+        # (r_commit / r_fresh in info) so returns can be re-timed on the trainer side.
+        self._rtc_source = str(rtc_delay_source)
+        self._rtc = self._rtc_source != "none"
+        self._rtc_delay = int(rtc_delay)
+        self._rtc_delay_max = int(rtc_delay_max)
+        self._rtc_delay_base = float(rtc_delay_base)
+        self._rtc_delay_seed = int(rtc_delay_seed)
+        self._rtc_overrun_rate = float(rtc_overrun_rate)
+        self._scheduler = None
+        self._rtc_episode_index = 0
+        self._commit_done = False
+        self._geo_after_commit: Optional[float] = None
+        self._interval_execs: list = []
         # The SFT rejection thresholds, verbatim; imported here so a stale fork of the
         # numbers cannot drift from the corpus generator's.
         from continuous_demos.drive_failure import DriveFailureConfig
@@ -452,42 +477,145 @@ class ContinuousObjectNavEnvActor:
         if self._video_capture:
             self._video_frames.append(self._encode_frame(rgb))
             self._video_meta.append((-1, 0.0))   # pre-motion frame; overlays info[0]
+        obs: Dict[str, Any] = {"instr_or_goal": episode.object_category}
+        if self._rtc:
+            # Fresh scheduler per episode, stream seeded seed + episode index (the
+            # delay-source discipline, LATENCY_MASKING.md section 4). The first
+            # observe() forces d = 0 -- there is no tail at spawn -- so the first
+            # decision is unconditioned by construction.
+            self._scheduler = self._make_scheduler()
+            self._scheduler.reset(self._rtc_episode_index)
+            self._rtc_episode_index += 1
+            self._commit_done = False
+            self._geo_after_commit = None
+            self._interval_execs = []
+            pfx, d0 = self._scheduler.observe(self._robot_sim.get_2d_pose())
+            obs["rtc_prefix"] = pfx
+            obs["rtc_delay"] = int(d0)
         return rgb, {
-            "obs": {"instr_or_goal": episode.object_category},
+            "obs": obs,
             "reward": 0.0,
             "done": False,
             "is_exhausted": self.is_exhausted(),
             "info": info,
         }
 
-    def step(self, action, supplementary_logs: Optional[Dict[str, Any]] = None):
-        """`action` is the `(gap, 3)` chunk prefix the policy head already truncated."""
-        chunk = np.asarray(action, dtype=np.float64).reshape(-1, 3)
-        if len(chunk) != self.gap:
-            raise ValueError(
-                f"env gap={self.gap} but received a {len(chunk)}-row chunk. The head and the "
-                "env must agree on ticks-per-step, or sim time and policy steps quietly mean "
-                "different things and two runs stop being comparable."
-            )
-        execution = self._executor.execute(
-            chunk, chunk_index=self._steps,
-            # The on_tick hook carries BOTH per-tick concerns: physical fall tracking
-            # (always) and video frames (when capture is on) -- see _video_on_tick.
-            on_tick=self._video_on_tick,
+    # -- RTC latency masking (docs/RTC_RL.md; the schedule is objectnav_eval's) -------
+    def _make_scheduler(self):
+        from objectnav_eval.schedule import ChunkScheduler, DelaySource
+        return ChunkScheduler(
+            self.gap,
+            DelaySource(self._rtc_source, delay=self._rtc_delay,
+                        delay_max=self._rtc_delay_max, base=self._rtc_delay_base,
+                        seed=self._rtc_delay_seed),
+            overrun_rate=self._rtc_overrun_rate, seed=self._rtc_delay_seed,
         )
+
+    def _execute_commitment(self) -> None:
+        """Run the pending committed ticks and take the SPLICE-POINT geodesic reading
+        (the reward split's mid measurement, docs/RTC_RL.md section 4). Runs at most
+        once per decision; reached from begin_interval (overlap) or step (sync) --
+        whichever comes first -- so the trajectory is identical either way."""
+        committed = self._scheduler.pending_commitment()
+        if committed is None:
+            raise RuntimeError("no pending commitment: the scheduler has not observed")
+        if len(committed):
+            self._interval_execs.append(self._executor.execute_setpoints(
+                committed, chunk_index=self._steps, on_tick=self._video_on_tick))
+            self._task.observe_pose(self._robot_sim.get_2d_pose())
+            self._geo_after_commit = float(self._task.evaluate()["distance_to_goal"])
+        else:
+            self._geo_after_commit = None      # d = 0: the splice IS the interval start
+        self._commit_done = True
+
+    def begin_interval(self) -> None:
+        """Execute the committed ticks ahead of the chunk's arrival -- the opportunistic
+        overlap entry (docs/RTC_RL.md section 5). Fired without awaiting by the rollout
+        loop; Ray actor task ordering serializes the coming step() behind this call, so
+        it changes wall-clock and nothing else. Raises when rtc is off rather than
+        no-opping: a silently inert overlap flag is indistinguishable from a working one.
+        """
+        if not self._rtc or self._scheduler is None:
+            raise RuntimeError(
+                "begin_interval requires rtc_delay_source != 'none' on this env")
+        if not self._commit_done:
+            self._execute_commitment()
+
+    def step(self, action, supplementary_logs: Optional[Dict[str, Any]] = None):
+        """`action`: without RTC, the `(gap, 3)` chunk prefix the policy head already
+        truncated -- the historical contract, unchanged. With RTC, the FULL
+        `(n_ticks, 3)` chunk: this actor owns the slicing (docs/RTC_RL.md section 5) --
+        the scheduler tiles the interval as committed ticks + fresh span and retains
+        the tail as the next commitment's source."""
+        chunk = np.asarray(action, dtype=np.float64).reshape(-1, 3)
+        base_geo = self._prev_geodesic
+        if not self._rtc:
+            if len(chunk) != self.gap:
+                raise ValueError(
+                    f"env gap={self.gap} but received a {len(chunk)}-row chunk. The head and the "
+                    "env must agree on ticks-per-step, or sim time and policy steps quietly mean "
+                    "different things and two runs stop being comparable."
+                )
+            execution = self._executor.execute(
+                chunk, chunk_index=self._steps,
+                # The on_tick hook carries BOTH per-tick concerns: physical fall tracking
+                # (always) and video frames (when capture is on) -- see _video_on_tick.
+                on_tick=self._video_on_tick,
+            )
+            executions = [execution]
+            geo_mid = None
+        else:
+            if len(chunk) <= self.gap:
+                raise ValueError(
+                    f"rtc needs the FULL chunk (> gap={self.gap} rows) so the tail can "
+                    f"fund the next commitment; got {len(chunk)} rows. The head returns "
+                    "the full block when called with a prefix -- rollout_core passes "
+                    "obs['rtc_prefix']."
+                )
+            if not self._commit_done:
+                self._execute_commitment()
+            plan = self._scheduler.accept(chunk)
+            fresh = plan.setpoints[plan.committed:]
+            if len(fresh):
+                self._interval_execs.append(self._executor.execute_setpoints(
+                    fresh, chunk_index=self._steps, on_tick=self._video_on_tick))
+            executions = self._interval_execs
+            geo_mid = self._geo_after_commit
         self._steps += 1
 
-        # One geodesic query per policy step, not per tick: the task layer keeps path length
-        # on the cheap PathTracker precisely so stepping never triggers a navmesh query.
+        # One geodesic query per policy step (plus, under RTC with d > 0, the one at the
+        # splice): the task layer keeps path length on the cheap PathTracker precisely so
+        # stepping never triggers extra navmesh queries.
         self._task.observe_pose(self._robot_sim.get_2d_pose())
         geodesic = float(self._task.evaluate()["distance_to_goal"])
 
-        progress = (self._prev_geodesic - geodesic
-                    if np.isfinite(geodesic) and np.isfinite(self._prev_geodesic) else 0.0)
-        if self.progress_reward_clip > 0:
-            progress = float(np.clip(progress, -self.progress_reward_clip,
-                                     self.progress_reward_clip))
-        collided = self._collided(execution)
+        if geo_mid is None:
+            progress = (self._prev_geodesic - geodesic
+                        if np.isfinite(geodesic) and np.isfinite(self._prev_geodesic) else 0.0)
+            if self.progress_reward_clip > 0:
+                progress = float(np.clip(progress, -self.progress_reward_clip,
+                                         self.progress_reward_clip))
+            r_commit = 0.0
+        else:
+            # The reward split (docs/RTC_RL.md section 4): progress over the committed
+            # ticks vs the fresh span, each clipped by the same physical-consistency
+            # bound, each finite-guarded the same way the single-delta path is. The two
+            # parts telescope to the whole interval's progress; r_commit is what the
+            # trainer-side re-timing moves to the action that committed it.
+            r_commit = (base_geo - geo_mid
+                        if np.isfinite(geo_mid) and np.isfinite(base_geo) else 0.0)
+            eff_mid = geo_mid if np.isfinite(geo_mid) else base_geo
+            r_fresh_progress = (eff_mid - geodesic
+                                if np.isfinite(geodesic) and np.isfinite(eff_mid) else 0.0)
+            if self.progress_reward_clip > 0:
+                r_commit = float(np.clip(r_commit, -self.progress_reward_clip,
+                                         self.progress_reward_clip))
+                r_fresh_progress = float(np.clip(r_fresh_progress,
+                                                 -self.progress_reward_clip,
+                                                 self.progress_reward_clip))
+            progress = r_commit + r_fresh_progress
+        collided = any(self._collided(e) for e in executions)
+        last_exec = next((e for e in reversed(executions) if e.ticks), None)
         reward = float(progress) - self.slack_penalty
         if collided:
             reward -= self.collision_penalty
@@ -569,17 +697,43 @@ class ContinuousObjectNavEnvActor:
             "reward_lost": reward_lost,
             "pos_rots": self._pos_rots(),
             **info_extra,
+            # The reward split at the splice point (docs/RTC_RL.md section 4), emitted
+            # EVERY step (0.0 / full reward without RTC) so the trajectory column set is
+            # constant. r_commit is progress the COMMITMENT made -- caused by the
+            # previous action's tail -- and is what the trainer-side re-timing moves;
+            # r_fresh is everything else this step (fresh-span progress and all
+            # penalties/bonuses; penalty timing within the interval is not split, a
+            # recorded approximation).
+            "r_commit": float(r_commit),
+            "r_fresh": float(reward - r_commit),
             # How far the chunk asked the base to move this step. Paired with the
             # reward it separates "the policy commanded nothing" from "the policy
             # commanded a move the controller could not execute".
-            "commanded_m": float(execution.ticks[-1].commanded_displacement)
-            if execution.ticks else 0.0,
-            "end_lag_m": float(execution.end_lag),
+            "commanded_m": float(last_exec.ticks[-1].commanded_displacement)
+            if last_exec is not None else 0.0,
+            "end_lag_m": float(last_exec.end_lag) if last_exec is not None else 0.0,
         }
         self._cache["info"].append(info)
         self._cache["reward"].append(float(reward))
+        obs: Dict[str, Any] = {"instr_or_goal": self._episode.object_category}
+        if self._rtc:
+            # Close this decision and open the next: the scheduler draws d at
+            # OBSERVATION emission (the reciprocal schedule) and the prefix crosses to
+            # the policy with the obs. On a terminal step nothing is pending -- emit an
+            # empty prefix so the column set stays constant without leaking an
+            # unconsumed observe() into the next episode.
+            self._commit_done = False
+            self._geo_after_commit = None
+            self._interval_execs = []
+            if done:
+                obs["rtc_prefix"] = np.zeros((0, 3), dtype=np.float64)
+                obs["rtc_delay"] = 0
+            else:
+                pfx, d_next = self._scheduler.observe(self._robot_sim.get_2d_pose())
+                obs["rtc_prefix"] = pfx
+                obs["rtc_delay"] = int(d_next)
         return rgb, {
-            "obs": {"instr_or_goal": self._episode.object_category},
+            "obs": obs,
             "reward": reward,
             "done": done,
             "is_exhausted": self.is_exhausted(),

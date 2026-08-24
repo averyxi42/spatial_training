@@ -235,3 +235,60 @@ class TestHighNoiseMarginalPreservation:
         assert abs(got - s1) / s1 < 0.25, (
             f"terminal std {got:.4f} vs analytic {s1} -- drift-correction sign is wrong "
             "(the '+' variant inflates the marginal ~4x at high noise)")
+
+
+# --------------------------------------------------------------------------------------
+# 5. RTC prefix conditioning on the eval sampler (docs/RTC_RL.md section 2; phase 1)
+# --------------------------------------------------------------------------------------
+class TestRTCPrefixODE:
+    def test_prefix_requires_force_ode_until_the_scorer_lands(self):
+        head = _head()
+        h = head(torch.randn(1, 1, HID))["h"][0, 0].detach().numpy()
+        with pytest.raises(RuntimeError, match="scorer"):
+            head.sample_chain_np(h, prefix=np.zeros((3, 3)))
+
+    def test_conditioned_chunk_is_full_length_and_carries_the_prefix_exactly(self):
+        """Rows [0, d) of the composed chunk are the commitment's own poses: the pinned
+        differentials compose into exactly compose(prefix). And the chunk is FULL
+        length -- the env owns slicing, the tail funds the next commitment."""
+        from longnav.utils.bin_codec import compose_chunk
+
+        head = _head()
+        head.force_ode = True
+        h = head(torch.randn(1, 1, HID))["h"][0, 0].detach().numpy()
+        d = 4
+        prefix = (np.random.default_rng(0).normal(size=(d, 3)) * 0.01)
+        chain, pos, lp, chunk = head.sample_chain_np(h, prefix=prefix)
+        assert chunk.shape == (T, 3) and pos.size == 0 and lp == 0.0
+        expected = compose_chunk(torch.as_tensor(prefix)[None])[0].numpy()
+        assert np.allclose(chunk[:d], expected, atol=1e-6)
+        # prefix rows are constant across every stored block (the scorer will assert
+        # this too once it lands)
+        blocks = chain.reshape(K + 1, T, 3)
+        scaled = head.codec.scale(torch.as_tensor(prefix).double()).float().numpy()
+        for b in blocks:
+            assert np.allclose(b[:d], scaled, atol=1e-6)
+
+    def test_empty_prefix_matches_legacy_rows_bitwise(self):
+        """d = 0 with the RTC contract must execute the SAME rows the legacy call
+        executes under the same seed -- the first decision of every episode."""
+        head = _head()
+        head.force_ode = True
+        h = head(torch.randn(1, 1, HID))["h"][0, 0].detach().numpy()
+        head.seed(7)
+        _, _, _, legacy = head.sample_chain_np(h)                    # (gap, 3)
+        head.seed(7)
+        _, _, _, full = head.sample_chain_np(h, prefix=np.zeros((0, 3)))  # (T, 3)
+        assert legacy.shape == (GAP, 3) and full.shape == (T, 3)
+        assert np.array_equal(full[:GAP], legacy)
+
+    def test_conditioning_changes_the_postfix(self):
+        head = _head()
+        head.force_ode = True
+        h = head(torch.randn(1, 1, HID))["h"][0, 0].detach().numpy()
+        pa = np.full((5, 3), 0.01)
+        head.seed(3)
+        _, _, _, a = head.sample_chain_np(h, prefix=pa)
+        head.seed(3)
+        _, _, _, b = head.sample_chain_np(h, prefix=-pa)
+        assert not np.allclose(a[5:], b[5:])

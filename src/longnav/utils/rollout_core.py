@@ -150,6 +150,16 @@ class EpisodeRolloutMixin:
                 # We must wait for the answer to decide the next step
                 # print("inferring VLM with messages:")
                 # print(messages)
+                if self.rollout_config.get('rtc_overlap'):
+                    # Opportunistic overlap (docs/RTC_RL.md section 5): the commitment is
+                    # fully determined at observation time, so the env can execute it
+                    # WHILE the VLM thinks. Fire-and-forget; Ray actor task ordering
+                    # serializes the coming step() behind it on the same actor, so the
+                    # trajectory is identical either way and only wall-clock changes.
+                    # Config-gated rather than capability-probed: only the continuous
+                    # ObjectNav actor exposes begin_interval, and enabling this against
+                    # any other env should fail loudly, not silently no-op.
+                    env_handle.begin_interval.remote()
                 t0 = time.time()
                 policy_out,action_logprobs,outputs = self.infer_probs(images=[rgb_pil],messages=messages,temperature = self.rollout_config['temperature'],pos_id_kwargs=pos_id_kwargs)
                 
@@ -182,8 +192,18 @@ class EpisodeRolloutMixin:
                             "an oracle chunk does not determine a denoising chain "
                             "(docs/FLOW_SDE_RL.md, failure mode 3)."
                         )
+                    # The RTC commitment rides the obs (docs/RTC_RL.md section 5): the env
+                    # drew d at observation emission and the prefix crosses WITH the
+                    # request. Present-even-if-empty declares the RTC contract (the head
+                    # then returns the FULL chunk and the env owns slicing); absent is
+                    # the historical path bit for bit.
+                    _rtc_prefix = state_dict['obs'].get('rtc_prefix')
+                    _chain_kwargs = (
+                        {"prefix": np.asarray(_rtc_prefix, dtype=np.float64)}
+                        if _rtc_prefix is not None else {})
                     chain, sde_positions, _chain_lp, action_to_env = _sample_chain(
-                        np.asarray(policy_out["h"], dtype=np.float32).reshape(-1))
+                        np.asarray(policy_out["h"], dtype=np.float32).reshape(-1),
+                        **_chain_kwargs)
                     action_logprobs = np.float32(_chain_lp)
                     # The action IS the chain: stored whole so the ratio is over exactly
                     # what acted. The executed chunk is derived from it (decode_action on

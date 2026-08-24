@@ -143,6 +143,27 @@ class ContinuousObjectNavEnvConfig:
     # Playback speed relative to sim time: written fps = factor / (dt * stride), so the
     # default 1.0 plays exactly realtime at ANY stride; 2.0 twice realtime, 0.5 half.
     video_realtime_factor: float = 1.0
+    # -- RTC latency masking (docs/RTC_RL.md; the schedule is objectnav_eval's) --------
+    # "none" (default) is the historical env, bit for bit. Any other source turns on the
+    # reciprocal schedule: the head sends the FULL chunk (requires an RTC-trained
+    # checkpoint -- fm_config.rtc_delay_max > 0), the env owns the slicing, the obs
+    # carries the committed prefix, and info reports the r_commit/r_fresh reward split.
+    # d is ALWAYS the assumed delay -- configured/sampled, never wall-clock.
+    #   fixed: rtc_delay every decision (the eval sweep's knob)
+    #   uniform: d ~ U[0, rtc_delay_max]
+    #   exp: d ~ rtc_delay_base**d over [0, rtc_delay_max] -- the RL default, matching
+    #        the RTC checkpoints' own training law
+    rtc_delay_source: str = "none"
+    rtc_delay: int = 0
+    rtc_delay_max: int = 0
+    rtc_delay_base: float = 0.8
+    # Separate stream (seeded rtc_delay_seed + episode index): delay draws must not
+    # perturb the policy's own noise, or no difference between delay policies is
+    # attributable.
+    rtc_delay_seed: int = 0
+    # Injected chunk-toss probability per decision (fallback A: hold). Deployment-time
+    # disturbance only; keep 0 during training.
+    rtc_overrun_rate: float = 0.0
 
 
 @dataclass

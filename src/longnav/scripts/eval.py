@@ -36,6 +36,13 @@ def main(cfg: RLConfig):
     shard_iter = ctx.shard_iter
     logger = ctx.logger
 
+    # Eval/deploy is the PURE ODE sampler (docs/FLOW_SDE_RL.md: N=0, logprob 0). The
+    # interleaved eval path (train_loop.run_eval_cycle) has always enforced this; this
+    # standalone script did not, so a flow-SDE config with sde_noise_a set was silently
+    # evaluated with the STOCHASTIC sampler. Same call, same guard, both paths. A head
+    # without the toggle (discrete, plain Gaussian) ignores it.
+    ray.get([t.set_ode_sampling.remote(True) for t in trainers])
+
     shard_iter,shard_iter_copy = itertools.tee(shard_iter)
     try:
         all_episodes = [s for shard in shard_iter_copy for s in shard]

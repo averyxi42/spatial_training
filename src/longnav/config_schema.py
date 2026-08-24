@@ -221,6 +221,13 @@ class RolloutConfig:
     # is overridden. Used by the forward-pass test tier for reproducible rollouts -- see
     # tests/forward/_bootstrap.py.
     use_oracle_action: bool = False
+    # Opportunistic policy/env overlap under RTC (docs/RTC_RL.md section 5): fire the env's
+    # begin_interval() -- execute the committed ticks -- without awaiting, before the VLM
+    # forward, so the sim moves while the model thinks. Wall-clock only; Ray actor task
+    # ordering makes trajectories identical either way. OFF by default, and only valid with
+    # an env that exposes begin_interval (the continuous ObjectNav actor with rtc enabled) --
+    # enabling it against any other env fails loudly.
+    rtc_overlap: bool = False
 
 
 # --- Experiment housekeeping ---

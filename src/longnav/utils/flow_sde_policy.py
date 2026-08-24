@@ -65,6 +65,13 @@ import torch
 import torch.nn as nn
 
 from longnav.utils.bin_codec import compose_chunk
+# The RTC single construction site (docs/RTC_TRAINING.md): mask, per-tick time and row
+# pinning come from the SAME helpers the SFT loss uses -- never re-derived here.
+from longnav.utils.flow_matching_head import (
+    pin_prefix,
+    prefix_mask_from_len,
+    prefix_time,
+)
 
 HEAD_CONFIG_FILE = "turn_vector_head_config.json"
 HEAD_WEIGHTS_FILE = "turn_vector_head.pt"
@@ -286,7 +293,7 @@ class FlowSDEHead(nn.Module):
 
     # -- rollout: sample -------------------------------------------------------------
     @torch.no_grad()
-    def sample_chain_np(self, h: np.ndarray
+    def sample_chain_np(self, h: np.ndarray, prefix: Optional[np.ndarray] = None
                         ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
         """One chunk: `(chain, positions, logprob, chunk)`.
 
@@ -294,10 +301,42 @@ class FlowSDEHead(nn.Module):
         for the ratio is byte-identical to what produced the executed action. `positions` is
         `(n,)` int64, ascending; transition k maps chain block k to block k+1. `logprob` is
         the summed density of the `n` stochastic transitions only.
+
+        `prefix` is the RTC commitment (docs/RTC_RL.md section 2): `(d, 3)` PHYSICAL
+        per-tick differentials, `d` possibly 0. Passing it -- even empty -- declares the
+        RTC contract: prefix rows are pinned clean at per-tick flow time t = 0 (this
+        repo's REVERSED axis: t = 1 noise, t = 0 data) through the whole integration,
+        and the returned `chunk` is the FULL `(n_ticks, 3)` block -- the env owns the
+        slicing, because the tail is the next commitment's source. `prefix=None` is the
+        historical contract exactly: unconditioned chain, `(gap, 3)` truncated chunk.
+
+        Phase boundary, enforced loudly: prefix conditioning currently requires
+        `force_ode` -- the stochastic sampler's masked density lands together with the
+        scorer (RTC_RL.md section 6, phase 2), and a conditioned SDE chain scored by
+        today's unmasked `chain_log_prob_batch` would be silently wrong.
         """
         dev = next(self.parameters()).device
         ctx = torch.as_tensor(np.asarray(h, np.float32), device=dev).reshape(1, -1)
         cfg, K, dt = self.sde, self.K, -1.0 / self.K
+        rtc = prefix is not None
+        prefix_full = prefix_mask = time_of = None
+        if rtc:
+            if not self.force_ode:
+                raise RuntimeError(
+                    "prefix conditioning on the stochastic sampler is not built yet: "
+                    "the masked transition density lands with the scorer "
+                    "(docs/RTC_RL.md section 6, phase 2). Eval/deploy (force_ode) only."
+                )
+            p = torch.as_tensor(np.asarray(prefix, np.float64),
+                                device=dev).reshape(-1, self.n_dims)
+            d = p.shape[0]
+            prefix_mask = prefix_mask_from_len(
+                torch.full((1,), d, dtype=torch.long, device=dev), self.n_ticks)
+            prefix_full = torch.zeros(1, self.n_ticks, self.n_dims,
+                                      device=dev, dtype=torch.float32)
+            if d:
+                prefix_full[:, :d] = self.codec.scale(p).float()
+            time_of = lambda t_k: prefix_time(t_k, prefix_mask)   # noqa: E731
         admissible = K - cfg.n_exclude_last
         perm = torch.randperm(admissible, generator=self._gen, device=dev)[: cfg.n]
         positions = perm.sort().values
@@ -311,6 +350,8 @@ class FlowSDEHead(nn.Module):
         with _decoder_eval(self.codec.decoder):
             x = torch.randn(1, self.n_ticks, self.n_dims, device=dev,
                             dtype=torch.float32, generator=self._gen)
+            if rtc:
+                x = pin_prefix(x, prefix_full, prefix_mask)
             blocks = [x]
             logprob = torch.zeros(1, device=dev)
             for k in range(K):
@@ -323,12 +364,14 @@ class FlowSDEHead(nn.Module):
                     w = _position_weight(torch.tensor([k], device=dev), cfg, K)
                     logprob = logprob + w * _gaussian_logprob(x, mu, std)
                 else:
-                    v = self.codec.decoder(ctx, x, t_k)
+                    v = self.codec.decoder(ctx, x, time_of(t_k) if rtc else t_k)
                     x = x + dt * v
+                    if rtc:
+                        x = pin_prefix(x, prefix_full, prefix_mask)
                 blocks.append(x)
 
         chain = torch.cat([b.reshape(1, -1) for b in blocks], dim=1)[0]
-        chunk = self._compose(blocks[-1])
+        chunk = self._compose(blocks[-1], full=rtc)
         return (chain.cpu().numpy().astype(np.float32),
                 positions.cpu().numpy().astype(np.int64),
                 float(logprob.item()),
@@ -347,8 +390,12 @@ class FlowSDEHead(nn.Module):
         z_K = flat[-self.block:].reshape(1, self.n_ticks, self.n_dims)
         return self._compose(z_K)
 
-    def _compose(self, z_K: torch.Tensor) -> np.ndarray:
+    def _compose(self, z_K: torch.Tensor, full: bool = False) -> np.ndarray:
         chunk = compose_chunk(self.codec.unscale(z_K.double()))          # (1, T, 3)
+        if full:
+            # The RTC contract: the env owns the slicing (the tail is the next
+            # commitment's source), so the head hands over every row.
+            return chunk[0].float().cpu().numpy()
         return chunk[0, : self.gap].float().cpu().numpy()
 
     # -- training: score stored transitions under current theta ------------------------
