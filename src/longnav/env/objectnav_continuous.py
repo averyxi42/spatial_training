@@ -350,10 +350,17 @@ class ContinuousObjectNavEnvActor:
             if isinstance(o, np.floating): return float(o)
             if isinstance(o, np.ndarray): return o.tolist()
             return str(o)
+        def _denan(o):
+            """NaN -> null at SERIALISATION time only: step info keeps NaN (a float,
+            collatable); JSON keeps strict null. See `_finite`."""
+            if isinstance(o, float) and not np.isfinite(o): return None
+            if isinstance(o, dict): return {k: _denan(v) for k, v in o.items()}
+            if isinstance(o, (list, tuple)): return [_denan(v) for v in o]
+            return o
         with open(os.path.join(save_dir, "sequence.json"), "w") as f:
-            _json.dump(seq, f, default=_ser)
+            _json.dump(_denan(seq), f, default=_ser)
         with open(os.path.join(save_dir, "summary.json"), "w") as f:
-            _json.dump(episode_logs, f, default=_ser, indent=2)
+            _json.dump(_denan(episode_logs), f, default=_ser, indent=2)
         with open(os.path.join(self.logging_output_dir, f"results_{os.getpid()}"), "a") as f:
             f.write(_json.dumps(episode_logs, default=_ser) + "\n")
         if clear_steps:
@@ -648,6 +655,7 @@ class ContinuousObjectNavEnvActor:
                     anchor=fresh_anchor))
             executions = self._interval_execs
             geo_mid = self._geo_after_commit
+            d_ticks = int(plan.committed)
         self._steps += 1
 
         # One geodesic query per policy step (plus, under RTC with d > 0, the one at the
@@ -675,11 +683,15 @@ class ContinuousObjectNavEnvActor:
             r_fresh_progress = (eff_mid - geodesic
                                 if np.isfinite(geodesic) and np.isfinite(eff_mid) else 0.0)
             if self.progress_reward_clip > 0:
-                r_commit = float(np.clip(r_commit, -self.progress_reward_clip,
-                                         self.progress_reward_clip))
-                r_fresh_progress = float(np.clip(r_fresh_progress,
-                                                 -self.progress_reward_clip,
-                                                 self.progress_reward_clip))
+                # PROPORTIONAL clips (audit note): the clip bound is physical -- no
+                # part moves the geodesic more than the path drivable in ITS ticks --
+                # so each part's bound scales with its tick share. Two full-size clips
+                # would double the admissible artifact per interval at d > 0; at d = 0
+                # this branch is not reached and the legacy single clip applies.
+                clip_c = self.progress_reward_clip * d_ticks / self.gap
+                clip_f = self.progress_reward_clip * (self.gap - d_ticks) / self.gap
+                r_commit = float(np.clip(r_commit, -clip_c, clip_c))
+                r_fresh_progress = float(np.clip(r_fresh_progress, -clip_f, clip_f))
             progress = r_commit + r_fresh_progress
         collided = any(self._collided(e) for e in executions)
         last_exec = next((e for e in reversed(executions) if e.ticks), None)
@@ -1082,6 +1094,14 @@ class ContinuousObjectNavEnvActor:
 
     @staticmethod
     def _finite(value: float):
-        """Non-finite distances are legitimate (the robot left the world) but must serialise
-        as `null`, not as `inf`, or the trajectory log stops being strict JSON."""
-        return float(value) if np.isfinite(value) else None
+        """Non-finite distances become NaN -- a FLOAT, never None.
+
+        History (2026-08-24 audit, F1): this used to return None, and one None in a
+        numeric info column made `_pack_trajectory` build an object-dtype array that
+        `collate_trajectories` could not convert -- its old bare `except` then dropped
+        the ENTIRE column for the whole batch, silently starving every
+        distance-consuming consumer (~0.16% of steps poisoned ~10% of episodes'
+        batches). NaN keeps the column numeric end to end and is maskable downstream;
+        JSON strictness (null, not NaN) is handled at serialisation time
+        (`_denan` in flush_logs_to_disk), which is the only place it was ever needed."""
+        return float(value) if np.isfinite(value) else float("nan")

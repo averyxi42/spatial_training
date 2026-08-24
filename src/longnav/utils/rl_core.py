@@ -59,9 +59,24 @@ def collate_trajectories(trajectory_list: list[dict], device='cpu'):
                 elif key in ['actions']:
                     t = t.long()  # Ensure int32 for pointer
                 tensors.append(t)
-        except:
-            print(f"cannot collate key {key}")
-            continue
+        except Exception as exc:
+            # String metadata columns (episode_label, scene_id, ...) legitimately do
+            # not collate and are skipped. ANYTHING ELSE failing here means a numeric
+            # column was poisoned upstream (2026-08-24 audit, F1: one None from a
+            # navmesh-blind step made distance_to_goal an object array, and this
+            # except's old bare `continue` dropped the whole column for the entire
+            # batch -- starving every distance-consuming estimator with only an
+            # actor-log print). A poisoned numeric column must be LOUD.
+            if all(isinstance(x, str)
+                   for a in arrays for x in np.asarray(a).ravel().tolist()):
+                continue                      # pure string metadata: skip quietly
+            raise RuntimeError(
+                f"collate_trajectories: column {key!r} failed tensor conversion "
+                f"({exc}). A None/object value has poisoned it upstream -- fix the "
+                "producer (emit NaN, never None, for missing numerics); silently "
+                "dropping the column is how distance signals vanished from whole "
+                "batches."
+            ) from exc
             
         # Pad Sequence
         # batch_first=True -> (Batch, Seq, ...)

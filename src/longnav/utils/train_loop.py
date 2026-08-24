@@ -69,6 +69,22 @@ def bootstrap_all(cfg: RLConfig, training: bool) -> BootstrapContext:
 
     sims = bootstrapper.bootstrap_sims(wandb_actor)
 
+    # The two step caps must agree, and nothing else checks it (2026-08-24 audit, F4):
+    # if the VLM loop's cap (rollout.max_steps) is SMALLER than the env's
+    # (sim.max_steps), episodes end with done=False and truncated=False on their last
+    # stored step, so bootstrap_truncated never corrects them and their returns are
+    # computed as if the episode continued for free. Larger is harmless (the env
+    # truncates first, flagged properly).
+    _sim_cap = getattr(bootstrapper.typed_cfg.sim, "max_steps", None)
+    _roll_cap = bootstrapper.typed_cfg.rollout.max_steps
+    if _sim_cap is not None and _roll_cap < int(_sim_cap):
+        raise ValueError(
+            f"rollout.max_steps={_roll_cap} < sim.max_steps={_sim_cap}: the rollout "
+            "loop would cut episodes the env never flags as truncated, and their "
+            "returns would silently skip the truncation bootstrap. Set "
+            "rollout.max_steps >= sim.max_steps."
+        )
+
     shard_iter = get_shard_iterator(
         subset_label=bootstrapper.typed_cfg.task.subset_label,
         episode_json=bootstrapper.typed_cfg.task.episode_json,

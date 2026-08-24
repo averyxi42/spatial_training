@@ -156,10 +156,15 @@ class EpisodeRolloutMixin:
                     # WHILE the VLM thinks. Fire-and-forget; Ray actor task ordering
                     # serializes the coming step() behind it on the same actor, so the
                     # trajectory is identical either way and only wall-clock changes.
-                    # Config-gated rather than capability-probed: only the continuous
-                    # ObjectNav actor exposes begin_interval, and enabling this against
-                    # any other env should fail loudly, not silently no-op.
-                    env_handle.begin_interval.remote()
+                    # The FIRST call of each episode is awaited (audit F3): a
+                    # fire-and-forget exception only reaches Ray's logs, so a
+                    # misconfiguration (rtc_overlap against an env without
+                    # begin_interval, or with rtc off) would otherwise be silent. The
+                    # first decision's commitment is empty (d_0 = 0), so awaiting it
+                    # costs nothing and validates the contract loudly.
+                    _bi_ref = env_handle.begin_interval.remote()
+                    if step_count == 0:
+                        ray.get(_bi_ref)
                 t0 = time.time()
                 policy_out,action_logprobs,outputs = self.infer_probs(images=[rgb_pil],messages=messages,temperature = self.rollout_config['temperature'],pos_id_kwargs=pos_id_kwargs)
                 
@@ -371,7 +376,14 @@ class EpisodeRolloutMixin:
             return state_dict['is_exhausted'], final_info, final_trajectory
         
         except Exception as e:
-            print(f"Episode failed: {e}")
+            # LOUD MARKER (2026-08-24 audit, F2): this except converts ANY env/VLM
+            # exception into a silent per-episode drop; run_rollout_cycle then pads the
+            # batch with duplicates of the survivors. That is the intended containment
+            # for rare faults -- but a SYSTEMATIC failure (one broken scene, a bad env
+            # contract) silently reweights every training batch and only this print
+            # says so. Grep rollout worker logs for EPISODE_FAILED when batches look
+            # odd; a nonzero steady rate is an env bug, not noise.
+            print(f"EPISODE_FAILED (dropped from batch, survivors duplicated): {e}")
             import traceback
             traceback.print_exc()
             # Return handles anyway so we don't leak resources (or handle crash logic)
@@ -446,7 +458,10 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
         # the distance/value heads read the same packed hidden and are the point of an
         # eval run that measures them. One extra forward per EPISODE (not per step), and
         # only when a probe is actually configured -- a plain policy eval is unchanged.
-        if eval and getattr(self, "state_probe_attached", False):
+        if eval and getattr(self, "state_probe_attached", False) \
+                and getattr(self, "rl_trajectory", None) is not None:
+            # rl_trajectory is None for an exhausted-sentinel episode (audit F5):
+            # subscripting it here surfaced only at the driver's final ray.get.
             import torch
             with torch.no_grad():
                 self.rl_embeds_inputs = self._pack_embeds()

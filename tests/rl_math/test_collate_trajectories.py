@@ -98,19 +98,36 @@ def test_missing_old_log_prob_and_old_logprobs_raises_keyerror():
         collate_trajectories(trajs)
 
 
-def test_uncollatable_key_is_silently_dropped_known_gap():
-    """Pin current (arguably buggy) behavior: if a key's values can't be
-    converted to a tensor at all (e.g. a list of dicts), collate_trajectories
-    swallows the exception, prints a message, and silently omits the key from
-    the batch -- it does not raise or otherwise surface the failure."""
+def test_poisoned_numeric_column_raises_string_metadata_skips():
+    """The 2026-08-24 contract (audit F1): a column that fails tensor conversion is
+    either pure string metadata -- skipped quietly, as episode_label always was -- or
+    a POISONED numeric column, which must raise. The old pinned behavior (silently
+    dropping any failing key with a print) is how one None from a navmesh-blind step
+    erased distance_to_goal from entire batches and starved the distance-kernel
+    estimators without an error."""
+    import numpy as np
+
+    # String metadata: skipped quietly, everything else collates.
     trajs = [_discrete_traj(3, seed=1), _discrete_traj(3, seed=2)]
     for t in trajs:
-        t["uncollatable"] = [{"nested": "dict"}] * 3  # can't torch.tensor() this
-
+        t["scene_meta"] = ["a_scene"] * 3
     batch = collate_trajectories(trajs)
+    assert "scene_meta" not in batch
+    assert "actions" in batch
 
-    assert "uncollatable" not in batch
-    assert "actions" in batch  # other keys still collate normally
+    # A None-poisoned numeric column: loud, naming the key.
+    trajs = [_discrete_traj(3, seed=1), _discrete_traj(3, seed=2)]
+    for t in trajs:
+        t["distance_to_goal"] = np.array([1.0, None, 2.0], dtype=object)
+    with pytest.raises(RuntimeError, match="distance_to_goal"):
+        collate_trajectories(trajs)
+
+    # A dict-valued column: also loud (not metadata -- a producer bug).
+    trajs = [_discrete_traj(3, seed=1), _discrete_traj(3, seed=2)]
+    for t in trajs:
+        t["uncollatable"] = [{"nested": "dict"}] * 3
+    with pytest.raises(RuntimeError, match="uncollatable"):
+        collate_trajectories(trajs)
 
 
 def test_pad_sequence_failure_bleeds_previous_key_known_gap():
