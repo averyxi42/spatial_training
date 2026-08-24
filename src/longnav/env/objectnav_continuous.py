@@ -77,6 +77,7 @@ class ContinuousObjectNavEnvActor:
         rtc_delay_base: float = 0.8,
         rtc_delay_seed: int = 0,
         rtc_overrun_rate: float = 0.0,
+        snap_start: bool = True,
         **kwargs: Any,
     ):
         self.episodes_path = episodes
@@ -143,6 +144,14 @@ class ContinuousObjectNavEnvActor:
         self._exclude_categories = frozenset(
             c.strip().lower() for c in (exclude_categories or ()) if c and c.strip()
         )
+        # Spawn-snap policy. True is this env's historical behaviour; the EVAL HARNESS
+        # does NOT snap (its snap_start defaults False), and a snapped spawn can land
+        # disconnected from the goal on the dataset mesh -- measured here as ~30% of the
+        # pinned sample101 set skipped as reward_mesh_disconnected, episodes the harness
+        # serves fine. Cross-path parity evals must set False; training runs keep True
+        # unless deliberately re-based (changing it changes start distances and every
+        # downstream number).
+        self.snap_start = bool(snap_start)
         # -- RTC latency masking (docs/RTC_RL.md; schedule from objectnav_eval) --------
         # "none" (default) is the historical env, bit for bit: no scheduler is ever
         # constructed, step() keeps its (gap, 3) contract, and no extra geodesic query
@@ -439,7 +448,7 @@ class ContinuousObjectNavEnvActor:
                 }
             self._episode = episode
             self._ensure_scene(episode)
-            start = self._task.reset(episode.episode, snap_to_navmesh=True)
+            start = self._task.reset(episode.episode, snap_to_navmesh=self.snap_start)
             if np.isfinite(float(start["distance_to_goal"])):
                 break
             # Screening passes on the ROBOT-footprint mesh, but the REWARD is measured on

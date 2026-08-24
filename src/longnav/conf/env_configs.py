@@ -153,6 +153,9 @@ class ContinuousObjectNavEnvConfig:
     #   uniform: d ~ U[0, rtc_delay_max]
     #   exp: d ~ rtc_delay_base**d over [0, rtc_delay_max] -- the RL default, matching
     #        the RTC checkpoints' own training law
+    # Spawn-snap policy: True (historical). The eval harness does NOT snap, and snapped
+    # spawns can land mesh-disconnected (skipped episodes); parity evals set False.
+    snap_start: bool = True
     rtc_delay_source: str = "none"
     rtc_delay: int = 0
     rtc_delay_max: int = 0
