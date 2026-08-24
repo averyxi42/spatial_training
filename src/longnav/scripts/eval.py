@@ -97,6 +97,13 @@ def main(cfg: RLConfig):
     os.makedirs(run_dir, exist_ok=True)
     written = 0
     batch_size = 32 # fixed batch size decoupled from RL logic for eval
+    if eval_uids_file:
+        # ONE collection call for the whole pinned set. Each batch boundary costs every
+        # sim up to two shard episodes -- the dangling post-episode reset dispatched at
+        # call exit, plus the next call's bootstrap reset; both advance the shard cursor
+        # without running the episode (observed: 36 of 101 pinned episodes silently
+        # skipped across 3 boundaries x 5 sims).
+        batch_size = max(len(all_episodes), 1)
     for i in range(max(math.ceil(len(all_episodes)/batch_size),1)):
         logger.info("Starting rollout collection!")
         rollout_list,result_list,log_list = collect_rollouts(sims,trainers,shard_iter,batch_size,{"return_inputs":False,"eval":True}) #
