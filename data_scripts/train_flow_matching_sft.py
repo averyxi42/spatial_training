@@ -222,7 +222,13 @@ def parse_args():
                         "how downstream knows the checkpoint understands a prefix")
     f.add_argument("--rtc-delay-dist", choices=("uniform", "exp"), default="uniform",
                    help="law for the per-example d draw. uniform is the paper's real-world "
-                        "recipe; exp halves the weight per tick (its simulated setting)")
+                        "recipe; exp weighs d by --rtc-delay-base ** d (the paper's "
+                        "simulated setting at the default base)")
+    f.add_argument("--rtc-delay-base", type=float, default=0.5,
+                   help="decay base for --rtc-delay-dist exp. 0.5 = the paper's halving "
+                        "(row-0 coverage ~50%% but P(d>=5) ~3%% at d_max=10); 0.8 is the "
+                        "gentle middle (P(0)~0.22, E[d]~3, P(d>=5)~26%%). Trades early-row "
+                        "supervision coverage against high-d conditioning mass")
     f.add_argument("--rtc-zero-frac", type=float, default=0.0,
                    help="extra probability mass at d=0 on top of the law: resume-from-rest "
                         "must be trained, not hoped for (the freezing hazard, "
@@ -419,6 +425,7 @@ def parse_args():
         rtc_delay_max=mine.rtc_delay_max,
         rtc_delay_dist=mine.rtc_delay_dist,
         rtc_zero_frac=mine.rtc_zero_frac,
+        rtc_delay_base=mine.rtc_delay_base,
     )
     if args.output_dir == "dump/vector_sft":
         raise SystemExit(

@@ -478,8 +478,16 @@ def test_sample_prefix_len_support_and_laws():
     d_exp = sample_prefix_len(2048, 4, dist="exp")
     counts = torch.bincount(d_exp, minlength=5).float()
     assert bool((counts[:-1] >= counts[1:]).all()), "exp weights must decay per tick"
+    # A gentler base spreads mass toward high d: at 0.8 the top half of the range
+    # must be drawn much more often than the default halving draws it.
+    d_gentle = sample_prefix_len(4096, 10, dist="exp", base=0.8)
+    d_halving = sample_prefix_len(4096, 10, dist="exp", base=0.5)
+    assert (d_gentle >= 5).float().mean() > 2 * (d_halving >= 5).float().mean()
+    assert int(d_gentle.max()) <= 10
     with pytest.raises(ValueError, match="dist"):
         sample_prefix_len(4, 4, dist="linear")
+    with pytest.raises(ValueError, match="base"):
+        sample_prefix_len(4, 4, dist="exp", base=1.0)
 
 
 def test_postfix_mean_ignores_committed_rows_only():
@@ -530,6 +538,9 @@ def test_empty_prefix_is_bit_identical_to_none():
 
 def test_flow_matching_config_validates_rtc_fields():
     FlowMatchingConfig(rtc_delay_max=4, rtc_delay_dist="exp", rtc_zero_frac=0.1)
+    FlowMatchingConfig(rtc_delay_max=4, rtc_delay_dist="exp", rtc_delay_base=0.8)
+    with pytest.raises(ValueError, match="rtc_delay_base"):
+        FlowMatchingConfig(rtc_delay_base=1.0)
     with pytest.raises(ValueError, match="rtc_delay_max"):
         FlowMatchingConfig(rtc_delay_max=-1)
     with pytest.raises(ValueError, match="rtc_delay_dist"):

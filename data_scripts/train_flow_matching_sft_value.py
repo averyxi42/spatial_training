@@ -794,6 +794,7 @@ def parse_args():
                         "their action loss")
     f.add_argument("--rtc-delay-dist", choices=("uniform", "exp"), default="uniform")
     f.add_argument("--rtc-zero-frac", type=float, default=0.0)
+    f.add_argument("--rtc-delay-base", type=float, default=0.5)
 
     pre.add_argument("--latent-cvae", action="store_true",
                      help="convert the deterministic readout into a stochastic INTENT: "
@@ -1005,6 +1006,7 @@ def parse_args():
         rtc_delay_max=mine.rtc_delay_max,
         rtc_delay_dist=mine.rtc_delay_dist,
         rtc_zero_frac=mine.rtc_zero_frac,
+        rtc_delay_base=mine.rtc_delay_base,
     )
     if args.output_dir == "dump/vector_sft":
         raise SystemExit(

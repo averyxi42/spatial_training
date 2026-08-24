@@ -410,20 +410,26 @@ def postfix_mean(values: torch.Tensor, prefix_mask: torch.Tensor) -> torch.Tenso
 
 def sample_prefix_len(
     n: int, delay_max: int, *, dist: str = "uniform", zero_frac: float = 0.0,
-    device=None, generator: Optional[torch.Generator] = None,
+    base: float = 0.5, device=None, generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     """`(n,)` int64 commitment lengths in `[0, delay_max]`, drawn ONLINE per example.
 
     No dataset column exists or is needed: the prefix target is the chunk's own first
     `d` rows (docs/RTC_TRAINING.md section 6.4). `uniform` matches the paper's
-    real-world recipe; `exp` is its simulated setting, weights halving per tick.
+    real-world recipe; `exp` is its simulated setting, weights `base ** d` -- the
+    paper's halving at the default `base = 0.5`, a gentler decay above it. The base
+    trades ROW COVERAGE against HIGH-d MASS: uniform supervises row 0 in 1/(d_max+1)
+    of examples; base 0.5 gives it ~50% but leaves P(d >= 5) ~ 3%; base 0.8 sits
+    between (P(0) ~ 0.22, E[d] ~ 3, P(d >= 5) ~ 26% at d_max = 10).
     `zero_frac` adds deliberate mass at `d = 0` on top of either law -- resume-from-rest
     must be trained, not hoped for (the freezing hazard, doc section 8).
     """
+    if not 0.0 < base < 1.0:
+        raise ValueError(f"base must be in (0, 1), got {base}")
     if dist == "uniform":
         d = torch.randint(0, delay_max + 1, (n,), device=device, generator=generator)
     elif dist == "exp":
-        w = 0.5 ** torch.arange(delay_max + 1, dtype=torch.float32, device=device)
+        w = base ** torch.arange(delay_max + 1, dtype=torch.float32, device=device)
         d = torch.multinomial(w.expand(n, -1), 1, generator=generator).squeeze(1)
     else:
         raise ValueError(f"dist must be 'uniform' or 'exp', got {dist!r}")
@@ -597,6 +603,10 @@ class FlowMatchingConfig:
     rtc_delay_max: int = 0
     rtc_delay_dist: str = "uniform"
     rtc_zero_frac: float = 0.0
+    #: decay base for rtc_delay_dist='exp': weights base**d. 0.5 is the paper's halving;
+    #: larger is gentler (0.8 keeps ~26% of draws at d>=5 at d_max=10). Unused by
+    #: 'uniform'.
+    rtc_delay_base: float = 0.5
 
     def __post_init__(self):
         self.action_scales = tuple(float(s) for s in self.action_scales)
@@ -612,6 +622,8 @@ class FlowMatchingConfig:
             )
         if not 0.0 <= self.rtc_zero_frac <= 1.0:
             raise ValueError(f"rtc_zero_frac must be in [0, 1], got {self.rtc_zero_frac}")
+        if not 0.0 < self.rtc_delay_base < 1.0:
+            raise ValueError(f"rtc_delay_base must be in (0, 1), got {self.rtc_delay_base}")
         if self.stratified_time and abs(self.time_beta - 1.0) > 1e-9:
             raise ValueError(
                 "stratified_time requires time_beta == 1.0 (the Beta(alpha, 1) inverse CDF "
@@ -1293,7 +1305,8 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
                     "the config is wrong, not that the loss should divide by zero"
                 )
             d_len = sample_prefix_len(N, cfg.rtc_delay_max, dist=cfg.rtc_delay_dist,
-                                      zero_frac=cfg.rtc_zero_frac, device=dev)
+                                      zero_frac=cfg.rtc_zero_frac,
+                                      base=cfg.rtc_delay_base, device=dev)
             rtc_mask = prefix_mask_from_len(d_len, T).repeat_interleave(K, dim=0)
             time = prefix_time(time, rtc_mask)                        # (N*K, T)
         x_t, u_t = flow_interpolate(act_k, noise, time)
