@@ -4,10 +4,11 @@ Status: SFT and harness-eval sides BUILT on branch `rtc` (both repos,
 2026-08-23): the core flow-module extension (per-tick time, prefix pinning,
 postfix loss), the SFT trainer flags, the shared `ChunkScheduler` in
 `objectnav_eval`, the harness runner/wire, and the rollout-policy prefix path.
-**The RL side (section 7) is design only** -- deliberately deferred; extra
-subtleties are under discussion and nothing in `flow_sde_policy`,
-`rollout_core` or the RL env actor has been touched. The flow-module helpers
-were built to be the reusable substrate that work will consume. Companion to
+**The RL side is design only** -- deliberately deferred; the full design and
+implementation plan are `docs/RTC_RL.md` (2026-08-24), and nothing in
+`flow_sde_policy`, `rollout_core` or the RL env actor has been touched. The
+flow-module helpers were built to be the reusable substrate that work will
+consume. Companion to
 `habitat_physical_nav/docs/LATENCY_MASKING.md`, which owns the harness-side
 schedule this document builds against; the split is deliberate and mirrored
 there (§Scope). Method follows the training-time variant of real-time chunking
@@ -168,6 +169,12 @@ when the RL side is built (section 7) -- the training-time masking is then
 literally the same code in SFT and RL.
 
 ## 7. What the RL scorer masks, and why
+
+> **Superseded in scope (2026-08-24): the full RL design now lives in
+> `docs/RTC_RL.md`** — the decision-step MDP, the prefix-conditioned chain
+> spec, the tail-masking rejection, the γ-re-timed returns and the
+> implementation plan. This section survives as the short form; where they
+> differ, RTC_RL.md wins.
 
 The flow-SDE head's organizing invariant — sampler and scorer share the one
 transition density `_sde_transition` — survives because prefix conditioning
