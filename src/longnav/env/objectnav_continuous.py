@@ -268,7 +268,25 @@ class ContinuousObjectNavEnvActor:
         self._cursor = 0
 
     def is_exhausted(self) -> bool:
-        return self._episodes is not None and self._cursor >= len(self._order)
+        """True when this actor NEEDS WORK: no episodes loaded yet, or the assigned
+        shard is spent. THE FRESH STATE IS EXHAUSTED -- this is the discrete env's
+        contract (`habitat.py`: `episode_counter >= shard_length` with both 0 at
+        init), and it is what `collect_rollouts`' bootstrap keys on to hand each
+        actor its initial shard.
+
+        History (2026-08-24): this method previously returned False for a fresh
+        actor (`_episodes is not None and ...`), which silently defeated the shard
+        bootstrap for the continuous env in EVERY flow -- training never consumed
+        its shard iterator (each actor free-streamed its own pool; `train_uids` was
+        layered on as a de facto workaround), and standalone eval never served its
+        pinned subsets (observed: 128 collections, 29 unique episodes, none
+        guaranteed from the requested set). Restoring the contract is safe for
+        training only together with the trivial-shard default
+        (`get_shard_iterator`'s no-source fallback + `subset_label` defaulting to
+        empty): a trivial shard (None) means "load the full split yourself", which
+        reproduces the previous de facto training stream through the front door.
+        """
+        return self._episodes is None or self._cursor >= len(self._order)
 
     def set_log_prefix(self, prefix: str) -> None:
         """Prefix for wandb metric keys of subsequent episodes ("" = training stream)."""

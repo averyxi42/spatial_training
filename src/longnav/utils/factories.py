@@ -453,7 +453,16 @@ def get_shard_iterator(
         if logger is not None: logger.info(f"Loaded {len(all_episodes)} episodes from JSON: {episode_json}")
 
     else:
-        raise ValueError("Shard size > 0 but no episode source (subset_label or episode_json) provided.")
+        # No episode source: the TRIVIAL shard (None), i.e. "load the full split
+        # yourself" -- one per worker, exactly the discrete env's long-standing idiom
+        # and the training default (2026-08-24; see config_schema.subset_label). A
+        # raise here would leave training shardless the moment the env bootstrap
+        # contract works, which is how the continuous env's broken is_exhausted went
+        # unnoticed: nothing ever consumed these shards, so nothing ever raised.
+        if logger is not None:
+            logger.info("No episode source: trivial shards (each worker loads the "
+                        "full split).")
+        return trivial_shard_iterator()
 
     if not all_episodes:
         raise ValueError("The resolved episode list is empty.")

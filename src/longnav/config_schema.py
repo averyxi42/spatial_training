@@ -236,7 +236,15 @@ class RunConfig:
     run_name: str = "debug_run"
     logger: Optional[Any] = None
     shard_size: int = 6
-    subset_label: str = "sample400_a"
+    # Episode source for sharding. EMPTY (the default since 2026-08-24) means the
+    # trivial shard: every worker loads the full split itself -- the discrete env's
+    # long-standing behaviour and what continuous training did in practice all along
+    # (see objectnav_continuous.is_exhausted for the history). The old default,
+    # "sample400_a", predates the continuous env's broken bootstrap contract: once that
+    # contract was restored, the old default would have silently fed a 400-episode EVAL
+    # subset into any training run that did not override it. Name a subset explicitly
+    # for pinned evals; never rely on this default for one.
+    subset_label: str = ""
     episode_json: str = ""
     output_dir: str = "./dump/results"
     jobtype: str = "eval"

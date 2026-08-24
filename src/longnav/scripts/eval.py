@@ -60,13 +60,14 @@ def main(cfg: RLConfig):
     if eval_uids_file:
         raw = open(eval_uids_file).read()
         uids = [u.strip() for u in raw.replace("\n", ",").split(",") if u.strip()]
-        parts = [uids[i::len(sims)] for i in range(len(sims))]
-        ray.get([s.assign_shard.remote(p) for s, p in zip(sims, parts)])
+        # One disjoint part per sim, delivered through the (restored) bootstrap
+        # contract: a fresh env reports exhausted, collect_rollouts hands it the next
+        # shard, and a sim whose part is spent retires when the iterator runs dry --
+        # each episode runs exactly once.
+        shard_iter = iter([uids[i::len(sims)] for i in range(len(sims))])
         all_episodes = uids
-        # Exhausted sims retire instead of being refilled: each episode runs once.
-        shard_iter = iter(())
         logger.info(f"Pinned eval set: {len(uids)} uids from {eval_uids_file}, "
-                    f"split across {len(sims)} sims")
+                    f"{len(sims)} parts")
 
     def cleanup():
         for trainer in trainers:
