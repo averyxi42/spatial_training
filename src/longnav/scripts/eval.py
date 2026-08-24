@@ -49,6 +49,25 @@ def main(cfg: RLConfig):
     except:
         all_episodes = [None]*10000 #fallback
 
+    # Pinned eval set: the interleaved path's EXPLICIT-shard idiom (run_eval_cycle),
+    # not the training-style refill. `collect_rollouts` only hands a shard to an env
+    # that reports exhausted, and a fresh actor does not -- so a shard iterator alone
+    # never reaches the sims and the run silently serves each actor's own seeded
+    # stream instead of the pinned set (observed: 29 unique episodes in 128
+    # collections, 5x duplication across identically-seeded actors). Uids in the
+    # file may be either convention; assign_shard resolves both.
+    eval_uids_file = getattr(bootstrapper.typed_cfg.task, "eval_uids_file", None)
+    if eval_uids_file:
+        raw = open(eval_uids_file).read()
+        uids = [u.strip() for u in raw.replace("\n", ",").split(",") if u.strip()]
+        parts = [uids[i::len(sims)] for i in range(len(sims))]
+        ray.get([s.assign_shard.remote(p) for s, p in zip(sims, parts)])
+        all_episodes = uids
+        # Exhausted sims retire instead of being refilled: each episode runs once.
+        shard_iter = iter(())
+        logger.info(f"Pinned eval set: {len(uids)} uids from {eval_uids_file}, "
+                    f"split across {len(sims)} sims")
+
     def cleanup():
         for trainer in trainers:
             ray.kill(trainer)
