@@ -58,6 +58,7 @@ sim:
   # goal_unreachable, which the harness's reference numbers score as failures.
   snap_start: false
   screen_reachability: false
+  tick_metrics: true
   # RTC off by default (the historical env, bit for bit); legs override on the CLI.
   rtc_delay_source: none
   rtc_delay: 0

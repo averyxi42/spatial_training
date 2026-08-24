@@ -79,6 +79,7 @@ class ContinuousObjectNavEnvActor:
         rtc_overrun_rate: float = 0.0,
         snap_start: bool = True,
         screen_reachability: bool = True,
+        tick_metrics: bool = False,
         **kwargs: Any,
     ):
         self.episodes_path = episodes
@@ -158,6 +159,10 @@ class ContinuousObjectNavEnvActor:
         # goals pay nothing. False = the harness's serve-everything convention, required
         # for cross-path parity on pinned sets (see _next_admissible_episode).
         self.screen_reachability = bool(screen_reachability)
+        # Per-tick metric latching (the harness's evaluate_every=1). False keeps the
+        # one-geodesic-query-per-step training economy; parity evals set True -- see
+        # _metrics_on_tick.
+        self.tick_metrics = bool(tick_metrics)
         # -- RTC latency masking (docs/RTC_RL.md; schedule from objectnav_eval) --------
         # "none" (default) is the historical env, bit for bit: no scheduler is ever
         # constructed, step() keeps its (gap, 3) contract, and no extra geodesic query
@@ -361,6 +366,26 @@ class ContinuousObjectNavEnvActor:
             buf, format="JPEG", quality=88)
         return buf.getvalue()
 
+    def _metrics_on_tick(self, record) -> None:
+        """Per-TICK metric latching, the harness's convention (evaluate_every=1).
+
+        Off by default: a geodesic query per tick is exactly the cost the per-step
+        design avoids in training. Cross-path parity evals need it -- committed motion
+        swings more, and within-interval dips through the goal radius are latched by
+        the harness's tick-granular oracle and missed by a step-granular one (the miss
+        rate grows with d). Also feeds the path tracker per tick, which is what makes
+        path-length (and therefore oSPL) comparable across stacks."""
+        self._video_on_tick(record)
+        self._task.observe_pose(record.pose)
+        geo = float(self._task.evaluate()["distance_to_goal"])
+        if np.isfinite(geo) and geo < self._min_geodesic:
+            self._min_geodesic = geo
+            self._path_at_min = float(self._task.path_tracker.length)
+
+    @property
+    def _on_tick(self):
+        return self._metrics_on_tick if self.tick_metrics else self._video_on_tick
+
     def _video_on_tick(self, record) -> None:
         """Executor tick hook: capture every `video_tick_stride`-th physics tick.
 
@@ -536,7 +561,7 @@ class ContinuousObjectNavEnvActor:
             raise RuntimeError("no pending commitment: the scheduler has not observed")
         if len(committed):
             self._interval_execs.append(self._executor.execute_setpoints(
-                committed, chunk_index=self._steps, on_tick=self._video_on_tick))
+                committed, chunk_index=self._steps, on_tick=self._on_tick))
             self._task.observe_pose(self._robot_sim.get_2d_pose())
             self._geo_after_commit = float(self._task.evaluate()["distance_to_goal"])
         else:
@@ -573,9 +598,10 @@ class ContinuousObjectNavEnvActor:
                 )
             execution = self._executor.execute(
                 chunk, chunk_index=self._steps,
-                # The on_tick hook carries BOTH per-tick concerns: physical fall tracking
-                # (always) and video frames (when capture is on) -- see _video_on_tick.
-                on_tick=self._video_on_tick,
+                # The on_tick hook carries the per-tick concerns: physical fall tracking
+                # (always), video frames (when capture is on), and -- under tick_metrics
+                # -- the harness-convention per-tick metric latch.
+                on_tick=self._on_tick,
             )
             executions = [execution]
             geo_mid = None
@@ -592,8 +618,16 @@ class ContinuousObjectNavEnvActor:
             plan = self._scheduler.accept(chunk)
             fresh = plan.setpoints[plan.committed:]
             if len(fresh):
+                # The fresh span CHAINS its feedforward from the last COMMITTED
+                # setpoint -- the commanded chain, exactly what the harness's single
+                # merged block does. Re-seeding from the live pose here (the default)
+                # would inject a tracking-lag transient into the feedforward at every
+                # splice, a control divergence the merged-block path does not have.
+                fresh_anchor = (plan.setpoints[plan.committed - 1]
+                                if plan.committed else None)
                 self._interval_execs.append(self._executor.execute_setpoints(
-                    fresh, chunk_index=self._steps, on_tick=self._video_on_tick))
+                    fresh, chunk_index=self._steps, on_tick=self._on_tick,
+                    anchor=fresh_anchor))
             executions = self._interval_execs
             geo_mid = self._geo_after_commit
         self._steps += 1

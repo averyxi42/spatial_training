@@ -160,6 +160,12 @@ class ContinuousObjectNavEnvConfig:
     # False = the harness's serve-everything convention; parity evals need it, since the
     # robot mesh screens out ~30 of sample101 that the harness scores as failures.
     screen_reachability: bool = True
+    # Per-tick metric latching (the harness's evaluate_every=1): oracle latch and path
+    # tracking per control tick instead of per policy step. False (historical) keeps
+    # training's one-query-per-step economy; parity evals set True -- step-granular
+    # latching misses within-interval dips through the goal radius, and the miss grows
+    # with d.
+    tick_metrics: bool = False
     rtc_delay_source: str = "none"
     rtc_delay: int = 0
     rtc_delay_max: int = 0
