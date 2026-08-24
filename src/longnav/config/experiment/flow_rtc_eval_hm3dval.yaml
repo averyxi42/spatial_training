@@ -38,6 +38,10 @@ vlm:
     # explicit value by design (no default exists to inherit silently).
     sde_noise_a: 0.9
     sde_position_weight: sigma
+    # Seeds the head's own generator (per worker) so an eval run is reproducible.
+    # Without it the ODE base noise is fresh per run and d>0 oracle moved +-3 pts
+    # across replicates (measured 2026-08-24: 0.485/0.515/0.545 at d=5).
+    sde_seed: 1000
 
 sim:
   episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1/val
