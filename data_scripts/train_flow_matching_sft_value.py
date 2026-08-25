@@ -451,6 +451,96 @@ def _probe_save_extras(model):
 class _ProbeTrainerMixin:
     """Accumulate/drain the probe losses alongside the whitelisted metrics."""
 
+    #: When set, probe parameters are clipped SEPARATELY to this norm and excluded from
+    #: the global clip. None keeps the stock single-global-clip behaviour.
+    probe_clip_norm = None
+
+    def _install_split_clip(self):
+        """Clip the probe head independently of everything else.
+
+        `max_grad_norm` is enforced by ONE global clip over `model.parameters()`
+        (transformers `trainer.py`, "Gradient clipping"), so a large auxiliary gradient
+        rescales the primary objective's update even when the two are otherwise fully
+        decoupled. Detaching the probe (`--probe-grad-scale 0`) stops its gradient
+        reaching the backbone, but the probe head's OWN parameters still enter that norm:
+        measured on v9 at step ~20, `state_probe` alone was ~0.99 of a ~1.3 total, so the
+        clipper was still being driven by the auxiliary head and still scaling the action
+        update down with it. v8 showed the severe form of the same coupling -- norm ~5
+        every step, a 0.21x rescale, and 20 points of oracle success
+        (docs/STOP_HEAD_NAVIGATION_TRADEOFF.md).
+
+        Two independent clips are the honest expression of "these objectives do not share
+        a budget". The reported `grad_norm` stays the PRIMARY group's, because that is
+        the number governing the policy and the one comparable to runs without a probe.
+
+        Wrapping the accelerator's bound method rather than patching transformers: the
+        clip is inline in the training loop with no hook before it, and the only callback
+        (`on_pre_optimizer_step`) fires after the damage is done.
+        """
+        acc = getattr(self, "accelerator", None)
+        probe = getattr(getattr(self, "model", None), "state_probe", None)
+        if acc is None or probe is None or self.probe_clip_norm is None:
+            return
+        if getattr(acc, "_probe_split_clip_installed", False):
+            return
+        original = acc.clip_grad_norm_
+        probe_ids = {id(q) for q in probe.parameters()}
+        limit = float(self.probe_clip_norm)
+
+        def split_clip(parameters, max_norm, norm_type=2, **kw):
+            params = list(parameters)
+            primary = [q for q in params if id(q) not in probe_ids]
+            aux = [q for q in params if id(q) in probe_ids]
+            norm = original(primary, max_norm, norm_type=norm_type, **kw) if primary else None
+            if aux:
+                _torch.nn.utils.clip_grad_norm_(aux, limit, norm_type=norm_type)
+            return norm
+
+        acc.clip_grad_norm_ = split_clip
+        acc._probe_split_clip_installed = True
+        if int(getattr(self.args, "process_index", 0) or 0) == 0:
+            print(f"[probe] split gradient clipping: probe params clipped separately at "
+                  f"{limit}, excluded from the global max_grad_norm "
+                  f"{self.args.max_grad_norm}", flush=True)
+
+    def _get_num_items_in_batch(self, batch_samples, device):
+        """Count only ACTION-BEARING turns in the flow loss's global denominator.
+
+        The base counter sums `num_turns` over every row. Probe-only rows are zeroed in
+        the flow loss's NUMERATOR (`action_weight = 0`) but their turns stayed in the
+        DENOMINATOR, scaling the action gradient ~0.58x at v8's mixture (on-policy rows
+        are ~42% of turns) while the probe loss -- a per-row mean -- was untouched. That
+        dilution is one of the three factors behind v8's navigation collapse
+        (docs/STOP_HEAD_NAVIGATION_TRADEOFF.md); it matters most the moment
+        `--probe-grad-scale > 0` re-attaches the head, because the diluted action anchor
+        is what a backbone-reaching auxiliary gradient overpowers.
+
+        Probe-off runs are bit-identical: without a probe the collator emits no
+        `action_weight`, every row counts, and this reduces to the base sum. An
+        all-probe-only window falls back to the full count rather than dividing the
+        (all-zero) flow loss by zero.
+        """
+        if not batch_samples or "num_turns" not in batch_samples[0]:
+            return None
+        n = 0
+        for b in batch_samples:
+            w = b.get("action_weight")
+            if w is not None and float(w) == 0.0:
+                continue
+            n += int(b["num_turns"])
+        if n == 0:
+            n = sum(int(b["num_turns"]) for b in batch_samples)
+        n = _torch.tensor(n, device=device)
+        if self.args.average_tokens_across_devices and self.args.world_size > 1:
+            n = self.accelerator.gather(n).sum()
+        return n
+
+    def training_step(self, *args, **kwargs):
+        # Installed here rather than in __init__: the accelerator and the model's probe
+        # both exist by the first step, and this costs one attribute check afterwards.
+        self._install_split_clip()
+        return super().training_step(*args, **kwargs)
+
     _PROBE_KEYS = ("probe_stop_loss_sum", "probe_stop_n", "probe_stop_pos",
                    "probe_stop_psum", "probe_stop_tp", "probe_stop_fp", "probe_stop_fn",
                    "probe_distance_loss_sum", "probe_value_loss_sum", "probe_turns",
@@ -696,6 +786,14 @@ def parse_args():
                           "scene, and the first on-policy rows are all ordered though "
                           "the split is ~48%% shuffled. Unset keeps the historical "
                           "first-N behaviour so old runs reproduce.")
+    pre.add_argument("--probe-clip-norm", type=float, default=None,
+                     help="clip the probe head's gradients SEPARATELY to this norm and "
+                          "exclude them from the global --max-grad-norm. Unset keeps one "
+                          "global clip over everything, which lets a large auxiliary "
+                          "gradient rescale the primary objective's update even when the "
+                          "probe is detached -- the residual half of the coupling that "
+                          "cost v8 20 points of oracle success. 1.0 mirrors the global "
+                          "default; smaller caps the head harder.")
     pre.add_argument("--probe-save-scores", action="store_true",
                      help="dump raw per-turn stop logits + labels + the ordered/shuffled "
                           "flag at every eval, one npz per rank under "
@@ -949,6 +1047,7 @@ def parse_args():
     args.probe_gamma = mine.probe_gamma
     args.probe_head_lr = mine.probe_head_lr
     args.probe_save_scores = mine.probe_save_scores
+    args.probe_clip_norm = mine.probe_clip_norm
     args.eval_sample_seed = mine.eval_sample_seed
     args.no_distance_head = mine.no_distance_head
     args.no_value_head = mine.no_value_head
@@ -1413,7 +1512,10 @@ def main():
 
     # --- PROBE --- mixin only changes metric visibility; probe-off runs identically
     class _ProbeFlowTrainer(_ProbeTrainerMixin, FlowMatchingSFTTrainer):
-        pass
+        # Class attribute rather than a constructor arg: the mixin reads it at the first
+        # training step, and threading it through the Trainer's signature would mean
+        # touching the base trainer, which the probe-off path must keep bit-identical.
+        probe_clip_norm = args.probe_clip_norm
 
     _TrainerCls = _ProbeFlowTrainer if args.probe else FlowMatchingSFTTrainer
     trainer = _TrainerCls(
