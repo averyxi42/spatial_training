@@ -9,6 +9,9 @@
 # Gauge note (RTC_RL.md section 6 phase 3): the postfix-masked density sums fewer
 # elements, so chain/abs_log_ratio_mean's historical ~0.01-nat band must be
 # re-established from THIS run's cycle 0 before anything is tuned against it.
+# MEASURED (cycle 0, 2026-08-25): abs_log_ratio_mean / rollout_seam_gap sit at
+# ~0.0005-0.0006 nats, lp_selfdiff ~0.002. That is the healthy band for the
+# conditioned chain; treat anything 10x above it the way ~0.1 was treated before.
 resources:
   # The documented landmine (docs/LATENT_RL_ENV.md): config_schema defaults
   # vlm_conda_env to "longnav" but this machine's env is longnav_vlm.
