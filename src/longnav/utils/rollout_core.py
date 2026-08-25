@@ -828,12 +828,18 @@ def collect_rollouts(
             if ray.get(env_handle.is_exhausted.remote()):
                 initial_shard = next(shard_iterator)
                 env_handle.assign_shard.remote(initial_shard)
-            reset_ref = env_handle.reset.remote()
-            pending_resets[reset_ref] = env_handle
         except StopIteration:
+            # No shard to hand out -- but RESET ANYWAY (2026-08-25 regression fix):
+            # under the restored is_exhausted contract, an env whose shard was
+            # EXPLICITLY assigned before this call (run_eval_cycle's idiom) reports
+            # exhausted until its first reset parses the shard, and skipping the
+            # reset here silently produced n=0 evals. A genuinely-exhausted env
+            # resets to its sentinel and retires -- also correct.
             iterator_exhausted = True
-            print("Warning: Not enough shards for all workers during bootstrap.")
-            pass
+            print("Warning: no shard available at bootstrap; resetting anyway "
+                  "(a pre-assigned shard, if any, is parsed by the reset).")
+        reset_ref = env_handle.reset.remote()
+        pending_resets[reset_ref] = env_handle
     print(f"Bootstrapping: Initializing {len(env_handles)} environments...")
     initial_live_sims = len(pending_resets)
     # Helper to check if we should keep the loop alive
