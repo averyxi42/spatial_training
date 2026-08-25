@@ -9,6 +9,11 @@
 # Gauge note (RTC_RL.md section 6 phase 3): the postfix-masked density sums fewer
 # elements, so chain/abs_log_ratio_mean's historical ~0.01-nat band must be
 # re-established from THIS run's cycle 0 before anything is tuned against it.
+resources:
+  # The documented landmine (docs/LATENT_RL_ENV.md): config_schema defaults
+  # vlm_conda_env to "longnav" but this machine's env is longnav_vlm.
+  vlm_conda_env: longnav_vlm
+
 defaults:
   - override /policy_head@vlm.policy_head: flow_sde_head
   - override /sim: objectnav_continuous
