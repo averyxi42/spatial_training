@@ -57,6 +57,12 @@ class RLAlgoConfig:
     # value_head (both claim the worker's value readout slot).
     state_probe: Optional[str] = None
     advantage_estimator: str = "reinforce_plus_plus"
+    # RTC return re-timing (docs/RTC_RL.md section 4): r~_k = r_fresh_k +
+    # gamma*r_commit_{k+1} == R_k - r_commit_k -- subtract from each step's return the
+    # committed reward its action could not influence. Consumed only when the env
+    # emits the r_commit/r_fresh split (RTC runs); default ON per the doc's identity
+    # argument, flag kept for the ablation.
+    retime_commit_rewards: bool = True
     n_rollout: int = 12 # note: must be divisible by num vlms times gradient accumulation
     n_adv: int = 256 # number of trajectories for advantage estimation, must > n_rollout
     n_epoch: int = 2 # number of policy gradient epochs

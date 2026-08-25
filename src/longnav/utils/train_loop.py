@@ -255,6 +255,25 @@ def compute_advantages_and_returns(
     """
     values = traj_batch.get("values", None)
     rewards = traj_batch["rewards"]
+    # RTC return re-timing (docs/RTC_RL.md section 4): move each interval's
+    # COMMITTED-tick progress to the action that committed it,
+    #   r~_k = r_fresh_k + gamma * r_commit_{k+1}  ==  R_k - r_commit_k  (the
+    # subtraction identity; gamma is the unique weight for which it holds).
+    # Unbiased, variance-reducing, objective-preserving. Applies only when the env
+    # emitted the split (RTC runs); the flag exists for the ablation. Padding rows
+    # carry r_commit = 0, so the shift needs no length bookkeeping, and the terminal
+    # step correctly receives no next-commit term (its tail never executed).
+    if (getattr(cfg.training.rl_config, "retime_commit_rewards", True)
+            and "r_commit" in traj_batch.keys() and "r_fresh" in traj_batch.keys()):
+        gamma = cfg.training.rl_config.gamma
+        r_commit = traj_batch["r_commit"]
+        next_commit = torch.zeros_like(r_commit)
+        next_commit[:, :-1] = r_commit[:, 1:]
+        rewards = traj_batch["r_fresh"] + (rewards - traj_batch["r_fresh"]
+                                           - r_commit) + gamma * next_commit
+        # (rewards - r_fresh - r_commit) preserves any non-split reward component
+        # exactly; with the env's exhaustive split it is ~0 by construction.
+        traj_batch["rewards"] = rewards
     if (getattr(cfg.training.rl_config, "bootstrap_truncated", False)
             and values is not None and "truncated" in traj_batch.keys()):
         # A budget-capped episode is TRUNCATED, not terminated: treating the cap as

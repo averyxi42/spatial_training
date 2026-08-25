@@ -241,12 +241,6 @@ class TestHighNoiseMarginalPreservation:
 # 5. RTC prefix conditioning on the eval sampler (docs/RTC_RL.md section 2; phase 1)
 # --------------------------------------------------------------------------------------
 class TestRTCPrefixODE:
-    def test_prefix_requires_force_ode_until_the_scorer_lands(self):
-        head = _head()
-        h = head(torch.randn(1, 1, HID))["h"][0, 0].detach().numpy()
-        with pytest.raises(RuntimeError, match="scorer"):
-            head.sample_chain_np(h, prefix=np.zeros((3, 3)))
-
     def test_conditioned_chunk_is_full_length_and_carries_the_prefix_exactly(self):
         """Rows [0, d) of the composed chunk are the commitment's own poses: the pinned
         differentials compose into exactly compose(prefix). And the chunk is FULL
@@ -292,3 +286,84 @@ class TestRTCPrefixODE:
         head.seed(3)
         _, _, _, b = head.sample_chain_np(h, prefix=-pa)
         assert not np.allclose(a[5:], b[5:])
+
+
+# --------------------------------------------------------------------------------------
+# 6. RTC prefix conditioning on the STOCHASTIC sampler + scorer (docs/RTC_RL.md, phase 2)
+# --------------------------------------------------------------------------------------
+class TestRTCPrefixSDE:
+    def _prefix(self, d=4):
+        return np.random.default_rng(5).normal(size=(d, 3)) * 0.012
+
+    def test_recompute_matches_rollout_logprob_with_prefix(self):
+        head = _head(n=3, a=0.2)
+        h = head(torch.randn(1, 1, HID))["h"][0, 0].detach().numpy()
+        prefix = self._prefix()
+        head.seed(11)
+        chain, pos, lp, chunk = head.sample_chain_np(h, prefix=prefix)
+        assert chunk.shape == (T, 3) and pos.size == 3 and lp != 0.0
+        head.train()   # the ratio must survive train-mode callers (dropout pinned inside)
+        recomputed = head.chain_log_prob_batch(
+            torch.as_tensor(h).reshape(1, 1, -1),
+            torch.as_tensor(chain).reshape(1, 1, -1),
+            torch.as_tensor(pos).reshape(1, 1, -1),
+            prefix_actions=torch.as_tensor(prefix, dtype=torch.float32).reshape(1, 1, -1, 3),
+            prefix_len=torch.tensor([[len(prefix)]]),
+        )
+        assert abs(float(recomputed[0, 0]) - lp) < 1e-3
+
+    def test_prefix_rows_constant_across_all_chain_blocks_under_sde(self):
+        head = _head(n=3, a=0.5)
+        h = head(torch.randn(1, 1, HID))["h"][0, 0].detach().numpy()
+        prefix = self._prefix()
+        head.seed(3)
+        chain, pos, lp, _ = head.sample_chain_np(h, prefix=prefix)
+        blocks = chain.reshape(K + 1, T, 3)
+        scaled = head.codec.scale(torch.as_tensor(prefix).double()).float().numpy()
+        for b in blocks:
+            assert np.allclose(b[:len(prefix)], scaled, atol=1e-6)
+
+    def test_scorer_asserts_on_prefix_drift(self):
+        head = _head(n=2, a=0.2)
+        h = head(torch.randn(1, 1, HID))["h"][0, 0].detach().numpy()
+        prefix = self._prefix()
+        head.seed(9)
+        chain, pos, lp, _ = head.sample_chain_np(h, prefix=prefix)
+        bad = chain.copy().reshape(K + 1, T, 3)
+        bad[0, 0, 0] += 0.05    # corrupt a committed row of block 0
+        with pytest.raises(RuntimeError, match="drift"):
+            head.chain_log_prob_batch(
+                torch.as_tensor(h).reshape(1, 1, -1),
+                torch.as_tensor(bad.reshape(-1)).reshape(1, 1, -1),
+                torch.as_tensor(pos).reshape(1, 1, -1),
+                prefix_actions=torch.as_tensor(prefix, dtype=torch.float32).reshape(1, 1, -1, 3),
+                prefix_len=torch.tensor([[len(prefix)]]),
+            )
+
+    def test_empty_prefix_sde_is_bitwise_the_legacy_sampler(self):
+        head = _head(n=3, a=0.4)
+        h = head(torch.randn(1, 1, HID))["h"][0, 0].detach().numpy()
+        head.seed(21)
+        chain_a, pos_a, lp_a, chunk_a = head.sample_chain_np(h)
+        head.seed(21)
+        chain_b, pos_b, lp_b, chunk_b = head.sample_chain_np(h, prefix=np.zeros((0, 3)))
+        assert np.array_equal(chain_a, chain_b) and np.array_equal(pos_a, pos_b)
+        assert lp_a == lp_b
+        assert np.array_equal(chunk_b[:GAP], chunk_a)   # full-vs-truncated contract
+
+    def test_density_excludes_committed_rows(self):
+        """Same seed, same h: the conditioned chain's logprob must differ from what an
+        unmasked density over the same stored blocks would give -- i.e. the mask is
+        actually applied. Checked via the scorer: score the conditioned chain WITHOUT
+        the prefix kwargs (unmasked, unconditioned drift) and confirm it disagrees."""
+        head = _head(n=2, a=0.3)
+        h = head(torch.randn(1, 1, HID))["h"][0, 0].detach().numpy()
+        prefix = self._prefix()
+        head.seed(13)
+        chain, pos, lp, _ = head.sample_chain_np(h, prefix=prefix)
+        unmasked = head.chain_log_prob_batch(
+            torch.as_tensor(h).reshape(1, 1, -1),
+            torch.as_tensor(chain).reshape(1, 1, -1),
+            torch.as_tensor(pos).reshape(1, 1, -1),
+        )
+        assert abs(float(unmasked[0, 0]) - lp) > 1e-3

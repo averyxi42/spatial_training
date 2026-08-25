@@ -1227,7 +1227,7 @@ class VLMTrainingMixin:
         policy_stats,vpreds, = self.ddp_model(**forward_kwargs)
         return policy_stats,vpreds
     
-    def rl_loss(self, log_probs, actions, advantages, response_mask, old_log_prob, returns, old_values, vpreds, rollout_log_probs=None, ref_log_probs=None, policy_stats=None, actions_continuous=None, sde_positions=None):
+    def rl_loss(self, log_probs, actions, advantages, response_mask, old_log_prob, returns, old_values, vpreds, rollout_log_probs=None, ref_log_probs=None, policy_stats=None, actions_continuous=None, sde_positions=None, prefix_actions=None, prefix_len=None):
         from verl.trainer.ppo.core_algos import compute_value_loss,compute_entropy_loss
         # `rl_loss` runs on the WORKER (`self.model`), not the wrapper (`self.vlm`) -- the
         # same resolution note as the actuator seam. getattr-chained so head-less test stubs
@@ -1245,8 +1245,13 @@ class VLMTrainingMixin:
                     "chain-head RL loss requires policy_stats['h'], actions_continuous "
                     "(the stored chains) and sde_positions.")
             hh = policy_stats['h']
+            # RTC: recondition on the STORED commitment (docs/RTC_RL.md section 5) --
+            # absent on non-RTC runs, and the scorer treats absence as unconditioned.
+            _rtc_kw = ({"prefix_actions": prefix_actions.to(hh.device),
+                        "prefix_len": prefix_len.to(hh.device)}
+                       if prefix_actions is not None else {})
             log_prob = _chain_lp(hh, actions_continuous.to(hh.device),
-                                 sde_positions.to(hh.device))
+                                 sde_positions.to(hh.device), **_rtc_kw)
             # NO re-anchoring: postprocess `old_log_prob` is correct BY CONSTRUCTION
             # relative to the training forwards -- the framework aligns them (same cached
             # embeds, same code path) and this was verified for the chain head at 0.0096
@@ -1329,7 +1334,8 @@ class VLMTrainingMixin:
                 # determinism of the scorer on ITS OWN inputs, in-context
                 metrics['chain/lp_selfdiff'] = float(
                     (_chain_lp(hh, actions_continuous.to(hh.device),
-                               sde_positions.to(hh.device)) - log_prob).abs().max())
+                               sde_positions.to(hh.device), **_rtc_kw)
+                     - log_prob).abs().max())
         if self.rl_algo_config.value_head is not None:
             _vh = getattr(getattr(self, "model", None), "value_head", None)
             if getattr(_vh, "is_distributional", False):
@@ -1519,7 +1525,7 @@ class VLMTrainingMixin:
             self.optimizer.zero_grad()
         return metrics
             
-    def train_rl_step(self,embeds_inputs,actions=None,old_log_prob=None,advantages=None,returns=None,old_values=None,rollout_log_probs=None,ref_log_probs=None,actions_continuous=None,sde_positions=None,loss_scale=1.0):
+    def train_rl_step(self,embeds_inputs,actions=None,old_log_prob=None,advantages=None,returns=None,old_values=None,rollout_log_probs=None,ref_log_probs=None,actions_continuous=None,sde_positions=None,prefix_actions=None,prefix_len=None,loss_scale=1.0):
         '''
         Docstring for train_rl_step
         
@@ -1542,6 +1548,8 @@ class VLMTrainingMixin:
                     'actions': actions,
                     'actions_continuous': actions_continuous,
                     'sde_positions': sde_positions,
+                    'prefix_actions': prefix_actions,
+                    'prefix_len': prefix_len,
                     'old_log_prob': old_log_prob,
                     'advantages': advantages,
                     'returns': returns,

@@ -187,6 +187,7 @@ class EpisodeRolloutMixin:
                 _chain_head = getattr(getattr(self, "model", None), "action_head", None)
                 _sample_chain = getattr(_chain_head, "sample_chain_np", None)
                 sde_positions = None
+                rtc_prefix_len = rtc_prefix_pad = None
                 if self.policy_head_config['type'] == "continuous" and _sample_chain is not None:
                     if self.rollout_config.get('use_oracle_action'):
                         # An oracle action is a CHUNK; no unique chain ends at it, and any
@@ -210,6 +211,17 @@ class EpisodeRolloutMixin:
                         np.asarray(policy_out["h"], dtype=np.float32).reshape(-1),
                         **_chain_kwargs)
                     action_logprobs = np.float32(_chain_lp)
+                    # RTC buffer fields (docs/RTC_RL.md section 5): the EXACT physical
+                    # differentials the sampler consumed, zero-padded to the head's
+                    # headroom, plus the length. Required, not convenience -- the
+                    # scorer reconditions from these, never from the chain or poses.
+                    if _rtc_prefix is not None:
+                        _pad = int(_chain_head.n_ticks) - int(_chain_head.gap)
+                        _p = np.asarray(_rtc_prefix, dtype=np.float32).reshape(-1, 3)
+                        rtc_prefix_len = np.int64(_p.shape[0])
+                        rtc_prefix_pad = np.zeros((_pad, 3), dtype=np.float32)
+                        if _p.shape[0]:
+                            rtc_prefix_pad[: _p.shape[0]] = _p
                     # The action IS the chain: stored whole so the ratio is over exactly
                     # what acted. The executed chunk is derived from it (decode_action on
                     # the same seam as every other head), never stored in its place.
@@ -325,6 +337,11 @@ class EpisodeRolloutMixin:
                         "rollout_logprobs": action_logprobs,
                         "rewards": state_dict.get("reward", 0.0),
                         "dones": state_dict['done'],
+                        # RTC buffer fields ride only on RTC runs (single env type per
+                        # run, so the column set stays constant within any batch).
+                        **({"prefix_len": rtc_prefix_len,
+                            "prefix_actions": rtc_prefix_pad}
+                           if rtc_prefix_len is not None else {}),
                         # "spl": state_dict['info']['spl'],
                         # "success": state_dict['info']['success'],
                         # "distance_to_goal": state_dict['info']['distance_to_goal'],
@@ -511,8 +528,22 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
                         sde_positions = torch.as_tensor(
                             np.asarray(self.rl_trajectory['sde_positions']),
                             device=hh.device).reshape(1, actions_continuous.shape[1], -1)
+                        # RTC: recondition on the STORED prefix (docs/RTC_RL.md
+                        # section 5); absent on non-RTC runs.
+                        _rtc_kw = {}
+                        if 'prefix_len' in self.rl_trajectory:
+                            _rtc_kw = {
+                                "prefix_actions": torch.as_tensor(
+                                    np.asarray(self.rl_trajectory['prefix_actions']),
+                                    dtype=torch.float32,
+                                    device=hh.device).unsqueeze(0),
+                                "prefix_len": torch.as_tensor(
+                                    np.asarray(self.rl_trajectory['prefix_len']),
+                                    device=hh.device).reshape(1, -1),
+                            }
                         old_log_prob = _chain_lp(hh, actions_continuous,
-                                                 sde_positions).squeeze(0).float().cpu()
+                                                 sde_positions,
+                                                 **_rtc_kw).squeeze(0).float().cpu()
                     else:
                         actions_continuous = torch.as_tensor(self.rl_trajectory['actions_continuous'], dtype=policy_stats['mu'].dtype, device=policy_stats['mu'].device)
                         if actions_continuous.dim() == 2:
@@ -541,7 +572,8 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
                             _ref_chain_lp = getattr(_ref_head, "chain_log_prob_batch", None)
                             if _ref_chain_lp is not None:
                                 ref_lp = _ref_chain_lp(ref_stats['h'], actions_continuous,
-                                                       sde_positions).squeeze(0)
+                                                       sde_positions,
+                                                       **_rtc_kw).squeeze(0)
                             else:
                                 ref_lp = self._continuous_log_prob(
                                     actions_continuous, ref_stats['mu'],
@@ -651,6 +683,8 @@ class RLActor(RLWorker):
         rollout_log_probs = traj_batch.get('rollout_logprobs',None)
         ref_logprobs = traj_batch.get('ref_logprobs',None)
         sde_positions = traj_batch.get('sde_positions', None)
+        prefix_actions = traj_batch.get('prefix_actions', None)
+        prefix_len = traj_batch.get('prefix_len', None)
 
         # NOTE on the chain head's `old_log_prob`: the postprocess value is passed through
         # UNCHANGED -- there is no re-anchoring (an earlier anchor was removed; it papered
@@ -660,7 +694,7 @@ class RLActor(RLWorker):
         # sitting at seam level. If actor/ppo_kl is large on minibatches trained BEFORE any
         # optimizer step of the cycle, suspect attn_impl or a trajectory/model_inputs
         # misalignment (see the alignment invariant in train_rl.py), never the seam.
-        return super().train_rl_step(embeds_inputs, actions=actions, old_log_prob=old_log_prob, advantages=advantages, returns=returns, old_values=old_values, rollout_log_probs=rollout_log_probs, ref_log_probs=ref_logprobs, actions_continuous=actions_continuous, sde_positions=sde_positions, loss_scale=loss_scale)
+        return super().train_rl_step(embeds_inputs, actions=actions, old_log_prob=old_log_prob, advantages=advantages, returns=returns, old_values=old_values, rollout_log_probs=rollout_log_probs, ref_log_probs=ref_logprobs, actions_continuous=actions_continuous, sde_positions=sde_positions, prefix_actions=prefix_actions, prefix_len=prefix_len, loss_scale=loss_scale)
     
     def train_dagger_step(self, embeds_inputs_np, embeds_inputs_meta, traj_batch):
         """

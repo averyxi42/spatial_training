@@ -138,7 +138,8 @@ class SDEConfig:
 # The one transition density (the sampler/scorer invariant lives HERE)
 # ======================================================================================
 def _sde_transition(decoder: nn.Module, ctx: torch.Tensor, x_t: torch.Tensor,
-                    t: torch.Tensor, dt: float, cfg: SDEConfig
+                    t: torch.Tensor, dt: float, cfg: SDEConfig,
+                    prefix_mask: Optional[torch.Tensor] = None
                     ) -> Tuple[torch.Tensor, torch.Tensor]:
     """One SDE step's Gaussian: `(mu, std)` of `z_next` given `(ctx, x_t, t)`.
 
@@ -150,10 +151,20 @@ def _sde_transition(decoder: nn.Module, ctx: torch.Tensor, x_t: torch.Tensor,
     `sigma_t` scales the drift correction (as sigma^2/2) and the injected noise (as
     sigma*sqrt|dt|) from the SAME tensor -- the two are halves of one identity and any knob
     that scales one without the other is wrong (wiring rule 1).
+
+    `prefix_mask` (`(B, T)` bool, True at RTC-committed rows) makes the transition on
+    those rows a DIRAC: the field sees per-tick flow time 0 there (this repo's reversed
+    axis -- clean, see docs/RTC_RL.md section 2), and `mu` is pinned to `x_t`, so the
+    committed rows carry no transition randomness. Their density terms are excluded by
+    the caller (`_gaussian_logprob(prefix_mask=...)`): prefix rows are STATE, and the
+    Gaussian evaluated at a pinned row is a garbage finite number that differs between
+    old and new policy. Sampler and scorer both come through here -- the module's one
+    invariant -- so the mask lives in this signature, nowhere else.
     """
     x_t = x_t.float()
     t = t.float()
-    v = decoder(ctx.float(), x_t, t)                                    # (B, T, 3)
+    time_in = prefix_time(t, prefix_mask) if prefix_mask is not None else t
+    v = decoder(ctx.float(), x_t, time_in)                              # (B, T, 3)
     tb = t.view(-1, 1, 1)
     eps_hat = x_t + (1.0 - tb) * v
     # t_min cannot bind for any K <= 1000 (source times are >= 1/K); if it ever does,
@@ -168,6 +179,8 @@ def _sde_transition(decoder: nn.Module, ctx: torch.Tensor, x_t: torch.Tensor,
     # marginal-preservation test never caught it). See tests/test_flow_sde_policy.py::
     # test_high_noise_marginal_preservation for the guard.
     mu = x_t + dt * (v - 0.5 * sigma_t.pow(2) * score)
+    if prefix_mask is not None:
+        mu = torch.where(prefix_mask[..., None], x_t, mu)   # Dirac on committed rows
     std = sigma_t * math.sqrt(abs(dt))
     return mu, std.expand_as(mu)
 
@@ -190,10 +203,19 @@ def _sigma(t: torch.Tensor, cfg: SDEConfig, dt: float) -> torch.Tensor:
     return cfg.noise_a * torch.sqrt(t.clamp_min(0.0) / denom)
 
 
-def _gaussian_logprob(x: torch.Tensor, mu: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    """Sum over the chunk dims, keep the batch dim. Float32 throughout."""
+def _gaussian_logprob(x: torch.Tensor, mu: torch.Tensor, std: torch.Tensor,
+                      prefix_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Sum over the chunk dims, keep the batch dim. Float32 throughout.
+
+    `prefix_mask` excludes RTC-committed rows from the sum, as a MULTIPLIER: their
+    transition is a Dirac (see `_sde_transition`), and even at a pinned row where
+    `x == mu` the Gaussian contributes `-0.5*log(2*pi*var)` per element -- an
+    `h`-independent constant per transition, but one the masked objective must not
+    carry (docs/RTC_RL.md section 2)."""
     var = std.pow(2)
     lp = -0.5 * ((x - mu).pow(2) / var + torch.log(2.0 * math.pi * var))
+    if prefix_mask is not None:
+        lp = lp * (~prefix_mask)[..., None].to(lp.dtype)
     return lp.flatten(1).sum(dim=1)
 
 
@@ -310,10 +332,11 @@ class FlowSDEHead(nn.Module):
         slicing, because the tail is the next commitment's source. `prefix=None` is the
         historical contract exactly: unconditioned chain, `(gap, 3)` truncated chunk.
 
-        Phase boundary, enforced loudly: prefix conditioning currently requires
-        `force_ode` -- the stochastic sampler's masked density lands together with the
-        scorer (RTC_RL.md section 6, phase 2), and a conditioned SDE chain scored by
-        today's unmasked `chain_log_prob_batch` would be silently wrong.
+        The stochastic (RL) sampler conditions through `_sde_transition(prefix_mask=)`:
+        committed rows are Dirac (mu pinned, field at per-tick t = 0), their density
+        terms are excluded, and the chain blocks carry the pinned rows so the scorer's
+        constancy assert can hold them against the stored prefix (docs/RTC_RL.md
+        section 2).
         """
         dev = next(self.parameters()).device
         ctx = torch.as_tensor(np.asarray(h, np.float32), device=dev).reshape(1, -1)
@@ -321,12 +344,6 @@ class FlowSDEHead(nn.Module):
         rtc = prefix is not None
         prefix_full = prefix_mask = time_of = None
         if rtc:
-            if not self.force_ode:
-                raise RuntimeError(
-                    "prefix conditioning on the stochastic sampler is not built yet: "
-                    "the masked transition density lands with the scorer "
-                    "(docs/RTC_RL.md section 6, phase 2). Eval/deploy (force_ode) only."
-                )
             p = torch.as_tensor(np.asarray(prefix, np.float64),
                                 device=dev).reshape(-1, self.n_dims)
             d = p.shape[0]
@@ -357,12 +374,19 @@ class FlowSDEHead(nn.Module):
             for k in range(K):
                 t_k = torch.full((1,), 1.0 + k * dt, device=dev)
                 if k in pos_set:
-                    mu, std = _sde_transition(self.codec.decoder, ctx, x, t_k, dt, cfg)
+                    mu, std = _sde_transition(self.codec.decoder, ctx, x, t_k, dt, cfg,
+                                              prefix_mask=prefix_mask)
                     eps = torch.randn(mu.shape, device=dev, dtype=torch.float32,
                                       generator=self._gen)
                     x = mu + std * eps
+                    if rtc:
+                        # Re-pin BEFORE the density: the stored block must carry the
+                        # exact committed rows, and the density is over postfix
+                        # elements of exactly the stored block.
+                        x = pin_prefix(x, prefix_full, prefix_mask)
                     w = _position_weight(torch.tensor([k], device=dev), cfg, K)
-                    logprob = logprob + w * _gaussian_logprob(x, mu, std)
+                    logprob = logprob + w * _gaussian_logprob(x, mu, std,
+                                                              prefix_mask=prefix_mask)
                 else:
                     v = self.codec.decoder(ctx, x, time_of(t_k) if rtc else t_k)
                     x = x + dt * v
@@ -400,7 +424,9 @@ class FlowSDEHead(nn.Module):
 
     # -- training: score stored transitions under current theta ------------------------
     def chain_log_prob_batch(self, h: torch.Tensor, chains: torch.Tensor,
-                             positions: torch.Tensor) -> torch.Tensor:
+                             positions: torch.Tensor,
+                             prefix_actions: Optional[torch.Tensor] = None,
+                             prefix_len: Optional[torch.Tensor] = None) -> torch.Tensor:
         """`(B, S)` summed log-probs, differentiable, float32.
 
         `h` is `(B, S, ctx)` (the `policy_stats["h"]` of a training forward), `chains` is
@@ -411,6 +437,14 @@ class FlowSDEHead(nn.Module):
         acted, which changes the estimator (docs/FLOW_SDE_RL.md, storage). One decoder call
         per stochastic slot scores the whole batch: the decoder takes vector time, so rows
         with different positions batch together.
+
+        RTC (docs/RTC_RL.md sections 2 and 5): `prefix_actions` is `(B, S, d_max, 3)`
+        PHYSICAL differentials, zero-padded; `prefix_len` is `(B, S)`. Both come from
+        the rollout buffer, NEVER re-derived from poses -- the 1/sigma^2-amplified
+        density does not forgive a compose/decompose round trip. The scorer rebuilds
+        the mask, reconditions `_sde_transition` identically to the sampler, and
+        ASSERTS the stored chain's committed rows equal the stored prefix (a broken
+        pin would otherwise score a chain that never acted).
         """
         B, S = chains.shape[0], chains.shape[1]
         n, dt = self.sde.n, -1.0 / self.K
@@ -418,6 +452,28 @@ class FlowSDEHead(nn.Module):
         ctx = h.reshape(rows, -1).float()
         ch = chains.reshape(rows, self.K + 1, self.n_ticks, self.n_dims).float()
         pos = positions.reshape(rows, n).long()
+
+        mask = None
+        if prefix_actions is not None:
+            if prefix_len is None:
+                raise ValueError("prefix_actions without prefix_len")
+            plen = prefix_len.reshape(rows).long()
+            # prefix_mask_from_len raises on d >= n_ticks -- the loud guard, kept: a
+            # violating stored d means the buffer is corrupt, not that scoring should
+            # improvise a mask.
+            mask = prefix_mask_from_len(plen, self.n_ticks)
+            pa = prefix_actions.reshape(rows, -1, self.n_dims)
+            scaled = self.codec.scale(pa.double()).float()
+            pf_full = torch.zeros(rows, self.n_ticks, self.n_dims,
+                                  device=ch.device, dtype=torch.float32)
+            pf_full[:, : scaled.shape[1]] = scaled
+            drift = ((ch[:, 0] - pf_full).abs() * mask[..., None].float()).max()
+            if float(drift) > 1e-4:
+                raise RuntimeError(
+                    f"stored chain's committed rows drift {float(drift):.2e} from the "
+                    "stored prefix_actions: the sampler's pin is broken or the buffer "
+                    "was corrupted -- scoring would rate a chain that never acted"
+                )
 
         with _decoder_eval(self.codec.decoder):
             total = torch.zeros(rows, device=ctx.device, dtype=torch.float32)
@@ -427,9 +483,10 @@ class FlowSDEHead(nn.Module):
                 idx = torch.arange(rows, device=ctx.device)
                 x_k = ch[idx, k]                                         # (rows, T, 3)
                 x_next = ch[idx, k + 1]
-                mu, std = _sde_transition(self.codec.decoder, ctx, x_k, t_k, dt, self.sde)
+                mu, std = _sde_transition(self.codec.decoder, ctx, x_k, t_k, dt,
+                                          self.sde, prefix_mask=mask)
                 w = _position_weight(k, self.sde, self.K)
-                total = total + w * _gaussian_logprob(x_next, mu, std)
+                total = total + w * _gaussian_logprob(x_next, mu, std, prefix_mask=mask)
         return total.reshape(B, S)
 
     # -- run-log honesty ---------------------------------------------------------------
