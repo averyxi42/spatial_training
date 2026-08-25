@@ -69,6 +69,16 @@ sim:
 
 rollout:
   max_steps: 175
+  # BLIND-EPISODE REJECTION (2026-08-25). A navmesh-blind step carries no progress
+  # signal, and 82.8% of affected episodes never recover -- measured at 4.59% of
+  # episodes / 1.10% of steps, concentrated in a few scenes (43% of one scene's).
+  # With this on the episode is DISCARDED and the collector runs a replacement, so no
+  # blind row ever reaches collation. Escapes are carved out by default (99.1% of them
+  # are blind -- a median 2-row tail as the robot falls -- and rejecting them would
+  # delete the escape population and every escape_penalty with it).
+  # TRAINING ONLY by construction: run_eval_cycle passes respect_rejections=False, so
+  # the pinned held-out 26 keep their denominator and stay comparable to the baseline.
+  reject_blind_episodes: true
   # Byte-identical to the SFT corpus format; the leading assistant echo in the turn
   # template is load-bearing (see flow_sde_objectnav_v3.yaml's header for the numbers).
   convo_start_template:
