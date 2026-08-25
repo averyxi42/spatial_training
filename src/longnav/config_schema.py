@@ -234,6 +234,25 @@ class RolloutConfig:
     # an env that exposes begin_interval (the continuous ObjectNav actor with rtc enabled) --
     # enabling it against any other env fails loudly.
     rtc_overlap: bool = False
+    # -- blind-episode rejection (worker-side criterion; the COLLECTOR decides whether
+    # to honour it, per call: training does, eval does not) --------------------------
+    # A step whose geodesic is non-finite ("blind") carries no progress signal: the
+    # reward is slack-only and the finite-hold settles the accumulated delta on the
+    # recovery step. Measured over 74,692 training episodes: 1.10% of steps, 4.59% of
+    # episodes, and 82.8% of affected episodes never recover -- concentrated in a few
+    # scenes (43% of one scene's episodes). With this on, an affected episode is
+    # DISCARDED and the collector runs a replacement, so no blind row ever reaches
+    # collation. OFF by default: a run that does not ask for it behaves exactly as
+    # before.
+    reject_blind_episodes: bool = False
+    # The carve-out, ON by default. A physically-terminated episode (the fall detector
+    # fired) goes blind BECAUSE it is falling out of the world: measured, 99.1% of
+    # escapes are blind, with a median 2-step blind tail against 25 for other blind
+    # episodes. Rejecting them would delete the entire escape population and with it
+    # every `escape_penalty` the shaping applies -- silently, while the knob still sat
+    # in the YAML. Keep them: they are correctly labelled and correctly penalised, and
+    # their blindness is the symptom of a real terminal event, not a measurement gap.
+    reject_blind_keep_physical_terminal: bool = True
 
 
 # --- Experiment housekeeping ---

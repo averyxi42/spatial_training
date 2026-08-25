@@ -105,6 +105,27 @@ class EpisodeRolloutMixin:
              stacked["rewards"] = stacked["rewards"].astype(np.float32)    
         return stacked
     
+    def _episode_rejected(self, final_info) -> bool:
+        """Is this episode unusable for training? (see RolloutConfig.reject_blind_episodes)
+
+        Verdict only -- the collector decides whether to act on it. Returns False
+        whenever the feature is off, so a run that does not configure rejection is
+        byte-identical to one from before this existed. `blind_total` is the env's
+        CUMULATIVE count (a recovered episode still reports its blindness); an env that
+        does not emit it can never be rejected, which is the right default for the
+        dummy/discrete envs that have no such notion.
+        """
+        cfg = self.rollout_config
+        if not cfg.get('reject_blind_episodes'):
+            return False
+        if int(final_info.get('blind_total', 0) or 0) <= 0:
+            return False
+        if cfg.get('reject_blind_keep_physical_terminal', True):
+            # The fall detector fired: blindness here is the fall, not a metric gap.
+            if bool(final_info.get('escaped')) or bool(final_info.get('tipped_over')):
+                return False
+        return True
+
     def run_episode(self,env_handle, initial_state_ref,collect_trajectory=False,compute_value=False):
         """
         Returns:
@@ -389,7 +410,14 @@ class EpisodeRolloutMixin:
                 # Convert list of dicts -> Dict of Numpy Arrays (Zero-Copy Friendly)
             final_trajectory = self._pack_trajectory(trajectory_buffer) if collect_trajectory else None
             final_info = state_dict['info'] | {"steps":step_count, "instr_or_goal":instr_or_goal}
-            # Return Clean Tuple (No Actor Handles here)
+            # THE REJECTION VERDICT IS THE WORKER'S. What counts as unusable is a
+            # property of the episode, which only the worker has seen; whether to ACT
+            # on the verdict is the collector's per-call decision (train honours it,
+            # eval does not). Reported in `final_info` because that dict is what
+            # `RLActor.run_episode` already returns to the collector -- three outcomes
+            # stay distinguishable there: exhausted sentinel (is_exhausted, info None),
+            # failure (info None, loud), rejection (info present, `rejected` true).
+            final_info["rejected"] = self._episode_rejected(final_info)
             return state_dict['is_exhausted'], final_info, final_trajectory
         
         except Exception as e:
@@ -793,12 +821,32 @@ def collect_rollouts(
     shard_iterator: Iterator[list[str]],
     target_episodes: int = float('inf'),
     postprocess_kwargs = {"return_inputs":True, "eval":False},
-    wandb_logger = None
+    wandb_logger = None,
+    respect_rejections: bool = False,
+    max_dispatch_factor: float = 3.0,
 ) -> tuple[list,list,list]:
     """
     Orchestrates the RL collection pipeline.
 
     returns: trajectory buffer, result list, log list, indexed by dispatch_id
+
+    `respect_rejections` -- honour the worker's per-episode `rejected` verdict: a
+    rejected episode is DISCARDED (no postprocess forward, never buffered, never
+    collated) and the scheduler runs a replacement, so the caller still receives
+    exactly `target_episodes` clean episodes. The criterion itself is the worker's
+    (see `EpisodeRolloutMixin._episode_rejected`); this flag only decides whether the
+    verdict is acted on, which is why it is an ARGUMENT and not config: training
+    honours rejections, eval must not (a pinned set with a variable denominator stops
+    being comparable). Default False keeps every existing caller on its current path.
+
+    `max_dispatch_factor` bounds the retries: a shard whose episodes are (nearly) all
+    rejectable would otherwise spin forever. Exceeding `factor * target` dispatches
+    raises with the observed rejection rate.
+
+    NOTE: rejections are NOT failures. A crashed episode still takes the loud
+    `EPISODE_FAILED` path and is padded upstream -- fault tolerance is deliberately
+    absent so faults stay visible. Rejection is a data-quality filter with its own
+    counter and its own isolated log directory.
     """
 
     # --- 1. Initialize Pools ---
@@ -820,6 +868,8 @@ def collect_rollouts(
     result_dict = {}
     log_dict = {}
     iterator_exhausted = False
+    rejected_count = 0
+    rejected_by_scene: dict = {}
 
     last_dispatch_time = time.time()
     # --- 3. Bootstrap: Initial Sharding & Resets ---
@@ -865,6 +915,21 @@ def collect_rollouts(
             active_episodes[ep_ref] = dispatch_counter,vlm,sim
             dispatch_counter +=1
             total_potential +=1
+            # RETRY BOUND. Scheduling is this function's job, so the cap lives here: a
+            # shard whose episodes are (nearly) all rejectable would otherwise spin
+            # forever, looking exactly like a hang. Only reachable when rejections are
+            # honoured -- without them dispatch_counter can never exceed the target.
+            if (respect_rejections and target_episodes != float('inf')
+                    and dispatch_counter > max_dispatch_factor * target_episodes):
+                raise RuntimeError(
+                    f"rollout collection gave up: {dispatch_counter} dispatches for "
+                    f"{target_episodes} requested episodes ({rejected_count} rejected, "
+                    f"{100*rejected_count/max(dispatch_counter,1):.0f}%). Worst scenes: "
+                    f"{sorted(rejected_by_scene.items(), key=lambda kv: -kv[1])[:3]}. "
+                    "Either the rejection criterion is too broad for this pool or the "
+                    "pool is pathological -- do not raise max_dispatch_factor without "
+                    "looking at dump/<run>/rollout/_rejected/."
+                )
 
 
         # B. Wait for Events
@@ -912,6 +977,23 @@ def collect_rollouts(
                 dispatch_id, vlm, sim =  active_episodes.pop(ref)
                 # Unpack results
                 is_exhausted, result = ray.get(ref)
+
+                # --- REJECTION: discard and replace -------------------------------
+                # Acted on HERE, before the postprocess dispatch, so a rejected
+                # episode costs no log-prob forward. The vlm goes straight back to
+                # the idle pool and the sim still flushes -- to the isolated
+                # `_rejected` root -- and resets. `potential` (below) drops by one, so
+                # the scheduler launches a replacement on its own: no padding, no
+                # gaps in what the caller receives.
+                if respect_rejections and result is not None and result.get("rejected"):
+                    rejected_count += 1
+                    scene = str(result.get("scene_id") or "unknown")
+                    rejected_by_scene[scene] = rejected_by_scene.get(scene, 0) + 1
+                    idle_vlms.append(vlm)
+                    log_ref = sim.flush_logs_to_disk.remote(rejected=True)
+                    pending_logs[log_ref] = sim, None, is_exhausted
+                    continue
+
                 result_dict[dispatch_id] = result
 
                 # send vlm and sim to post episode processing
@@ -932,7 +1014,8 @@ def collect_rollouts(
             # --- CASE 4: Sim Log Flush Finished
             elif ref in pending_logs:
                 sim,dispatch_id,is_exhausted = pending_logs.pop(ref)
-                log_dict[dispatch_id] = ref # save the path to the log
+                if dispatch_id is not None:      # None == a rejected episode's flush
+                    log_dict[dispatch_id] = ref # save the path to the log
                 # send the sim to reset/reshard so it can start working again asap
                 try:
                     # print("logging done",end="")
@@ -947,11 +1030,21 @@ def collect_rollouts(
                     # No more work. Retire the Habitat worker.
                     # iterator_exhausted = True
                     pass
+    # ALIGNMENT: index the three lists by the SURVIVING dispatch ids, not by
+    # range(len). With rejections the ids develop gaps, and `range(num_rollouts)` would
+    # pair trajectory id 5 with result id 3 -- a silent violation of the traj/inputs
+    # invariant that surfaces as a one-sided ppo_kl blowup indistinguishable from
+    # off-policy drift. Identical to the old expression when ids are contiguous.
+    kept_ids = sorted(trajectory_ids)
     rollouts = [t for _, t in sorted(zip(trajectory_ids, trajectory_buffer))]
-    log_dict |={v[1]:k for k,v in pending_logs.items()}
-    num_rollouts = len(rollouts)
-    result_list = [result_dict[i] for i in range(num_rollouts)]
-    log_list = [log_dict[i] for i in range(num_rollouts)]
+    log_dict |={v[1]:k for k,v in pending_logs.items() if v[1] is not None}
+    result_list = [result_dict[i] for i in kept_ids]
+    log_list = [log_dict.get(i) for i in kept_ids]
+    if rejected_count:
+        top = sorted(rejected_by_scene.items(), key=lambda kv: -kv[1])[:3]
+        print(f"[rollout] rejected {rejected_count} episode(s) "
+              f"({100*rejected_count/max(dispatch_counter,1):.1f}% of dispatches); "
+              f"worst scenes: {[(s.split('-')[-1][:14], n) for s, n in top]}")
     return ray.get(rollouts), result_list, log_list
 
 

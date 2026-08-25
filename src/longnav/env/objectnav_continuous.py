@@ -292,7 +292,7 @@ class ContinuousObjectNavEnvActor:
         """Prefix for wandb metric keys of subsequent episodes ("" = training stream)."""
         self._log_prefix = str(prefix or "")
 
-    def flush_logs_to_disk(self, clear_steps: bool = True):
+    def flush_logs_to_disk(self, clear_steps: bool = True, rejected: bool = False):
         """Write this episode's video, summary and wandb payload; ship to the logger actor.
 
         Mirrors the discrete actor's contract -- `vid/episode_video`, `img/thumbnail` and
@@ -314,7 +314,14 @@ class ContinuousObjectNavEnvActor:
         first, last = infos[0], infos[-1]
         ep_label = str(first.get("episode_label", f"ep_{_time.time():.0f}"))
         scene = str(first.get("scene_id", "unknown_scene")).replace("/", "_")
-        save_dir = os.path.join(self.logging_output_dir, scene,
+        # REJECTED EPISODES GO SOMEWHERE ELSE ENTIRELY. A `rejected: true` field in the
+        # normal stream would be correct and would still be forgotten by the next person
+        # writing an analysis; a separate root cannot be mixed in by omission. Videos are
+        # unaffected (see below) -- they are for looking at, and a rejected episode is
+        # often exactly the one worth watching.
+        text_root = (os.path.join(self.logging_output_dir, "_rejected")
+                     if rejected else self.logging_output_dir)
+        save_dir = os.path.join(text_root, scene,
                                 f"{ep_label}.{os.getpid()}@{_time.time():.0f}")
         os.makedirs(save_dir, exist_ok=True)
 
@@ -361,8 +368,10 @@ class ContinuousObjectNavEnvActor:
             _json.dump(_denan(seq), f, default=_ser)
         with open(os.path.join(save_dir, "summary.json"), "w") as f:
             _json.dump(_denan(episode_logs), f, default=_ser, indent=2)
-        with open(os.path.join(self.logging_output_dir, f"results_{os.getpid()}"), "a") as f:
-            f.write(_json.dumps(episode_logs, default=_ser) + "\n")
+        # Same isolation for the per-worker jsonl: a rejected episode never lands in the
+        # results stream every downstream aggregation globs.
+        with open(os.path.join(text_root, f"results_{os.getpid()}"), "a") as f:
+            f.write(_json.dumps(_denan(episode_logs), default=_ser) + "\n")
         if clear_steps:
             self._cache = {"rgb": [], "info": [], "reward": []}
             self._video_frames, self._video_meta = [], []
@@ -370,9 +379,13 @@ class ContinuousObjectNavEnvActor:
             import ray
             try:
                 # Media namespaces (vid/, img/) must stay as-is for the logger's
-                # detection; everything else takes the routing prefix.
-                _row = {k if k.startswith(("vid/", "img/")) else self._log_prefix + k: v
-                        for k, v in episode_logs.items()} if self._log_prefix else episode_logs
+                # detection; everything else takes the routing prefix. A rejected
+                # episode routes under `rejected/` so its scalars never average into
+                # the run's headline rollout statistics -- the wandb-side twin of the
+                # `_rejected` directory. Its video still ships, unprefixed.
+                _prefix = ("rejected/" if rejected else "") + self._log_prefix
+                _row = {k if k.startswith(("vid/", "img/")) else _prefix + k: v
+                        for k, v in episode_logs.items()} if _prefix else episode_logs
                 ray.get(self.logger_actor.log_row.remote(row=_row), timeout=1.0)
             except Exception as e:
                 print(f"[objectnav_continuous] logger ack issue: {e}")
@@ -538,6 +551,12 @@ class ContinuousObjectNavEnvActor:
         self._fall_run = 0
         self._max_fall_run = 0
         self._blind_run = 0
+        # CUMULATIVE blind steps this episode, distinct from `_blind_run` (the CURRENT
+        # consecutive run, which resets to 0 the moment the metric returns). An episode
+        # that went blind and recovered reports blind_run 0 at its end, so a consumer
+        # deciding "did this episode ever lose the metric" needs this counter, not that
+        # one. Read by the rollout worker's blind-episode rejection criterion.
+        self._blind_total = 0
         self._video_frames, self._video_meta, self._video_tick = [], [], 0
         if self._video_capture:
             self._video_frames.append(self._encode_frame(rgb))
@@ -707,6 +726,7 @@ class ContinuousObjectNavEnvActor:
             self._blind_run = 0
         else:
             self._blind_run += 1
+            self._blind_total += 1
 
         if np.isfinite(geodesic) and geodesic < self._min_geodesic:
             self._min_geodesic = float(geodesic)
@@ -773,6 +793,9 @@ class ContinuousObjectNavEnvActor:
             # Blind-run length in policy steps, and whether it ended the episode. Emitted
             # every step so the screening gap is visible as a rate, not just at the end.
             "blind_run": int(self._blind_run),
+            # Cumulative, so a recovered episode still reports its blindness. The
+            # rejection criterion reads this; emitted EVERY step for column constancy.
+            "blind_total": int(self._blind_total),
             "reward_lost": reward_lost,
             "pos_rots": self._pos_rots(),
             **info_extra,

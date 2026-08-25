@@ -129,7 +129,11 @@ def run_rollout_cycle(
 
     Returns: (traj_batch, model_inputs, values, distances, log_list)
     """
-    rollout_list, result_list, log_list = collect_rollouts(sims, trainers, shard_iter, n_rollout)
+    # TRAINING honours the workers' rejection verdicts: a rejected episode is replaced,
+    # so the batch is n_rollout clean episodes and no blind row reaches collation. Eval
+    # (run_eval_cycle) passes False -- see there.
+    rollout_list, result_list, log_list = collect_rollouts(
+        sims, trainers, shard_iter, n_rollout, respect_rejections=True)
 
     # ALIGNMENT INVARIANT: traj_batch row i and model_inputs[i] must describe the SAME
     # episode -- stored actions/old_log_prob are scored against those cached embeds. A
@@ -206,7 +210,12 @@ def run_eval_cycle(sims, trainers, eval_parts, total, wandb_actor, global_cycle,
     try:
         _, result_list, _ = collect_rollouts(
             sims, trainers, iter([]), total,
-            postprocess_kwargs={"return_inputs": False, "eval": True})
+            postprocess_kwargs={"return_inputs": False, "eval": True},
+            # NEVER on eval: the pinned set defines the denominator, and silently
+            # replacing episodes would make the number describe a different (easier)
+            # population than the one the set names. Blind episodes are part of what
+            # is being measured.
+            respect_rejections=False)
     finally:
         if ode:
             ray.get([t.set_ode_sampling.remote(False) for t in trainers])
