@@ -266,6 +266,57 @@ on scan-like chunks against 0.067 on the rest, **2.3x worse**. The `theta` cell 
 loosest exactly where the mode matters, which bears on the sub-cell `z_0` property of
 section 3.2 -- the bound it provides is weakest for scans.
 
+### Frame convention: pose space beats body-frame differentials (2026-08-27)
+
+The shipped head regresses per-tick BODY-FRAME differentials (`decompose_chunk`, one
+`action_scales` triple) while the tokenizer, the obedience gauge and the REWARD all live
+in anchor-relative CUMULATIVE pose space. A/B in the standalone prototype -- same
+tokenizer, same codes, same architecture, same schedule, only the regression target
+differs (`--action-space pose`, per-tick scales since pose magnitude ranges 19.1x across
+ticks):
+
+| | pose, 6 ep | differential, 12 ep | differential, 6 ep |
+| --- | --- | --- | --- |
+| obey both | **0.677** | 0.672 | 0.643 |
+| obey theta | **0.801** | 0.792 | 0.788 |
+| `z_0` spread theta | **0.0461** | 0.0509 | 0.0519 |
+| `z_0` spread xy | **0.0293** | 0.0307 | 0.0303 |
+| gen RMSE xy / theta | **0.0688 / 0.0878** | 0.0710 / 0.0929 | 0.0716 / 0.0931 |
+
+Pose reaches in 6 epochs what differentials need 12 to reach, and every metric moves the
+same way. The endpoint margin is small (0.677 vs 0.672); the striking number is the ~2x
+training-efficiency gap.
+
+**Why**, measured rather than argued. Perturbing by equal relative amounts in each space
+and reading terminal position error:
+
+| perturbation | via differentials | direct in poses | amplification |
+| --- | --- | --- | --- |
+| independent per tick | 0.0089 m | 0.0198 m | **0.45x** |
+| correlated `dx` bias | 0.0276 m | 0.0172 m | **1.61x** |
+| correlated `dtheta` bias | 0.0134 m | 0.0000 m | poses immune |
+
+Independent error accumulates as sqrt(T) while signal accumulates as T, so composition
+IMPROVES terminal SNR -- the accumulation-error worry is backwards for that case. The
+concern is correct for CORRELATED error, and a head emitting 20 ticks from one shared
+forward pass is a plausible source of it: a persistent heading bias rotates everything
+downstream, while in pose space a theta error has no positional consequence at all.
+
+**Arguments for differentials that did NOT survive.** Scale stationarity is real (19.1x
+range) but fixed by per-tick scales, an implementation detail. RTC anchor-freedom
+dissolves: the committed prefix in pose space is `compose(commanded diffs)` from zero,
+well-defined at the new anchor and free of tracking error because it uses commanded and
+not achieved motion. The control-space prior is real but weak -- `|dy|/|dx| = 0.146`,
+`dy` std 0.011 against `dx` 0.036 -- and the expected over-dispersion from losing it did
+not appear; the head learns the constraint from data.
+
+**Not a reason to change the shipped head.** That is a breaking change to
+`action_scales`, the RTC prefix path, the flow-SDE chain, the incoming-motion slot and
+every existing checkpoint, for a few points of a prototype metric. The finding is that
+pose space is the right default FOR THIS DESIGN, decided while the choice is still free.
+Caveat: measured without `r(h)`, and pose's advantage may narrow once a continuous
+branch supplies the geometry differentials encode implicitly.
+
 Open, and the reason this section is incomplete:
 
 * **Is the ambiguity chunk-expressible at all?** Partially answered: within-chunk
