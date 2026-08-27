@@ -41,6 +41,7 @@ fine and prints plausible numbers.
 """
 import argparse
 import json
+import math
 import sys
 import time as _time
 from pathlib import Path
@@ -99,6 +100,30 @@ class CodeContext(nn.Module):
             parts.append(torch.zeros(c_xy.shape[0], self.reserved * self.d_model,
                                      device=c_xy.device, dtype=parts[0].dtype))
         return torch.cat(parts, dim=-1)
+
+
+#: `compose_chunk` wraps cumulative heading into [-pi, pi]. Nothing downstream can tell
+#: a wrapped angle from an unwrapped one, so a chunk that crosses pi is silently folded
+#: and re-encodes to a WRONG code with no error raised. In this configuration that is
+#: unreachable -- `w_max_radps` 2.0 x `chunk_duration` 0.8 = 1.6 rad, a 1.96x margin,
+#: and 48k generated chunks peak at 1.664 -- but the margin is a property of THIS robot
+#: and THIS chunk length, not of the design. At 4 rad/s, or at H = 40 ticks, it is gone.
+#: Assert rather than re-represent: a unit-vector (cos, sin) heading would remove the
+#: discontinuity by construction, but it costs a refit of both models to defend against
+#: a state the robot cannot reach. This check costs nothing and fails loudly instead.
+THETA_WRAP_GUARD = 0.9 * math.pi
+
+
+def assert_no_wrap(chunk, where):
+    """`chunk`: (..., T, 3) anchor-relative poses. Raises before a fold can go unnoticed."""
+    m = float(chunk[..., 2].abs().max())
+    if m > THETA_WRAP_GUARD:
+        raise ValueError(
+            f"{where}: |theta| reached {m:.3f} rad against a wrap guard of "
+            f"{THETA_WRAP_GUARD:.3f} (pi = {math.pi:.3f}). compose_chunk folds past pi "
+            f"and the fold is invisible downstream -- check w_max_radps * chunk_duration "
+            f"against pi before trusting any code assigned here."
+        )
 
 
 def encode_corpus(tok, chunks, xy_scale, th_scale, device, batch=8192):
@@ -231,6 +256,7 @@ def main():
             actions, cx, ct, true_chunk = batch_of(sl)
             mses.append(float(flow_loss(actions, cx, ct)) * len(sl))
             gen = codec.denormalize(ctx(cx, ct)).float()
+            assert_no_wrap(gen, "generated chunk")
             err = gen - true_chunk
             e_xy.append(err[..., :2].pow(2).mean(dim=(1, 2)).cpu())
             e_th.append(err[..., 2].pow(2).mean(dim=1).cpu())
