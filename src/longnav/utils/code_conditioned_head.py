@@ -118,32 +118,81 @@ class CodeContextMixer(nn.Module):
 
 
 class CodePolicyHead(nn.Module):
-    """`p(c | h)` as one categorical over the `n_xy * n_theta` product."""
+    """`p(c | h)` as one categorical over the `n_xy * n_theta` product.
 
-    def __init__(self, n_xy: int, n_theta: int, in_dim: int, d_factor: int = 256):
+    `kind="mlp"` (THE DEFAULT) is a plain two-layer MLP on `h` with a free 1600-way
+    output layer. `kind="compositional"` builds the output table from per-factor
+    embeddings through an MLP.
+
+    WHY MLP IS THE DEFAULT. The compositional table was carried over from the separate
+    question of how to combine the two codes as CONDITIONING inputs, where keeping the
+    factors legible is genuinely useful. On the OUTPUT side the only argument I made for
+    it -- that an MLP over the factors avoids the independence `log p(i,j) = f(i)+g(j)`
+    -- rules out ADDITIVE compositional logits and says nothing against a free 1600-way
+    layer, which avoids that independence trivially since every logit is its own
+    parameter. What remained was parameter sharing across codes that share a factor: a
+    bias/variance argument, not an expressiveness one, and it was never weighed against
+    its cost. The cost is a ceiling: 1600x1024 = 1.6M table entries generated from ~415k
+    parameters (80 factor vectors through a 512->256->1024 MLP), so achievable tables lie
+    on a roughly 4x-constrained manifold and two codes sharing `c_xy` cannot have
+    independent rows. The MLP head trades slower early learning for no ceiling.
+    """
+
+    KINDS = ("mlp", "compositional")
+
+    def __init__(self, n_xy: int, n_theta: int, in_dim: int, kind: str = "mlp",
+                 hidden: Optional[int] = None, d_factor: int = 256):
         super().__init__()
+        if kind not in self.KINDS:
+            raise ValueError(f"kind must be one of {self.KINDS}, got {kind!r}")
+        self.kind = kind
         self.n_xy, self.n_theta = int(n_xy), int(n_theta)
         self.vocab = self.n_xy * self.n_theta
-        self.e_xy = nn.Embedding(n_xy, d_factor)
-        self.e_theta = nn.Embedding(n_theta, d_factor)
-        nn.init.normal_(self.e_xy.weight, std=0.02)
-        nn.init.normal_(self.e_theta.weight, std=0.02)
-        self.table_mlp = nn.Sequential(
-            nn.Linear(2 * d_factor, d_factor), nn.SiLU(), nn.Linear(d_factor, in_dim))
+        # Kept for BOTH kinds so the only difference is the readout, not the input path.
         self.ln = nn.LayerNorm(in_dim)
-        grid_i = torch.arange(self.vocab) // self.n_theta
-        grid_j = torch.arange(self.vocab) % self.n_theta
-        self.register_buffer("grid_i", grid_i)
-        self.register_buffer("grid_j", grid_j)
+        # PRIOR-INITIALISED per-code bias. Fitting a 1600-way skewed prior by gradient
+        # descent is intrinsically slow at any sane LR -- the log-marginal spans ~7 nats
+        # and Adam moves a parameter by at most `lr` per step -- so a TRAINABLE bias is
+        # worth almost nothing while a prior-INITIALISED one is worth ~2.5 nats at step 0
+        # (measured H(c) = 4.838 against ln(1600) = 7.378). The value is in the starting
+        # point, not the parameter.
+        self.bias = nn.Parameter(torch.zeros(self.vocab))
+        if kind == "mlp":
+            # NO RANK BOTTLENECK. `logits = W2 . act(W1 h)` has rank at most the hidden
+            # width, so a hidden narrower than `vocab` confines the 1600 logits to a
+            # lower-dimensional subspace -- the same ceiling the compositional table had,
+            # relocated. Shallow is fine; thin is not. Default is wider than BOTH the
+            # input and the vocabulary.
+            h = int(hidden or max(2 * in_dim, self.vocab))
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, h), nn.SiLU(), nn.Linear(h, self.vocab))
+        else:
+            self.e_xy = nn.Embedding(n_xy, d_factor)
+            self.e_theta = nn.Embedding(n_theta, d_factor)
+            nn.init.normal_(self.e_xy.weight, std=0.02)
+            nn.init.normal_(self.e_theta.weight, std=0.02)
+            self.table_mlp = nn.Sequential(
+                nn.Linear(2 * d_factor, d_factor), nn.SiLU(),
+                nn.Linear(d_factor, in_dim))
+            self.register_buffer("grid_i", torch.arange(self.vocab) // self.n_theta)
+            self.register_buffer("grid_j", torch.arange(self.vocab) % self.n_theta)
 
     def table(self) -> torch.Tensor:
-        """(V, in_dim) output embeddings, rebuilt per forward -- V is small and the
-        factors must stay tied so a rare combination inherits both factors' training."""
+        """(V, in_dim) output embeddings. `compositional` only."""
         return self.table_mlp(
             torch.cat([self.e_xy(self.grid_i), self.e_theta(self.grid_j)], dim=-1))
 
     def logits(self, h: torch.Tensor) -> torch.Tensor:
-        return self.ln(h.float()) @ self.table().t()
+        z = self.ln(h.float())
+        raw = self.net(z) if self.kind == "mlp" else z @ self.table().t()
+        return raw + self.bias
+
+    @torch.no_grad()
+    def init_prior(self, log_prior: torch.Tensor) -> None:
+        """Set the bias to the corpus log-marginal over the joint code."""
+        if log_prior.shape != (self.vocab,):
+            raise ValueError(f"log_prior must be ({self.vocab},), got {tuple(log_prior.shape)}")
+        self.bias.copy_(log_prior.to(self.bias.dtype, copy=True))
 
     def joint_index(self, c_xy: torch.Tensor, c_theta: torch.Tensor) -> torch.Tensor:
         return c_xy * self.n_theta + c_theta
@@ -171,6 +220,18 @@ class TurnFlowActionRegressorWithCode(TurnFlowActionRegressor):
     # attribute satisfies normal lookup FIRST -- permanently shadowing the real module
     # with None. Only the plain float is safe to declare here.
     code_loss_weight: float = 1.0
+
+    @property
+    def code_mixer(self):
+        return getattr(self.normalizer, "code_mixer", None)
+
+    @property
+    def code_head(self):
+        return getattr(self.normalizer, "code_head", None)
+
+    @property
+    def tokenizer(self):
+        return getattr(self.normalizer, "tokenizer", None)
 
     # -- the two seams -----------------------------------------------------------------
     def _decoder_context(self, context: torch.Tensor,
@@ -246,13 +307,46 @@ class TurnFlowActionRegressorWithCode(TurnFlowActionRegressor):
 
 
 class CodeSFTTrainer(FlowMatchingSFTTrainer):
-    """`FlowMatchingSFTTrainer` plus the code head's statistics.
+    """`FlowMatchingSFTTrainer` plus the code head's statistics and its own clip group.
 
     A subclass rather than an edit: the parent accumulates an explicit key allowlist, so
     extending it here leaves every existing SFT run byte-identical.
     """
 
+    #: The code head's gradients are clipped SEPARATELY, at this norm. Measured on the
+    #: first attempt: `code_head/grad_frac` 0.34-0.91 and a global grad_norm of 6.19
+    #: against max_grad_norm 1.0, clipped on 100% of steps, versus 0.654 and 6% for the
+    #: same recipe without this head. One shared clip budget means the code CE decides
+    #: how large a step the warm-started decoder, the readout and the LoRA are allowed --
+    #: they were moving 5-6x slower than the recipe was tuned for. Splitting the group
+    #: fixes that without touching the loss weighting.
+    code_max_grad_norm: float = 1.0
+
+    def _install_split_clip(self):
+        if getattr(self, "_split_clip_done", False):
+            return
+        acc = getattr(self, "accelerator", None)
+        model = self.model
+        code_mods = [getattr(model, n, None) for n in ("code_head", "code_mixer")]
+        code_params = [q for m in code_mods if m is not None for q in m.parameters()
+                       if q.requires_grad]
+        if acc is None or not code_params:
+            return
+        self._split_clip_done = True
+        original, ids = acc.clip_grad_norm_, {id(q) for q in code_params}
+        cap = float(self.code_max_grad_norm)
+
+        def split_clip(parameters, max_norm, norm_type=2.0):
+            rest = [q for q in parameters if id(q) not in ids]
+            torch.nn.utils.clip_grad_norm_(code_params, cap, norm_type)
+            # The RETURNED norm is the rest-of-model norm, so `train/grad_norm` stays
+            # comparable with runs that have no code head.
+            return original(rest, max_norm, norm_type)
+
+        acc.clip_grad_norm_ = split_clip
+
     def _accumulate(self, outputs: Dict[str, torch.Tensor]):
+        self._install_split_clip()
         super()._accumulate(outputs)
         for key in CODE_METRIC_KEYS:
             if key not in outputs:
@@ -311,7 +405,9 @@ class CodeSFTTrainer(FlowMatchingSFTTrainer):
 
 def attach_code_heads(model: TurnFlowActionRegressor, tokenizer: FrozenChunkTokenizer,
                       code_loss_weight: float = 1.0, code_d_factor: int = 256,
-                      code_r_hidden: Optional[int] = None
+                      code_r_hidden: Optional[int] = None, code_head_kind: str = "mlp",
+                      code_head_hidden: Optional[int] = None,
+                      code_log_prior: Optional[torch.Tensor] = None
                       ) -> "TurnFlowActionRegressorWithCode":
     """Promote a normally-built flow head into the `(c, r(h))`-conditioned one.
 
@@ -324,16 +420,78 @@ def attach_code_heads(model: TurnFlowActionRegressor, tokenizer: FrozenChunkToke
     code embeddings, `r`, and the code head -- and `r` is zero-initialised, so the model
     at step 0 produces exactly what a `c`-only head with tokens 4-7 zeroed produces.
     """
-    dec = model.decoder
+    dec, codec = model.decoder, model.normalizer
     model.__class__ = TurnFlowActionRegressorWithCode
-    model.tokenizer = tokenizer
-    model.code_mixer = CodeContextMixer(
+    # ON THE CODEC, not the model. Three things follow, and all three are the point:
+    #   1. `normalizer.state_dict()` is already saved, so the weights persist with NO
+    #      change to save_pretrained -- the first build attached them to the model and
+    #      they were silently absent from every checkpoint.
+    #   2. `denormalize(context)` is the single rollout entry point that every eval
+    #      backend, the policy bridge and serving already call, so inference-time code
+    #      sampling lands there with no downstream change.
+    #   3. The SFT path (c from g(A*)) and the rollout path (c from p(c|h)) share ONE
+    #      mixer instance by construction, instead of two that can drift apart.
+    codec.tokenizer = tokenizer
+    codec.code_mixer = CodeContextMixer(
         tokenizer.vocab_xy, tokenizer.vocab_theta, context_dim=dec.context_dim,
         d_model=dec.d_model, n_tokens=dec.n_context_tokens, r_hidden=code_r_hidden,
     ).to(next(model.parameters()).device)
-    model.code_head = CodePolicyHead(
+    codec.code_head = CodePolicyHead(
         tokenizer.vocab_xy, tokenizer.vocab_theta, dec.context_dim,
+        kind=code_head_kind, hidden=code_head_hidden,
         d_factor=code_d_factor).to(next(model.parameters()).device)
+    if code_log_prior is not None:
+        codec.code_head.init_prior(code_log_prior.to(next(model.parameters()).device))
     model.code_loss_weight = float(code_loss_weight)
     model._code_cache = None
     return model
+
+
+def restore_code_slot(model, spec: Dict) -> None:
+    """Rebuild the code slot from `meta["fm_code"]`, ready for a STRICT weight load.
+
+    Constructs the modules with the recorded shapes and leaves them uninitialised --
+    `load_trainable` supplies the weights immediately afterwards. The tokenizer is
+    rebuilt as an empty shell of the right shape when the checkpoint carried one, so its
+    saved weights have somewhere to land; decode never needs it (only `encode` does), so
+    a checkpoint without one still evaluates and merely loses the obedience gauge.
+    """
+    codec, dec = model.normalizer, model.decoder
+    model.__class__ = TurnFlowActionRegressorWithCode
+    codec.code_mixer = CodeContextMixer(
+        int(spec["n_xy"]), int(spec["n_theta"]), context_dim=dec.context_dim,
+        d_model=dec.d_model, n_tokens=dec.n_context_tokens,
+        tok_xy=int(spec.get("tok_xy", 2)), tok_theta=int(spec.get("tok_theta", 2)),
+        r_hidden=spec.get("r_hidden"))
+    codec.code_head = CodePolicyHead(
+        int(spec["n_xy"]), int(spec["n_theta"]), dec.context_dim,
+        kind=spec.get("head_kind", "mlp"), hidden=spec.get("head_hidden"),
+        d_factor=int(spec.get("d_factor") or 256))
+    if spec.get("has_tokenizer"):
+        # Shape-only shell; `load_trainable` fills it. Built from the recorded levels so
+        # the FSQ grids match the ones the codes were assigned with.
+        from longnav.utils.chunk_tokenizer import DualTokenizer
+
+        shell = FrozenChunkTokenizer.__new__(FrozenChunkTokenizer)
+        nn.Module.__init__(shell)
+        lv_xy = _levels_for(int(spec["n_xy"]))
+        lv_th = _levels_for(int(spec["n_theta"]))
+        shell.model = DualTokenizer(lv_xy, lv_th, n_ticks=dec.n_ticks)
+        for q in shell.model.parameters():
+            q.requires_grad_(False)
+        shell.register_buffer("xy_scale", torch.tensor(1.0))
+        shell.register_buffer("theta_scale", torch.tensor(1.0))
+        shell.strict_wrap_guard = True
+        shell.checkpoint_path = "<restored from checkpoint>"
+        codec.tokenizer = shell
+    model._code_cache = None
+
+
+def _levels_for(vocab: int):
+    """The FSQ level list a vocabulary came from. Only `[8,5]` = 40 is in use; anything
+    else must be recorded explicitly rather than guessed, so this raises instead."""
+    known = {40: [8, 5], 25: [5, 5], 64: [8, 8], 16: [4, 4], 125: [5, 5, 5]}
+    if vocab not in known:
+        raise ValueError(
+            f"cannot infer FSQ levels for vocab {vocab}; record them in meta['fm_code']")
+    return known[vocab]

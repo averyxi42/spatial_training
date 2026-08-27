@@ -50,6 +50,24 @@ _CODE_FLAGS = {
                         help="frozen dual-FSQ tokenizer checkpoint (tokenizer.pt)"),
     "--code-loss-weight": dict(type=float, default=1.0,
                                help="weight on the code head's per-turn CE"),
+    "--code-prior": dict(default=None,
+                         help="npy of shape (vocab,) holding the corpus log-marginal "
+                              "over the joint code; initialises the head's per-code "
+                              "bias. Worth ~2.5 nats at step 0 (H(c)=4.838 against "
+                              "ln(1600)=7.378), because fitting a skewed 1600-way prior "
+                              "by gradient descent is slow at any sane LR."),
+    "--code-max-grad-norm": dict(type=float, default=1.0,
+                                 help="the code head's OWN clip norm; it is clipped as a "
+                                      "separate group so its gradient cannot consume the "
+                                      "global clip budget and shrink everyone else's step"),
+    "--code-head-kind": dict(default="mlp", choices=["mlp", "compositional"],
+                             help="code policy head readout. 'mlp' (DEFAULT) is a plain "
+                                  "two-layer MLP on h with a free 1600-way output layer. "
+                                  "'compositional' builds the table from per-factor "
+                                  "embeddings -- parameter sharing at the cost of a "
+                                  "constrained table; see CodePolicyHead's docstring."),
+    "--code-head-hidden": dict(type=int, default=None,
+                               help="hidden width of the mlp head; default in_dim"),
     "--code-d-factor": dict(type=int, default=256,
                             help="per-factor embedding width in the code head"),
     "--code-r-hidden": dict(type=int, default=None,
@@ -84,6 +102,50 @@ def _take_code_args():
     return ns
 
 
+def _load_prior(path):
+    if not path:
+        return None
+    import numpy as np, torch
+    a = torch.from_numpy(np.load(path).astype("float32"))
+    print(f"[code] prior-init bias from {path}: H(c) = "
+          f"{float(-(a.exp() * a).sum()):.4f} nats (uniform ln(V) = "
+          f"{float(torch.log(torch.tensor(float(a.numel())))):.4f})", flush=True)
+    return a
+
+
+def _patch_optimizer_groups():
+    """Put `code_head`/`code_mixer` in the FRESH group.
+
+    `build_optimizer_param_groups` builds `fresh` from the modules that exist at
+    `build()` time; these two are attached afterwards, so they fell into `other` at
+    `--lr` 1e-5 instead of `--head-lr` 1e-4 -- a ~10x deficit on the one module the
+    function's own docstring describes ("exactly as randomly-initialized as model.head,
+    wants the same larger step").
+    """
+    original = base.build_optimizer_param_groups
+
+    def patched(model, args):
+        groups = original(model, args)
+        code = [q for n in ("code_head", "code_mixer")
+                for q in (getattr(model, n, None).parameters()
+                          if getattr(model, n, None) is not None else [])
+                if q.requires_grad]
+        if not code:
+            return groups
+        ids = {id(q) for q in code}
+        head_lr = args.head_lr if args.head_lr is not None else args.lr
+        for g in groups:
+            g["params"] = [q for q in g["params"] if id(q) not in ids]
+        groups = [g for g in groups if g["params"]]
+        groups.append({"params": code, "lr": head_lr,
+                       "weight_decay": args.weight_decay})
+        print(f"[code] optimizer: {len(code)} code-head tensors moved to the fresh group "
+              f"at lr {head_lr}", flush=True)
+        return groups
+
+    base.build_optimizer_param_groups = patched
+
+
 class _BuildProxy:
     """Forwards every attribute to the real class and overrides only `build`.
 
@@ -106,12 +168,16 @@ class _BuildProxy:
               f"{sum(p.numel() for p in tok.parameters())} frozen params", flush=True)
         model = attach_code_heads(model, tok, code_loss_weight=ca.code_loss_weight,
                                  code_d_factor=ca.code_d_factor,
-                                 code_r_hidden=ca.code_r_hidden)
+                                 code_r_hidden=ca.code_r_hidden,
+                                 code_head_kind=ca.code_head_kind,
+                                 code_head_hidden=ca.code_head_hidden,
+                                 code_log_prior=_load_prior(ca.code_prior))
         n_new = (sum(p.numel() for p in model.code_mixer.parameters())
                  + sum(p.numel() for p in model.code_head.parameters()))
         print(f"[code] attached: +{n_new/1e6:.2f}M params, r(h) zero-init "
               f"(scale {model.code_mixer.residual_scale():.1f}), "
-              f"code_loss_weight {ca.code_loss_weight}", flush=True)
+              f"code_loss_weight {ca.code_loss_weight}, "
+              f"head kind {ca.code_head_kind}", flush=True)
         if ca.code_init_from:
             import torch
             ck = torch.load(ca.code_init_from, map_location="cpu", weights_only=False)
@@ -138,6 +204,8 @@ def main():
                 "fine-tune at ~75% of compute, after a normal run, which is how the "
                 "shipped RTC checkpoint was made. Run the normal one first."
             )
+    _patch_optimizer_groups()
+    CodeSFTTrainer.code_max_grad_norm = float(code_args.code_max_grad_norm)
     base.TurnFlowActionRegressor = _BuildProxy(base.TurnFlowActionRegressor, code_args)
     base.FlowMatchingSFTTrainer = CodeSFTTrainer
     base.main()

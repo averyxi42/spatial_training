@@ -81,6 +81,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1019,6 +1021,22 @@ class TurnVectorRegressor(nn.Module):
             blob["modality"] = modality
         if self.stop_head is not None:
             blob["stop_head"] = self.stop_head.state_dict()
+        # SAFETY NET. Anything trainable that none of the entries above covers is saved
+        # here, LOUDLY. A module attached to the model after `build()` -- which is how
+        # heads get added -- lands in no state dict, so training succeeds, checkpoints
+        # look complete, and the omission only surfaces when something tries to LOAD.
+        # That cost a full run once. The warning is the point: silently saving it would
+        # hide a module that nobody declared, which is its own failure.
+        extra = self._uncovered_trainable(blob)
+        if extra:
+            mods = sorted({k.split(".")[0] for k in extra})
+            warnings.warn(
+                f"save_pretrained: {len(extra)} trainable tensor(s) in {mods} are not "
+                f"covered by any declared save path; writing them to 'extra_trainable' "
+                f"so the checkpoint is loadable. Give them an explicit home -- attaching "
+                f"a module to a SAVED submodule (e.g. the normalizer) is usually right.",
+                RuntimeWarning, stacklevel=2)
+            blob["extra_trainable"] = extra
         torch.save(blob, output_dir / HEAD_WEIGHTS_FILE)
         model_meta = asdict(self.model_cfg)
         if model_meta.get("stop_head") is None:
@@ -1046,6 +1064,23 @@ class TurnVectorRegressor(nn.Module):
             )
         )
 
+    def _uncovered_trainable(self, blob) -> dict:
+        """`{name: tensor}` for every `requires_grad` parameter no blob entry holds.
+
+        Coverage is by IDENTITY, not by name: the same tensor can appear under different
+        prefixes, and a name-based check would call a shared parameter uncovered.
+        """
+        covered = set()
+        for mod_name in ("head", "normalizer", "modality_embedder", "stop_head"):
+            mod = getattr(self, mod_name, None)
+            if mod is not None and hasattr(mod, "parameters"):
+                covered |= {id(q) for q in mod.parameters()}
+        bb = getattr(self, "backbone", None)          # the adapter saves separately
+        if bb is not None:
+            covered |= {id(q) for q in bb.parameters()}
+        return {n: q.detach().cpu() for n, q in self.named_parameters()
+                if q.requires_grad and id(q) not in covered}
+
     def load_head_state(self, checkpoint_dir: Union[str, Path], strict: bool = True):
         """Load the head weights, the normalizer buffers and the modality encoders.
 
@@ -1059,6 +1094,24 @@ class TurnVectorRegressor(nn.Module):
         self.head.load_state_dict(blob["head"], strict=strict)
         self.normalizer.load_state_dict(blob["normalizer"], strict=strict)
         self.modality_embedder.load_state_blob(blob.get("modality"))
+        # The symmetric half of the safety net. Restored by name, and a name the model
+        # does not have is an ERROR: it means the checkpoint carries a module this build
+        # dropped, which is exactly the mismatch the net exists to make visible.
+        _extra = blob.get("extra_trainable")
+        if _extra:
+            own = dict(self.named_parameters())
+            missing = [k for k in _extra if k not in own]
+            if missing:
+                raise KeyError(
+                    f"checkpoint has extra_trainable tensors this model has no home for: "
+                    f"{missing[:5]}")
+            warnings.warn(
+                f"load_head_state: restoring {len(_extra)} tensor(s) from "
+                f"'extra_trainable'; these had no declared save path when written",
+                RuntimeWarning, stacklevel=2)
+            with torch.no_grad():
+                for k, v in _extra.items():
+                    own[k].copy_(v.to(own[k].dtype))
         # Strict in both directions, for the same reason the modality encoders are: the
         # config decides whether a stop head exists, and a model that quietly has one more
         # or one fewer readout than its own config claims is worse than a load error.

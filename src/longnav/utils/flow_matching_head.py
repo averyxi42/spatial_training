@@ -1604,6 +1604,23 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         if latent is not None:
             meta["fm_latent"] = {"dim": latent.dim, "sigma0": latent.sigma0,
                                  "rotated": latent.rotation is not None}
+        # Mirrors `fm_latent`: written ONLY when a code slot is installed, so a
+        # checkpoint without one stays byte-identical to one from before this existed.
+        # The weights themselves ride along inside `normalizer.state_dict()`, because the
+        # modules live on the codec -- attaching them to the model instead left them
+        # silently absent from every checkpoint.
+        _code = getattr(self.normalizer, "code_head", None)
+        if _code is not None:
+            _mx = self.normalizer.code_mixer
+            meta["fm_code"] = {
+                "n_xy": int(_code.n_xy), "n_theta": int(_code.n_theta),
+                "head_kind": _code.kind,
+                "head_hidden": int(_code.net[0].out_features) if _code.kind == "mlp" else None,
+                "d_factor": int(_code.e_xy.embedding_dim) if _code.kind != "mlp" else None,
+                "tok_xy": int(_mx.tok_xy), "tok_theta": int(_mx.tok_theta),
+                "r_hidden": int(_mx.r[0].out_features),
+                "has_tokenizer": getattr(self.normalizer, "tokenizer", None) is not None,
+            }
         path.write_text(json.dumps(meta, indent=2))
 
     @classmethod
@@ -1648,6 +1665,13 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
             # wrapper, exactly as `TurnVectorRegressor.from_pretrained` does. A no-op with
             # no specs declared.
             model.attach_modality_hooks()
+        # Rebuild the code slot before the weights land: `load_trainable` is strict, so
+        # unexpected `code_*` keys would otherwise fail the load outright -- which is the
+        # loud failure we want rather than a silently code-less model.
+        if meta.get("fm_code"):
+            from longnav.utils.code_conditioned_head import restore_code_slot
+
+            restore_code_slot(model, meta["fm_code"])
         model.load_trainable(checkpoint_dir, adapter=False)
         if device:
             model.to(device)
