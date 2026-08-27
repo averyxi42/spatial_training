@@ -63,6 +63,7 @@ def main():
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--split", default="train")
     ap.add_argument("--row-stride", type=int, default=1)
+    ap.add_argument("--n-ticks", type=int, default=20)
     ap.add_argument("--n-eval", type=int, default=65536)
     ap.add_argument("--steps", type=int, nargs="+", default=[10, 20, 50])
     ap.add_argument("--batch-size", type=int, default=4096)
@@ -85,7 +86,10 @@ def main():
     hd = torch.load(args.head, map_location="cpu", weights_only=False)
     ctx = CodeContext(n_xy, n_th).to(dev)
     ctx.load_state_dict(hd["ctx"])
-    decoder = FlowActionDecoder(context_dim=ctx.context_dim, **hd["decoder_config"])
+    # `to_config()` carries the network shape but NOT n_ticks, which lives on the
+    # instance; passing it separately rather than assuming the dict is complete.
+    decoder = FlowActionDecoder(context_dim=ctx.context_dim, n_ticks=args.n_ticks,
+                                **hd["decoder_config"])
     decoder.load_state_dict(hd["decoder"])
     decoder.eval().to(dev)
     codec = FlowActionCodec(decoder, action_scales=ACTION_SCALES).to(dev)
@@ -104,11 +108,14 @@ def main():
 
     @torch.no_grad()
     def obey_at(steps):
+        # `denormalize` takes no step count -- it reads `self.num_inference_steps` -- so
+        # the sweep sets the attribute rather than passing an argument the API lacks.
+        codec.num_inference_steps = int(steps)
         ok_x, ok_t = [], []
         for i in range(0, len(idx), args.batch_size):
             cx = cx_all[i:i + args.batch_size].to(dev)
             ct = ct_all[i:i + args.batch_size].to(dev)
-            gen = codec.denormalize(ctx(cx, ct), num_steps=steps).float()
+            gen = codec.denormalize(ctx(cx, ct)).float()
             gen[..., :2] /= ck["xy_scale"]; gen[..., 2] /= ck["theta_scale"]
             _, gx = tok.xy.encode(gen[..., :2])
             _, gt = tok.theta.encode(gen[..., 2:3])
