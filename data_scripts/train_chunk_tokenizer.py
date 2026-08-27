@@ -283,6 +283,14 @@ def main():
         return (float(torch.cat(xs).mean().sqrt()), float(torch.cat(ts).mean().sqrt()),
                 torch.cat(xi).numpy(), torch.cat(ti).numpy())
 
+    def save():
+        """Every epoch. A few MB against half an hour of GPU is not a trade worth making."""
+        torch.save({"model": model.state_dict(), "xy_levels": args.xy_levels,
+                    "theta_levels": args.theta_levels, "xy_scale": xy_scale,
+                    "theta_scale": th_scale, "d_model": args.d_model,
+                    "n_layers": args.n_layers}, out / "tokenizer.pt")
+
+    metrics_path = out / "metrics.jsonl"
     t0, step = time.time(), 0
     for ep in range(args.epochs):
         order = torch.randperm(len(train))
@@ -298,10 +306,18 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
             step += 1
+        save()
         rx, rt, xi, ti = evaluate()
         ux = usage_stats(xi, model.xy.fsq.vocab)
         ut = usage_stats(ti, model.theta.fsq.vocab)
         joint = len(np.unique(xi * model.theta.fsq.vocab + ti))
+        with metrics_path.open("a") as fh:
+            fh.write(json.dumps({
+                "epoch": ep + 1, "step": step,
+                "val_rmse_xy_m": rx * xy_scale, "val_rmse_theta_rad": rt * th_scale,
+                "xy_used": ux["used"], "theta_used": ut["used"],
+                "xy_perplexity": ux["perplexity"], "theta_perplexity": ut["perplexity"],
+                "joint_observed": joint}) + "\n")
         print(f"ep {ep+1}/{args.epochs} step {step} {time.time()-t0:.0f}s | "
               f"val rmse xy {rx*xy_scale:.4f} m  theta {rt*th_scale:.4f} rad | "
               f"used xy {ux['used']}/{ux['vocab']} ppl {ux['perplexity']:.1f} | "

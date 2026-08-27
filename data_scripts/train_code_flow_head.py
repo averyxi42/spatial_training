@@ -266,6 +266,14 @@ def main():
         decoder.train(); ctx.train()
         return res
 
+    def save(tag):
+        """3.5 MB. Written EVERY epoch, because a mid-run crash that costs 30 minutes of
+        GPU is not a trade anyone would take against a few megabytes of disk."""
+        torch.save({"decoder": decoder.state_dict(), "ctx": ctx.state_dict(),
+                    "decoder_config": decoder.to_config(), "epoch": tag},
+                   out / "code_flow_head.pt")
+
+    metrics_path = out / "metrics.jsonl"
     t0, step = _time.time(), 0
     for ep in range(args.epochs):
         order = t_idx[rng.permutation(len(t_idx))]
@@ -276,7 +284,12 @@ def main():
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
             step += 1
+        save(ep + 1)
         r = evaluate()
+        # Appended as it is produced, not assembled at the end: the first run's per-epoch
+        # numbers survived only in a log I had to scrape.
+        with metrics_path.open("a") as fh:
+            fh.write(json.dumps({"epoch": ep + 1, "step": step, **r}) + "\n")
         print(f"ep {ep+1}/{args.epochs} step {step} {_time.time()-t0:.0f}s | "
               f"mse {r['flow_mse']:.4f} | gen rmse xy {r['gen_rmse_xy_m']:.4f} m "
               f"th {r['gen_rmse_theta_rad']:.4f} rad | obey xy {r['obey_xy']:.3f} "
@@ -285,11 +298,7 @@ def main():
               f"{r['corpus_within_cell_xy_m']:.4f}) th {r['z0_spread_theta_rad']:.4f} "
               f"(cell {r['corpus_within_cell_theta_rad']:.4f})", flush=True)
 
-    # SAVE FIRST. The first run of this script finished all six epochs and then died in
-    # the final evaluation, losing every weight. Evaluation is a diagnostic; training is
-    # the artefact, and the artefact must survive a diagnostic that throws.
-    torch.save({"decoder": decoder.state_dict(), "ctx": ctx.state_dict(),
-                "decoder_config": decoder.to_config()}, out / "code_flow_head.pt")
+    save("final")
     final = evaluate(n=args.val_chunks)
     (out / "summary.json").write_text(json.dumps(
         {"args": vars(args), "params": int(n_par), "final": final}, indent=2))
