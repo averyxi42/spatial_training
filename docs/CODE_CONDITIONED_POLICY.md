@@ -63,28 +63,86 @@ leaves `proj(h)` the residual. That is the whole reason `proj(h)` gets the full
 specialisation is already enforced by what `c` takes off the table.
 
 `proj(h)` is not a maintenance channel. It is a continuous, detail-oriented latent
-path that RL genuinely trains. What is true is that the chain estimator remains
-inefficient on it (section 3), so the design's contribution there is to **confine**
-that inefficiency to detail while coarse behaviour learns through a clean discrete
-channel.
+path that RL genuinely trains. The chain estimator is still the inefficient one, but
+what that costs here is much less than it costs today, for reasons set out in
+section 3.2 -- and how much it costs at all is an open empirical question, not a
+standing defect.
 
 ## 3. The diagnosis this responds to
 
-From `FLOW_RL_SAMPLE_EFFICIENCY.md`, in one paragraph. Under the chain-as-action
-formulation the gradient reaches `mu_theta` only at the `sde_n` stochastic
-positions; `z_0` -- a 60-dim draw that largely selects the trajectory shape --
-receives zero credit, and the other `K - n` ODE steps receive zero gradient. A
-held-out regression of the chain score on the executed endpoint gives **R² =
-0.099**, so ~90% of score variance is unexplained by the action actually taken. In
-the `sigma -> 0` limit the log-prob is identically zero and there is no gradient at
-all, though the policy still varies -- entirely via `z_0`. The estimator credits
-the wrong variable.
+### 3.1 Two failures, not one
 
-A discrete code fixes this for the part of the action that matters most: the
+From `FLOW_RL_SAMPLE_EFFICIENCY.md`. Under the chain-as-action formulation the
+gradient reaches `mu_theta` only at the `sde_n` stochastic positions; `z_0` -- a
+60-dim draw that largely selects the trajectory shape -- receives zero credit, and
+the other `K - n` ODE steps receive zero gradient. In the `sigma -> 0` limit the
+log-prob is identically zero and there is no gradient at all, though the policy
+still varies, entirely via `z_0`.
+
+Those are **two separable problems** and only one of them is serious:
+
+* **Mis-credit.** `z_0` produces behavioural variation that is attributed to
+  nothing. This is a bias in *what* receives credit, and it is the threat.
+* **Sparse sampling.** The drift's gradient is estimated at `n` points of the
+  chain rather than along it. This is variance in *estimating* credit, it slows
+  learning, and it misattributes nothing.
+
+A discrete code removes the first for the part of the action that matters most: the
 code's log-probability is exact, low-dimensional, and a function of the chosen
 action alone. Multimodality survives because a categorical distribution is a proper
 multimodal density -- there is no conditional mean anywhere in the objective, so
-the mean-collapse failure of an L2 regression head does not arise.
+the mean-collapse failure of an L2 regression head does not arise. The second
+survives on the `proj(h)` channel and is the price of keeping it.
+
+### 3.2 Why `(c, proj(h))` shrinks the threat
+
+The harm from mis-crediting `z_0` is bounded by **how much `z_0` moves behaviour**,
+not by how much it moves the score. Two mechanisms shrink it here:
+
+* **Conditioning narrows the conditional.** The head is trained on
+  `p(A | h, c)` with `c = g(A*)`, so a properly learned conditional puts
+  essentially all of its mass inside cell `c`, and `z_0` draws from that mass. If
+  the `c` dependence is learned properly, `z_0`'s influence is **sub-cell by
+  construction** -- below the scale at which the code makes distinctions at all.
+* **`proj(h)` and `z_0` compete for the same space.** `proj(h)` shifts where the
+  conditional sits; `z_0` samples its spread. A `proj(h)` that explains detail well
+  narrows the conditional and directly leaves `z_0` less to do.
+
+Two qualifications that must not be folded away:
+
+* **Sub-cell is not return-irrelevant.** Cells are sized for mode separation, not
+  for return, so two trajectories inside one cell can still differ on whether they
+  clip a corner. Sub-cell `z_0` bounds the harm; it does not zero it.
+* **This is a statement about `z_0`, not about the `sigma` draws**, which are added
+  on top and can leave the cell on their own. That is a separate escape route,
+  handled by the two-sided `noise_a` bound in section 6.
+
+**`R² = 0.099` does not measure this and moves the wrong way.** It regresses the
+chain score on the executed endpoint, so it reports how much score variance is
+coupled to the action -- an estimator-efficiency statistic. As `z_0` sensitivity
+shrinks, endpoint variation shrinks while chain-realisation variation does not, and
+R² would fall *further* even as the harm disappears. The statistic that tracks the
+harm is return variance attributable to `z_0` at fixed `(h, c)`, and its cheap
+proxy is the obedience rate (section 6), measurable at SFT time before any RL
+exists.
+
+### 3.3 The open question: how much does `proj(h)` steer?
+
+`h` receives signal in proportion to how much it steers -- the ordinary property
+that a parameter's gradient magnitude tracks its influence, and not by itself a
+defect. It is recorded because it is **decision-relevant**, not because it is
+worrying:
+
+* If `proj(h)`'s measured steering share is large, the continuous channel matters
+  and so does the sparse-sampling cost on it -- then `sde_n` and `noise_a` are
+  worth tuning.
+* If it is small, the channel is near-inert once `c` is carrying the coarse
+  decisions, and the right move is to **drop the flow-SDE apparatus entirely**
+  rather than tune it -- deleting the chain density, the seam gauges and the
+  factored ratio along with it.
+
+Which of these holds is unmeasured, and it is the question that decides how much of
+`FLOW_SDE_RL.md` survives this design.
 
 ## 4. Tokenizer -- **INCOMPLETE, this is the remaining design work**
 
@@ -140,6 +198,11 @@ Open, and the reason this section is incomplete:
   data per code. Small: coarse control, rich residual, possibly unable to express
   the distinction RL needs. Large: fine control, vestigial residual, and RL drifts
   back toward a high-dimensional problem. RVQ softens but does not remove this.
+  Cell size carries a **second job** that pulls the other way from mode separation:
+  per section 3.2 it sets the scale below which uncredited `z_0` variation is
+  harmless, so shrinking cells sharpens control but also raises the bar the decoder
+  must clear to keep `z_0` sub-cell. The two criteria are not the same and the
+  tokenizer has to answer both.
 * **Long-tail code usage.** SFT usage will be skewed and a rarely-used code has a
   poorly-trained rendering, so when RL explores it the decoder produces something
   bad and the policy learns to avoid the *code* for reasons unrelated to the
@@ -192,7 +255,12 @@ re-establish `chain/abs_log_ratio_mean`'s band per factor.
 
 * **Obedience as a gauge, never as a loss.** Encode the generated chunk with the
   frozen tokenizer and log the rate of `g(A') != c`. Nearly free, and it is the
-  direct readout of whether the code still steers. What shifts under RL is the
+  direct readout of whether the code still steers. It has **two roles at two
+  times**: at SFT time, sampling `z_0` at fixed `(h, c)` measures whether `z_0`'s
+  influence is sub-cell (section 3.2) and gates the tokenizer/decoder pair before
+  any RL is built; at RL time the same statistic, now with `sigma` draws and a
+  shifted `p(c|h)` on top, reports whether that property survived. What shifts
+  under RL is the
   *joint* distribution over `(h, c)` -- every symbol is in the codebook and was
   rendered during SFT, so a novel pairing is compositional rather than
   extrapolative, and the loss's `c`-first-`h`-residual structure is what makes that
@@ -266,4 +334,14 @@ In order, all offline and none needing the RL stack:
 3. `z0_share` (`dump/latent_probe/z0_share.py`, unrun): the variance decomposition
    of chunk terminal displacement into what the observation chooses versus what
    `z_0` chooses. Bounds how much of the return-relevant variation any coarse code
-   can absorb.
+   can absorb. On today's *unconditioned* checkpoint this is the baseline the
+   design has to beat; the same probe run on a `c`-conditioned head, at fixed
+   `(h, c)`, is the sub-cell test of section 3.2.
+
+Then, once an SFT checkpoint exists and before committing to the RL path:
+
+4. **Sub-cell obedience at SFT time** -- sample `z_0` at fixed `(h, c)`, encode,
+   and measure `g(A') = c`. This is the pre-RL gate; a decoder that already leaves
+   its cell on `z_0` alone will not be rescued by anything downstream.
+5. **`proj(h)`'s steering share** (section 3.3) -- the measurement that decides
+   whether the flow-SDE channel is kept and tuned or deleted outright.
