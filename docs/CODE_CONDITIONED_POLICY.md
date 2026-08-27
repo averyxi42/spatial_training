@@ -340,8 +340,9 @@ re-establish `chain/abs_log_ratio_mean`'s band per factor.
 
 ### Instruments
 
-* **Obedience as a gauge, never as a loss.** Encode the generated chunk with the
-  frozen tokenizer and log the rate of `g(A') != c`. Nearly free, and it is the
+* **Obedience as a gauge, never as a loss -- and report it BY MISS DISTANCE, not as
+  strict equality.** Encode the generated chunk with the frozen tokenizer and log how
+  far `g(A')` lands from `c` in grid steps. Nearly free, and it is the
   direct readout of whether the code still steers. It has **two roles at two
   times**: at SFT time, sampling `z_0` at fixed `(h, c)` measures whether `z_0`'s
   influence is sub-cell (section 3.2) and gates the tokenizer/decoder pair before
@@ -354,6 +355,23 @@ re-establish `chain/abs_log_ratio_mean`'s band per factor.
   composition work. If distorted `proj(h)` produces behaviour that earns return,
   rewarding it is correct; if it produces bad behaviour, the RL loss drives it
   back. The gauge exists to make either visible, not to constrain them.
+
+  **Strict equality overstates failure and must not be the headline.** Measured on
+  the c-only head (section 4): strict obedience is 0.840 xy / 0.795 theta / 0.672
+  joint, but **94.0% of generations land within ONE grid step in both channels**, and
+  gross misses (>= 2 steps) are only ~3% per channel. FSQ indices are ordinal, so an
+  adjacent code is a neighbouring trajectory mode rather than a different behaviour;
+  counting those as total failures reads a boundary landing as a wrong mode. Report
+  the miss-distance histogram, headline the within-one-step rate, and treat the
+  >= 2-step rate as the real failure rate.
+
+  It also cannot be compared against the tokenizer's own round-trip (0.965, section
+  4) without that caveat: the tokenizer's decoder places ONE point per code, sitting
+  deep in the cell, while the head must place a whole distribution inside a
+  non-convex decision region including its tails. A perfect model of `p(A|c)` would
+  score 1.0 -- every chunk with code `c` is in cell `c` by definition -- so the
+  shortfall is real modelling error, but the two numbers answer different questions
+  and the gap between them is not the size of the problem.
 * **`sde_noise_a` now has a two-sided bound.** Large enough to explore detail,
   small enough that the sample stays inside its code cell -- chain noise that
   changes `g(A')` randomises the mode RL just chose. The same gauge measures it as
