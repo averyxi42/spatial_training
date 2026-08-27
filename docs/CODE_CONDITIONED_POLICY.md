@@ -146,6 +146,26 @@ Which of these holds is unmeasured, and it is the question that decides how much
 
 ## 4. Tokenizer -- **INCOMPLETE, this is the remaining design work**
 
+### Two invariants, stated before anything else
+
+**Discretisation is over the WHOLE CHUNK, never per tick.** `g` maps one `(H, 3)`
+chunk to one code (or one short token sequence for that chunk). A per-tick
+vocabulary would be an action-token language model over 25 Hz differentials -- a
+different architecture with a different decision frequency -- and it would put the
+policy back in the business of emitting motion rather than selecting a mode, which
+is the entire thing this design moves away from. Every statement in this document
+about codes, cells, obedience and `p(c|h)` is per decision, at 2.5 Hz.
+
+**The policy head must emit a distribution over the discretised chunk.** With one
+symbol per chunk that is a single categorical, which is why single-level
+quantisation is the simplest thing that can work. With more than one symbol the
+head must be **autoregressive**, and for RVQ specifically this is a correctness
+requirement, not an expressiveness preference: stage `l+1` quantises the residual
+of stage `l`, so `p(c_2 | c_1) != p(c_2)` by construction. A factorised head would
+place mass on stage combinations that never co-occur, and those decode to
+trajectories the corpus never contained -- the policy could sample them and would
+be scored on the result.
+
 What is settled:
 
 * **Standalone and frozen.** Trained as a pure autoencoder over action chunks with
