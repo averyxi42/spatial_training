@@ -1,0 +1,165 @@
+# @package _global_
+# THE POOL-SIZE EXPERIMENT (2026-08-27). Identical to flow_sde_rtc_held128 in every
+# respect except ONE LINE -- `sim.train_uids` names 7,403 episodes instead of 128.
+# Same RTC checkpoint, same exp(0.8) delay law, same blind-episode rejection, same
+# freeze/lr/a=0.9, same PINNED held-out 26 for eval, same n_rollout.
+#
+# WHY. The doctrine "a small fixed pool is needed for convergence" rests on the 2026-08
+# fullpool run showing no gain -- but that run was stopped at 55 cycles, and a
+# difficulty-controlled re-analysis (2026-08-27) shows the SUCCESSFUL held128 run also
+# looks flat at 55 cycles (t=+0.17 on success; its significance arrives only by ~900
+# cycles at t=+5.0). So the original comparison was underpowered, not informative. This
+# run is the matched-horizon rerun: several hundred cycles minimum, all else equal.
+#
+# THE HYPOTHESIS UNDER TEST (user's): flow-matching sampling noise is a nuisance the
+# gradient cannot marginalise, and repeating episodes is a poor-man's marginalisation --
+# multiple visits to one state average over the noise so the state-specific gradient can
+# emerge. If true, this run learns the SHARED component only and plateaus on the
+# held-out set well below the 128-episode run. If false (pools converge at matched
+# cycles), the small-pool doctrine is an artifact and the noise story loses its anchor.
+#
+# EVAL STAYS HONEST: the 26 eval uids are REMOVED from the training list (the pool
+# itself is untouched, so run_eval_cycle can still reach them via its explicit shard).
+# Without that subtraction a full-pool run would train on its own eval set and the
+# comparison would be worthless.
+resources:
+  # The documented landmine (docs/LATENT_RL_ENV.md): config_schema defaults
+  # vlm_conda_env to "longnav" but this machine's env is longnav_vlm.
+  vlm_conda_env: longnav_vlm
+
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  # The SFT LoRA baked into the base: the base model IS the SFT policy, the trainable
+  # LoRA is a fresh zero-delta, and peft's disable_adapter() is therefore an exact
+  # reference to SFT (what makes rl_config.ref_kl meaningful).
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_rtc_ft9000_geo/checkpoint-12000/adapter
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_rtc_ft9000_geo/checkpoint-12000
+    gap: 10
+    sde_n: 3
+    # THE CHANGE. See the header for the measured ladder this comes from.
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+
+sim:
+  # 8000 episodes over 80 HM3D TRAIN scenes, scene-disjoint from val (and therefore from
+  # sample101/sample400) by construction.
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train100x80
+  # HM3D `plant` labels are frequently wrong; excluded so the policy is not charged for
+  # failing to find something that is not there. ~571 of 8000 episodes. TRAINING ONLY --
+  # the eval harness still scores every category, so held-out numbers stay comparable
+  # with every historical result.
+  exclude_categories: [plant]
+  # TRAINING STREAM ONLY -- the pool, and therefore the eval set, is untouched. See the
+  # header for why this is a uid filter over the full pool rather than a smaller dataset.
+  # THE ONLY DELTA: 7,403 episodes (the full plant-filtered pool minus the 26 eval
+  # uids) instead of the stratified 128. Built by scratch/mk_fullset.py from
+  # list_episode_uids(), so every uid means what it means in this pool.
+  train_uids: /Projects/spatial_training/dump/eval_system/episode_sets/trainset_full_minus_eval.txt
+  # RTC (docs/RTC_RL.md section 5): the checkpoint's own training law, per-decision,
+  # separate stream. Training keeps snap/screening defaults (the training conventions).
+  rtc_delay_source: exp
+  rtc_delay_max: 10
+  rtc_delay_base: 0.8
+  rtc_delay_seed: 0
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 0.4
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: false
+  # Explicit rather than inherited-by-default, because it changes what the pool IS:
+  # an episode whose geodesic goes permanently non-finite is unmeasurable, not hard.
+  reward_lost_steps: 25
+
+rollout:
+  max_steps: 175
+  # BLIND-EPISODE REJECTION (2026-08-25). A navmesh-blind step carries no progress
+  # signal, and 82.8% of affected episodes never recover -- measured at 4.59% of
+  # episodes / 1.10% of steps, concentrated in a few scenes (43% of one scene's).
+  # With this on the episode is DISCARDED and the collector runs a replacement, so no
+  # blind row ever reaches collation. Escapes are carved out by default (99.1% of them
+  # are blind -- a median 2-row tail as the robot falls -- and rejecting them would
+  # delete the escape population and every escape_penalty with it).
+  # TRAINING ONLY by construction: run_eval_cycle passes respect_rejections=False, so
+  # the pinned held-out 26 keep their denominator and stay comparable to the baseline.
+  reject_blind_episodes: true
+  # Byte-identical to the SFT corpus format; the leading assistant echo in the turn
+  # template is load-bearing (see flow_sde_objectnav_v3.yaml's header for the numbers).
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  # No adapter load: the SFT policy is merged into the base above. Pointing this at the
+  # merged adapter applies the delta twice and setup_training refuses it by path.
+  checkpoint: null
+  load_optim: false
+  load_sched: false
+  # THE OTHER CHANGE: back to the standard rate -- `hapo`'s 2e-6, the 1x every earlier
+  # run is quoted against (the 10x twins were 2e-5). The twins showed 10x eventually
+  # degrades even with the head frozen; this run buys its exploration from `a`, not lr.
+  learning_rate: 2.0e-6
+  # THE FREEZE, unchanged: gradients flow THROUGH the frozen h->chain codec into the
+  # LoRA, but the codec itself is pinned to SFT. AdamW scales decay by lr, so 0 is a
+  # true freeze with no decay bleed.
+  action_head_learning_rate: 0.0
+  grad_accum_steps: 2
+  max_grad_norm: 20.0
+  rl_config:
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    # The tether, still MEASURE-ONLY. The twin's k1 sat ~1.6 while eval was flat and
+    # climbed to ~2.5 exactly as eval decayed, so it is a demonstrated leading
+    # indicator on this stack -- and ~1.6 is the scale to set ref_kl_coeff from if the
+    # leash is ever armed. k2 (quadratic) replaces the k3 exponential, which spiked 57x
+    # off one buffer-aged tail sample.
+    ref_kl: true
+    ref_kl_coeff: 0.0
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "flow_sde_rtc_a09_fullset"   # change per run to prevent local/wandb conflicts
+  output_dir: /Projects/spatial_training/dump/flow_rl
+  subset_label: "everything"
+  shard_size: 0
+  eval_every: 4
+  eval_set_size: 32          # ignored when eval_uids_file is set; kept for the record
+  # The fullpool run's own eval set, pinned so the curve is comparable to that run and to
+  # the 8-pass SFT baseline in docs/TRAINING_EVAL_SET.md. Disjoint from train_uids.
+  eval_uids_file: /Projects/spatial_training/dump/eval_system/episode_sets/fullpool_evalset_servable26.txt
+  eval_ode: true
