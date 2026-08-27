@@ -285,6 +285,13 @@ Design points that matter more than the domain:
 
 ## 9. Ranked, if the thread is picked up again
 
+The thread was picked up on 2026-08-27 and produced a design:
+**`CODE_CONDITIONED_POLICY.md`** — a discrete code as the RL action with the flow
+head demoted to its renderer. It supersedes 3–5 below for the coarse part of the
+action and quarantines the pathology in a continuous detail channel. The list is
+kept because it is the map of what else was on the table, and because option 3's
+reasoning is why the exact-CNF alternative was rejected there.
+
 1. **`sde_n` sweep** (1 vs 3) — existing config knob, no code, directly trades the
    quantity in question.
 2. **Antithetic / CRN coupling** — free, unbiased, low expected payoff.
