@@ -296,6 +296,70 @@ class BinaryStopHead(nn.Module):
     def probability(logits: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(logits.float())
 
+    def success_probability(self, logits: torch.Tensor, y: torch.Tensor):
+        """Exact P(a SAMPLED stop policy ends this episode in-radius) -> (P, arrived).
+
+        Each step is a Bernoulli hazard p_t = sigmoid(s_t) and the episode ends at the
+        FIRST stop, so with survival S_t = prod_{i<t}(1 - p_i):
+
+            P(success) = sum_t S_t * p_t * y_t
+
+        a first-passage decomposition -- closed form, O(n), exactly differentiable, no
+        sampling at train time. This IS the deployed quantity rather than a surrogate,
+        and three things that otherwise need hand-built machinery fall out of it:
+
+        * every step gets gradient, with dP/dp_t = S_t*y_t - P(success after t)/(1 - p_t):
+          firing now pays iff in-radius and costs the OPTION VALUE of firing later. The
+          trade-off is derived, not imposed by a margin or a temperature.
+        * out-of-radius frames following an arrival are penalised for consuming survival
+          probability a later arrival needs -- no mask required, and no "first run versus
+          all runs" choice to get wrong.
+        * a missed first arrival still trains the second, because the gradient simply
+          moves to whichever opportunity is left.
+
+        `arrived` is False when no frame is in-radius: P is then identically 0 whatever
+        the head does, so those rows are EXCLUDED from the mean rather than dragged
+        through it -- their failure belongs to navigation, not to this head.
+
+        Log space throughout; the naive product underflows long before a row's 175 turns.
+        """
+        y = y.reshape(-1)
+        lg = logits.float().reshape(-1)
+        finite = torch.isfinite(y)
+        yy = torch.where(finite, y, torch.zeros_like(y))
+        if not bool((finite & (yy > 0.5)).any()):
+            return lg.sum() * 0.0, False
+        # unlabelled frames neither fire nor consume survival
+        log_p = torch.where(finite, torch.nn.functional.logsigmoid(lg),
+                            torch.full_like(lg, -1e30))
+        log_1mp = torch.where(finite, torch.nn.functional.logsigmoid(-lg),
+                              torch.zeros_like(lg))
+        surv = torch.cat([log_1mp.new_zeros(1), torch.cumsum(log_1mp, dim=0)[:-1]])
+        return (torch.exp(surv + log_p) * yy).sum(), True
+
+    def firstpass_loss(self, logits: torch.Tensor, y: torch.Tensor,
+                       target_eps: float = 0.01):
+        """Drive P(success) to (1 - target_eps). -> (loss, arrived).
+
+        The SOFT TARGET is what makes this trainable rather than divergent. Maximising
+        P(success) outright has its optimum at a DETERMINISTIC policy -- p -> 1 at the
+        best in-radius frame and 0 before it -- i.e. at infinite logits. Measured: the
+        unbounded objective's max|logit| goes 8.98 -> 11.29 -> 13.59 at 4k/40k/400k steps
+        and is still climbing, while at eps=0.01 it settles at 5.21 by 40k and does not
+        move through 400k. That runaway is exactly the score-scale drift already observed
+        here (readout norm growing 2.6x monotonically; far-field stop probability
+        wandering 0.02 -> 0.31 between adjacent checkpoints).
+
+        eps is not an opaque regulariser: it is the assumed label reliability. Labels come
+        from a hard 1.0 m cut on a snapped geodesic, so demanding P = 1 asks the head to
+        be more certain than the data is. The penalty is symmetric, so exceeding the
+        target is discouraged too -- deliberately, since that is the saturating direction.
+        """
+        p, arrived = self.success_probability(logits, y)
+        if not arrived:
+            return p * 0.0, False
+        return (p - (1.0 - float(target_eps))) ** 2, True
+
 
 class StateProbe(nn.Module):
     """Both heads over one readout hidden. Loss = weighted sum of per-head CE."""
@@ -315,14 +379,16 @@ class StateProbe(nn.Module):
         self.stop_head = None
         if cfg.stop is not None:
             kw = {k: v for k, v in cfg.stop.items()
-                  if k not in ("loss_weight", "radius_m")}
+                  if k not in ("loss_weight", "radius_m", "firstpass_weight",
+                               "target_eps")}
             self.stop_head = BinaryStopHead(input_dim, dtype=dtype, **kw)
 
     def losses(self, hidden: torch.Tensor,
                distance_targets: Optional[torch.Tensor] = None,
                return_targets: Optional[torch.Tensor] = None,
                mask: Optional[torch.Tensor] = None,
-               stop_targets: Optional[torch.Tensor] = None) -> dict:
+               stop_targets: Optional[torch.Tensor] = None,
+               ordered: bool = True) -> dict:
         g = float(self.cfg.grad_scale)
         h = hidden if g >= 1.0 else (hidden * g + hidden.detach() * (1.0 - g))
         out = {}
@@ -335,14 +401,35 @@ class StateProbe(nn.Module):
                 self.value_head.loss(self.value_head(h.to(self.value_head.dtype)),
                                      return_targets, mask)
         if self.stop_head is not None and stop_targets is not None:
-            out["probe/stop_loss"] = self.cfg.stop.get("loss_weight", 1.0) * \
-                self.stop_head.loss(self.stop_head(h), stop_targets, mask)
+            _lg = self.stop_head(h)
+            _fp = float(self.cfg.stop.get("firstpass_weight", 0.0) or 0.0)
+            if _fp > 0.0:
+                # ORDER-DEPENDENT: survival is a running product over real time, so a
+                # turn permutation makes it meaningless. Shuffled rows fall back to BCE,
+                # which still teaches the clock-free part.
+                if ordered:
+                    _l, _ok = self.stop_head.firstpass_loss(
+                        _lg, stop_targets,
+                        target_eps=float(self.cfg.stop.get("target_eps", 0.01)))
+                    # ALWAYS emit the key; never branch on `_ok`. A row with no arrival
+                    # returns a zero still attached to the graph, so every rank composes
+                    # the same loss and enters the same collectives. Making a LOSS key
+                    # conditional on row CONTENT is what deadlocked DDP at step 0 on
+                    # 2026-08-22, and it hung v11 at step 0 the same way before this line.
+                    out["probe/stop_loss"] = _fp * _l
+                else:
+                    out["probe/stop_loss"] = self.cfg.stop.get("loss_weight", 1.0) * \
+                        self.stop_head.loss(_lg, stop_targets, mask)
+            else:
+                out["probe/stop_loss"] = self.cfg.stop.get("loss_weight", 1.0) * \
+                    self.stop_head.loss(_lg, stop_targets, mask)
         return out
 
     @torch.no_grad()
     def metrics(self, hidden: torch.Tensor,
                 distance_targets: Optional[torch.Tensor] = None,
                 return_targets: Optional[torch.Tensor] = None,
+                ordered: bool = True,
                 stop_targets: Optional[torch.Tensor] = None) -> dict:
         """Interpretable-scale accuracy, as sums + counts so any accumulation
         (grad-accum, DDP, eval loop) averages exactly. Masking matches `loss`:
@@ -375,6 +462,16 @@ class StateProbe(nn.Module):
                 out["probe_stop_tp"] = ((p >= 0.5) & (yy > 0.5)).float().sum()
                 out["probe_stop_fp"] = ((p >= 0.5) & (yy <= 0.5)).float().sum()
                 out["probe_stop_fn"] = ((p < 0.5) & (yy > 0.5)).float().sum()
+            # RAW P(success): the deployment quantity itself, under the sampled stop
+            # policy the objective optimises. Averaged over ARRIVING rows only -- a row
+            # that never reached the goal scores 0 no matter what the head does, so
+            # including it would report navigation failure as head failure.
+            if ordered:
+                _ps, _ok = self.stop_head.success_probability(
+                    self.stop_head(hidden), stop_targets)
+                if _ok:
+                    out["probe_stop_psuccess_sum"] = _ps.detach()
+                    out["probe_stop_psuccess_n"] = torch.ones((), device=_ps.device)
         if self.value_head is not None and return_targets is not None:
             y = return_targets.float()
             m = torch.isfinite(y)

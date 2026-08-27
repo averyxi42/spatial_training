@@ -384,11 +384,16 @@ class TurnFlowActionRegressorWithProbe(TurnFlowActionRegressor):
         probe_rows = to_sparse_indices(probe_rows, keep, strict=True)
         flat = [p for row in probe_rows for p in row]
         h = _torch.stack([hidden[p.batch_idx, int(p.indices[0])] for p in flat])
+        # The first-passage objective and its P(success) metric are ORDER-DEPENDENT
+        # (survival is a running product over real time), so shuffled rows fall back to
+        # BCE and are excluded from the metric.
+        _ordered = not bool(turns_shuffled)
         losses = probe.losses(
             h.unsqueeze(0),
             None if distance_targets is None else distance_targets.reshape(1, -1),
             None if return_targets is None else return_targets.reshape(1, -1),
             stop_targets=None if stop_targets is None else stop_targets.reshape(1, -1),
+            ordered=_ordered,
         )
         n_turns_t = _torch.tensor(float(len(flat)))
         _ddp = _probe_ddp_scale()
@@ -396,7 +401,10 @@ class TurnFlowActionRegressorWithProbe(TurnFlowActionRegressor):
         # (shuffled rows' returns, by design) contributes 0/0, not 0/n.
         _counts = {"probe/distance_loss": _finite_count(distance_targets),
                    "probe/value_loss": _finite_count(return_targets),
-                   "probe/stop_loss": _finite_count(stop_targets)}
+                   "probe/stop_loss": _finite_count(stop_targets),
+                   # the hinge is ONE number per row, not per turn: weight it by rows so
+                   # a 198-turn pointnav row cannot outvote a 48-turn objectnav one
+                   }
         for k, v in losses.items():
             out["loss"] = out["loss"] + v * _ddp
             # sum-style keys for ProbeTrainer._accumulate (weighted by the number of
@@ -433,6 +441,7 @@ class TurnFlowActionRegressorWithProbe(TurnFlowActionRegressor):
                 None if distance_targets is None else distance_targets.reshape(1, -1),
                 None if return_targets is None else return_targets.reshape(1, -1),
                 stop_targets=None if stop_targets is None else stop_targets.reshape(1, -1),
+                ordered=_ordered,
         ).items():
             out[k] = v.detach()
         return out
@@ -545,7 +554,8 @@ class _ProbeTrainerMixin:
                    "probe_stop_psum", "probe_stop_tp", "probe_stop_fp", "probe_stop_fn",
                    "probe_distance_loss_sum", "probe_value_loss_sum", "probe_turns",
                    "probe_distance_loss_turns", "probe_value_loss_turns",
-                   "probe_stop_loss_turns",
+                   "probe_stop_loss_turns", "probe_stop_psuccess_sum",
+                   "probe_stop_psuccess_n",
                    "probe_dist_abs_err_sum", "probe_dist_err_sum", "probe_dist_n",
                    "probe_value_abs_err_sum", "probe_value_n")
 
@@ -591,6 +601,14 @@ class _ProbeTrainerMixin:
             out[f"{prefix}probe_stop_pred_rate"] = float(sums.get("probe_stop_psum", 0.0)) / n
             out[f"{prefix}probe_stop_precision"] = tp / max(tp + fp, 1.0)
             out[f"{prefix}probe_stop_recall"] = tp / max(tp + fn, 1.0)
+        pn = sums.get("probe_stop_psuccess_n")
+        if pn is not None and float(pn) > 0:
+            # THE headline number: mean P(a sampled stop lands in-radius) over arriving
+            # rows. Threshold-free and directly the deployed quantity, unlike precision
+            # and recall at an implicit 0.5, which move with a score scale the metric
+            # cannot even see.
+            out[f"{prefix}probe_stop_psuccess"] = float(
+                sums["probe_stop_psuccess_sum"] / pn)
         vn = sums.get("probe_value_n")
         if vn is not None and float(vn) > 0:
             out[f"{prefix}probe_value_mae"] = float(sums["probe_value_abs_err_sum"] / vn)
@@ -786,6 +804,24 @@ def parse_args():
                           "scene, and the first on-policy rows are all ordered though "
                           "the split is ~48%% shuffled. Unset keeps the historical "
                           "first-N behaviour so old runs reproduce.")
+    pre.add_argument("--stop-firstpass-weight", type=float, default=0.0,
+                     help="use the FIRST-PASSAGE objective for the stop head instead of "
+                          "BCE (0 = BCE, the historical path, bit-identical). Treats each "
+                          "step as a Bernoulli hazard and maximises the exact "
+                          "P(a sampled stop lands in-radius) = sum_t S_t p_t y_t. This is "
+                          "the deployed quantity, not a surrogate: every step gets "
+                          "gradient carrying the option value of stopping later, frames "
+                          "after an arrival are penalised for foreclosing the next one, "
+                          "and a missed first arrival still trains the second. Needs no "
+                          "pos_weight, margin, temperature or threshold. Ordered rows "
+                          "only; shuffled rows keep BCE.")
+    pre.add_argument("--stop-target-eps", type=float, default=0.01,
+                     help="target P(success) = 1 - eps. NOT cosmetic: maximising "
+                          "P(success) outright has its optimum at infinite logits "
+                          "(measured max|logit| 8.98/11.29/13.59 at 4k/40k/400k steps, "
+                          "still climbing), which is the score-scale runaway already seen "
+                          "in this project. At eps=0.01 it settles by 40k and stays. Read "
+                          "it as the assumed reliability of a hard 1.0 m label.")
     pre.add_argument("--probe-clip-norm", type=float, default=None,
                      help="clip the probe head's gradients SEPARATELY to this norm and "
                           "exclude them from the global --max-grad-norm. Unset keeps one "
@@ -794,13 +830,23 @@ def parse_args():
                           "probe is detached -- the residual half of the coupling that "
                           "cost v8 20 points of oracle success. 1.0 mirrors the global "
                           "default; smaller caps the head harder.")
-    pre.add_argument("--probe-save-scores", action="store_true",
+    pre.add_argument("--no-probe-save-scores", dest="probe_save_scores",
+                     action="store_false",
+                     help="do NOT dump the per-turn stop scores. On by default since "
+                          "2026-08-26: the whole v12 run's dumps are 4.5 MB against a "
+                          "52 GB run directory, and they are the only artifact that "
+                          "makes a finished run re-analysable. Runs before v9 have "
+                          "none and cannot be re-scored at all.")
+    pre.add_argument("--probe-save-scores", dest="probe_save_scores",
+                     action="store_true",
                      help="dump raw per-turn stop logits + labels + the ordered/shuffled "
                           "flag at every eval, one npz per rank under "
                           "<output-dir>/probe_stop_scores. Cheap (one small MLP over "
                           "turns already in memory) and the ONLY way to get AUC/AP, "
                           "TPR at a deployable FPR, and the ordered-vs-shuffled split "
-                          "-- none are recoverable from the aggregate counts.")
+                          "-- none are recoverable from the aggregate counts. "
+                          "Now the default; kept so old command lines keep working.")
+    pre.set_defaults(probe_save_scores=True)
     pre.add_argument("--no-distance-head", action="store_true",
                      help="omit the distance head entirely. With --no-value-head this "
                           "makes the probe stop-only: the head that makes a checkpoint "
@@ -1040,6 +1086,8 @@ def parse_args():
     args.probe_head_lr = mine.probe_head_lr
     args.probe_save_scores = mine.probe_save_scores
     args.probe_clip_norm = mine.probe_clip_norm
+    args.stop_firstpass_weight = mine.stop_firstpass_weight
+    args.stop_target_eps = mine.stop_target_eps
     args.eval_sample_seed = mine.eval_sample_seed
     args.no_distance_head = mine.no_distance_head
     args.no_value_head = mine.no_value_head
@@ -1324,7 +1372,9 @@ def main():
                     f"--stop-radius {args.stop_radius} != dataset stop_radius_m "
                     f"{stamped_r}; the head would be trained on a different arrival "
                     "predicate than its config claims")
-            probe_cfg.stop = {"hidden_dims": [args.stop_hidden],
+            probe_cfg.stop = {"firstpass_weight": args.stop_firstpass_weight,
+                              "target_eps": args.stop_target_eps,
+                              "hidden_dims": [args.stop_hidden],
                               "pos_weight": args.stop_pos_weight,
                               "radius_m": float(args.stop_radius), "loss_weight": 1.0}
         _hs = int(model.backbone.config.text_config.hidden_size
