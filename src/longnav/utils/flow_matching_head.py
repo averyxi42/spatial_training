@@ -1187,6 +1187,23 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         return self.normalizer
 
     # -- the objective -----------------------------------------------------------------
+    # ---- extension seams. Both defaults are EXACTLY the historical behaviour, so a
+    # model that does not override them runs bit-identically to before they existed.
+    # They exist because a code-conditioned head has to change what the decoder is
+    # conditioned on and add a term to the objective, and neither is reachable from a
+    # module hook the way `..._value.py`'s probe is.
+    def _decoder_context(self, context: torch.Tensor,
+                         targets: torch.Tensor) -> torch.Tensor:
+        """`h` -> what the decoder consumes. Identity; see `code_conditioned_head.py`."""
+        return context.float()
+
+    def _aux_turn_losses(self, context: torch.Tensor, targets: torch.Tensor):
+        """`(per_turn addend (N,) or None, metrics dict)`. Nothing by default.
+
+        The addend is PER TURN so it rides the same `sum() / num_items_in_batch`
+        reduction as the flow loss and inherits its DDP-correct denominator."""
+        return None, {}
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1260,7 +1277,8 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         # run is byte-identical to before this existed.
         latent, kl, metrics_ctx = codec.latent, None, context.float()
         if latent is None:
-            c = context.float()
+            c = self._decoder_context(context, targets)
+            metrics_ctx = c
         else:
             # The posterior sees `h` DETACHED: its parameters are discarded at RL and must
             # not shape the trunk. It also sees `h` rather than the pooled state, so its
@@ -1394,6 +1412,9 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
                 self._kl_step = getattr(self, "_kl_step", 0) + (1 if self.training else 0)
                 beta = beta * min(1.0, self._kl_step / warm)
             per_turn = per_turn + beta * kl
+        aux_turn, aux_metrics = self._aux_turn_losses(context, targets)
+        if aux_turn is not None:
+            per_turn = per_turn + aux_turn
         total = per_turn.sum()
         denom = num_items_in_batch if num_items_in_batch is not None else per_turn.numel()
         denom = torch.as_tensor(denom, dtype=total.dtype, device=total.device).clamp(min=1)
@@ -1423,6 +1444,7 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
                         self._last_raw_dadc > float(self.latent_cfg.diversity_clamp)
                     ).float().sum()
                 metrics["fm_loss_sum"] = per_draw.view(N, K).mean(dim=1).sum().detach()
+            metrics.update(aux_metrics)
             metrics["loss_sum"] = total.detach()
             metrics["n_turns"] = torch.tensor(N, device=dev)
             metrics["n_tokens"] = torch.tensor(

@@ -51,103 +51,11 @@ for _p in (str(_ROOT), str(_ROOT / "src")):
         sys.path.insert(0, _p)
 
 
-# --------------------------------------------------------------------------- FSQ
-class FSQ(nn.Module):
-    """Finite Scalar Quantization (Mentzer et al. 2023), `d` dims x `L_i` levels.
-
-    No codebook, no commitment loss, no dead-code revival: every grid point is
-    reachable by construction. The implicit vocabulary is `prod(levels)`.
-    """
-
-    def __init__(self, levels):
-        super().__init__()
-        self.levels = list(levels)
-        self.register_buffer("_levels", torch.tensor(self.levels, dtype=torch.float32))
-        basis = np.concatenate([[1], np.cumprod(self.levels[:-1])]).astype(np.int64)
-        self.register_buffer("_basis", torch.tensor(basis))
-
-    @property
-    def vocab(self):
-        return int(np.prod(self.levels))
-
-    def _bound(self, z):
-        """Squash `z` into the quantisation range. The half-level offset for even `L`
-        is what keeps the grid symmetric about zero -- without it an even codebook is
-        biased one step to one side."""
-        half_l = (self._levels - 1) * (1 - 1e-3) / 2
-        offset = torch.where(self._levels % 2 == 0,
-                             torch.tensor(0.5, device=z.device),
-                             torch.tensor(0.0, device=z.device))
-        shift = torch.tan(offset / half_l)
-        return torch.tanh(z + shift) * half_l - offset
-
-    def forward(self, z):
-        """`z`: (B, d) -> (quantised (B, d) in [-1, 1], index (B,) int64)."""
-        bounded = self._bound(z)
-        quant = bounded + (torch.round(bounded) - bounded).detach()   # straight-through
-        half_width = self._levels // 2
-        codes = quant / half_width
-        idx_per_dim = (torch.round(bounded).detach() + half_width).long()
-        index = (idx_per_dim * self._basis).sum(dim=-1)
-        return codes, index
-
-
-# ----------------------------------------------------------------- one code stream
-class StreamTokenizer(nn.Module):
-    """Encode a `(T, C)` profile to one FSQ code and reconstruct it.
-
-    Mean-pooled encoder: the code describes the WHOLE chunk, which is the invariant
-    the policy head depends on (one categorical per decision, not a per-tick
-    vocabulary).
-    """
-
-    def __init__(self, n_channels, levels, n_ticks=20, d_model=128, n_layers=2,
-                 n_head=4):
-        super().__init__()
-        self.n_channels, self.n_ticks = n_channels, n_ticks
-        self.fsq = FSQ(levels)
-        d_latent = len(levels)
-
-        self.in_proj = nn.Linear(n_channels, d_model)
-        self.enc_pos = nn.Parameter(torch.randn(1, n_ticks, d_model) * 0.02)
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model, n_head, dim_feedforward=4 * d_model, batch_first=True,
-            norm_first=True, dropout=0.0)
-        self.encoder = nn.TransformerEncoder(enc_layer, n_layers)
-        self.to_latent = nn.Linear(d_model, d_latent)
-
-        self.from_latent = nn.Linear(d_latent, d_model)
-        self.dec_pos = nn.Parameter(torch.randn(1, n_ticks, d_model) * 0.02)
-        dec_layer = nn.TransformerEncoderLayer(
-            d_model, n_head, dim_feedforward=4 * d_model, batch_first=True,
-            norm_first=True, dropout=0.0)
-        self.decoder = nn.TransformerEncoder(dec_layer, n_layers)
-        self.out_proj = nn.Linear(d_model, n_channels)
-
-    def encode(self, x):
-        h = self.encoder(self.in_proj(x) + self.enc_pos).mean(dim=1)
-        return self.fsq(self.to_latent(h))
-
-    def decode(self, codes):
-        h = self.from_latent(codes)[:, None, :].expand(-1, self.n_ticks, -1)
-        return self.out_proj(self.decoder(h + self.dec_pos))
-
-    def forward(self, x):
-        codes, index = self.encode(x)
-        return self.decode(codes), index
-
-
-class DualTokenizer(nn.Module):
-    def __init__(self, xy_levels, theta_levels, **kw):
-        super().__init__()
-        self.xy = StreamTokenizer(2, xy_levels, **kw)
-        self.theta = StreamTokenizer(1, theta_levels, **kw)
-
-    def forward(self, chunk):
-        """`chunk`: (B, T, 3) normalised CUMULATIVE profile."""
-        xy_hat, xy_idx = self.xy(chunk[..., :2])
-        th_hat, th_idx = self.theta(chunk[..., 2:3])
-        return xy_hat, th_hat, xy_idx, th_idx
+# The model now lives in the library: three consumers need it (this trainer, the
+# code-conditioned SFT head, the RL-time obedience gauge) and a second copy would drift.
+from longnav.utils.chunk_tokenizer import (                                # noqa: E402
+    FSQ, DualTokenizer, StreamTokenizer,
+)
 
 
 # ------------------------------------------------------------------------- data
