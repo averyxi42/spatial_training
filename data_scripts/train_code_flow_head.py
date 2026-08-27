@@ -58,8 +58,8 @@ for _p in (str(_ROOT), str(_ROOT / "src"), str(_ROOT / "data_scripts")):
 
 from longnav.utils.flow_matching_head import (                             # noqa: E402
     ACTION_SCALES, NUM_INFERENCE_STEPS, TIME_ALPHA, TIME_BETA, TIME_OFFSET,
-    TIME_SCALE, FlowActionCodec, FlowActionDecoder, flow_interpolate, sample_noise,
-    sample_time,
+    TIME_SCALE, FlowActionCodec, FlowActionDecoder, euler_integrate,
+    flow_interpolate, sample_noise, sample_time,
 )
 from train_chunk_tokenizer import DualTokenizer, load_chunks, to_cumulative  # noqa: E402
 
@@ -150,6 +150,19 @@ def main():
     ap.add_argument("--split", default="train")
     ap.add_argument("--row-stride", type=int, default=1)
     ap.add_argument("--n-ticks", type=int, default=20)
+    ap.add_argument("--action-space", choices=["differential", "pose"],
+                    default="differential",
+                    help="what the flow head regresses. 'differential' is the shipped "
+                         "convention: per-tick BODY-FRAME differentials via "
+                         "decompose_chunk at a single action_scales triple. 'pose' "
+                         "regresses anchor-relative CUMULATIVE poses directly, at "
+                         "PER-TICK scales (magnitude ranges 19x across ticks, so one "
+                         "triple would bury the early rows in noise). Pose space aligns "
+                         "the head with the tokenizer, the obedience metric and the "
+                         "reward, and is immune to correlated heading bias -- which "
+                         "amplifies 1.61x through composition -- at the cost of the "
+                         "small-|dy| kinematic prior (|dy|/|dx| = 0.146) that body-frame "
+                         "differentials encode for free.")
     ap.add_argument("--k-samples", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--epochs", type=int, default=4)
@@ -226,9 +239,34 @@ def main():
                                                 pct_start=0.05)
     K, T, D = args.k_samples, args.n_ticks, 3
 
+    # POSE MODE. `normalize`/`denormalize` are hardwired to decompose/compose, so the
+    # pose variant scales the cumulative chunk directly and integrates the field itself.
+    # Per-tick scales, because pose magnitude ranges ~19x from tick 0 to tick 19 and a
+    # single triple would leave the early rows buried under the interpolant's noise.
+    pose_mode = args.action_space == "pose"
+    tick_scale = torch.from_numpy(
+        np.maximum(chunks[:200000].std(axis=0), 1e-3)).float().to(dev)   # (T, 3)
+    if pose_mode:
+        print(f"POSE space; per-tick scale tick0 {tick_scale[0].tolist()} "
+              f"tick19 {tick_scale[-1].tolist()}")
+
+    def to_actions(ch):
+        return (ch / tick_scale).float() if pose_mode else codec.normalize(ch).float()
+
+    def to_chunk(actions):
+        return actions * tick_scale
+
+    def generate(c, steps=None):
+        if not pose_mode:
+            return codec.denormalize(c).float()
+        z = torch.randn(c.shape[0], T, D, device=dev)
+        x0 = euler_integrate(lambda x_t, t: decoder(c, x_t, t), z,
+                             int(steps or NUM_INFERENCE_STEPS))
+        return to_chunk(x0).float()
+
     def batch_of(idx):
         ch = chunks_t[idx].to(dev)
-        return (codec.normalize(ch).float(), cxy_t[idx].to(dev), cth_t[idx].to(dev), ch)
+        return (to_actions(ch), cxy_t[idx].to(dev), cth_t[idx].to(dev), ch)
 
     def flow_loss(actions, cx, ct):
         """The shipped objective, function for function."""
@@ -255,7 +293,7 @@ def main():
             sl = idx[i:i + chunk_rows]
             actions, cx, ct, true_chunk = batch_of(sl)
             mses.append(float(flow_loss(actions, cx, ct)) * len(sl))
-            gen = codec.denormalize(ctx(cx, ct)).float()
+            gen = generate(ctx(cx, ct))
             assert_no_wrap(gen, "generated chunk")
             err = gen - true_chunk
             e_xy.append(err[..., :2].pow(2).mean(dim=(1, 2)).cpu())
@@ -283,7 +321,7 @@ def main():
         sub = idx[:512]
         _, sx, st, _ = batch_of(sub)
         rep_x = sx.repeat_interleave(M); rep_t = st.repeat_interleave(M)
-        gen_m = codec.denormalize(ctx(rep_x, rep_t)).float().view(len(sub), M, T, 3)
+        gen_m = generate(ctx(rep_x, rep_t)).view(len(sub), M, T, 3)
         res["z0_spread_xy_m"] = float(gen_m[..., :2].std(dim=1).mean())
         res["z0_spread_theta_rad"] = float(gen_m[..., 2].std(dim=1).mean())
         res["z0_spread_terminal_xy_m"] = float(
