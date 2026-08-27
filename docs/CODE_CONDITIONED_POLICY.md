@@ -204,11 +204,78 @@ What is settled:
   gamma-re-timed at the splice so its credit is correct, and it is not the
   tokenizer's job to encode a deployment parameter.
 
+### First measurements (2026-08-27, branch `code_tokenizer`)
+
+Dual FSQ, `[8,5] = 40` codes for `(x, y)` and 40 for `theta`, 1.60 M params, trained
+on the full 1,971,020-chunk corpus (`data_scripts/train_chunk_tokenizer.py`;
+evaluation `data_scripts/eval_chunk_tokenizer.py`; artefacts under
+`dump/tokenizer/dual_fsq_40x40/`).
+
+* **Chunks are stored CUMULATIVE** -- `|early| 0.0513` against `|late| 0.4654`. The
+  loader decides this by measurement, not assumption: integrating a cumulative corpus
+  (or failing to integrate a differential one) would train the tokenizer on the wrong
+  object and still print plausible numbers.
+* **Corpus scale is near-parity**: `xy` std **0.346 m**, `theta` std **0.383 rad**.
+  An earlier argument for skewing the budget toward `theta` was mistaken -- it read
+  per-tick *residual* error off a trainer log, which measures what the model finds
+  hard, not what the channel carries. Equal vocabularies are the right default.
+* **It converges in ONE epoch.** Val RMSE was 0.0639 m / 0.0797 rad at epoch 1 and
+  0.0638 / 0.0811 at epoch 20, with epoch-to-epoch scatter larger than any trend. The
+  binding constraint is code capacity, not optimisation: at vocab 40 the floor is
+  ~18% of `xy` std and ~21% of `theta` std. Fit for 2-3 epochs -- the extra 17 bought
+  no val improvement and did open a train/val gap (train 0.044 m / 0.068 rad against
+  val 0.064 / 0.081). Reconstruction is therefore a fixed property of the vocabulary
+  and cannot compare tokenizer variants unless vocabulary is held equal.
+* **Utilisation is total**: 40/40 on both streams -- the guarantee FSQ was chosen for,
+  and it held. (A 10/40 reading on a 92-step smoke run was undertraining, not
+  collapse.)
+* **The two streams are not alike.** Perplexity 13.1 for `xy` against 30.3 for
+  `theta` -- normalised entropy 0.70 against 0.93 -- at near-identical channel
+  variance. `theta` spends its codebook nearly uniformly while `xy` concentrates on a
+  few "advance at some speed" modes, so heading carries more distinct behavioural
+  structure per unit of variance. Any future asymmetry should favour `theta`, which
+  is the opposite of the discarded argument above.
+
+**Existence-pruning is dead; a frequency floor works.** 1547 of 1600 joint cells are
+occupied on the full corpus, so "drop combinations that never occur" removes 3.3% and
+is not a mechanism -- as the corpus arithmetic predicted, at ~1200 chunks per cell
+existence is a weak filter. A frequency floor is a mechanism, and the curve is
+favourable rather than flat:
+
+| floor | cells kept | chunk coverage |
+| --- | --- | --- |
+| 1 | 1547 | 100% |
+| 10 | 1331 | 99.95% |
+| **100** | **723** | **98.7%** |
+| 500 | 402 | 95.0% |
+| 1000 | 273 | 90.3% |
+
+723 cells at 98.7% coverage sits inside the CE head's budget (~1.1 M exposures over a
+standard run, so ~1500 per code before Zipf). Cutting the tail remains a deliberate
+deletion of rare modes rather than a free structural win -- but here it is a cheap one.
+
+**Scans separate, which is the design's central premise surviving its first test.**
+Scoring each chunk by `sweep - |net|` in cumulative heading and taking the top 2%
+(39,421 chunks, threshold 0.434 rad): **5 `theta` codes hold 80% of them at 8.8x
+enrichment** over their corpus share. Code 29 carries 17.0% of scans against a 0.45%
+corpus share -- **37.8x**, effectively a dedicated scan code -- and code 21 is 13.4x.
+The `theta` codebook does allocate capacity to the mode the design needs from it.
+
+**But scans are the worst-served part of the distribution**: `theta` RMSE is 0.152 rad
+on scan-like chunks against 0.067 on the rest, **2.3x worse**. The `theta` cell is
+loosest exactly where the mode matters, which bears on the sub-cell `z_0` property of
+section 3.2 -- the bound it provides is weakest for scans.
+
 Open, and the reason this section is incomplete:
 
-* **Is the ambiguity chunk-expressible at all?** A chunk is 0.8 s. If a scan spans
-  two or three decisions, then within any single chunk it looks like an ordinary
-  turn and the distinction "scanning" versus "committing to a left turn" is not
+* **Is the ambiguity chunk-expressible at all?** Partially answered: within-chunk
+  excursion-and-return is real (2% of chunks by construction of the quantile) and it
+  earns dedicated codes. What is NOT answered is whether the scanning behaviour that
+  matters for goal-search spans several decisions, in which case the chunk-level view
+  sees only a fragment of it and the code names a piece of a mode rather than the
+  mode. A chunk is 0.8 s; if a scan spans two or three decisions, then within any
+  single chunk it looks like an ordinary turn and the distinction "scanning" versus
+  "committing to a left turn" is not
   present in `A`. A per-chunk tokenizer cannot split a mode that is invisible in
   the object it encodes, however well designed; disambiguation would have to come
   from `h`'s history, and the code could not help with the behaviour it is most
