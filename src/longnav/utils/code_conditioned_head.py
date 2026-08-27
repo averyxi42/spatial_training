@@ -97,7 +97,16 @@ class CodeContextMixer(nn.Module):
     def forward(self, h: torch.Tensor, c_xy: torch.Tensor,
                 c_theta: torch.Tensor) -> torch.Tensor:
         hf = h.float()
-        return torch.cat([self.emb_xy(c_xy), self.emb_theta(c_theta), self.r(hf)], dim=-1)
+        code = torch.cat([self.emb_xy(c_xy), self.emb_theta(c_theta)], dim=-1)
+        res = self.r(hf)
+        # THE NUMBER THAT DECIDES THIS DESIGN. If r(h)'s block grows much larger than the
+        # code block, the decoder fits through `h` and `c` becomes decorative -- the
+        # latent programme's collapse, reproduced. `r`'s weight RMS alone cannot say so,
+        # because the output scale also depends on how large `h` is.
+        with torch.no_grad():
+            self._last_code_rms = float(code.pow(2).mean().sqrt())
+            self._last_res_rms = float(res.pow(2).mean().sqrt())
+        return torch.cat([code, res], dim=-1)
 
     @torch.no_grad()
     def residual_scale(self) -> float:
@@ -290,6 +299,13 @@ class CodeSFTTrainer(FlowMatchingSFTTrainer):
         if mixer is not None:
             # 0.0 while r(h) is still the no-op it is initialised to.
             out[f"{prefix}code_r_scale"] = mixer.residual_scale()
+            code_rms = getattr(mixer, "_last_code_rms", None)
+            res_rms = getattr(mixer, "_last_res_rms", None)
+            if code_rms is not None and res_rms is not None:
+                out[f"{prefix}code_ctx_code_rms"] = code_rms
+                out[f"{prefix}code_ctx_res_rms"] = res_rms
+                # >> 1 means r(h) is swamping the code tokens.
+                out[f"{prefix}code_ctx_res_over_code"] = res_rms / max(code_rms, 1e-9)
         return out
 
 

@@ -54,6 +54,16 @@ _CODE_FLAGS = {
                             help="per-factor embedding width in the code head"),
     "--code-r-hidden": dict(type=int, default=None,
                             help="hidden width of r(h); default context_dim"),
+    "--code-init-from": dict(default=None,
+                             help="WARM START from a c-only prototype head "
+                                  "(code_flow_head.pt): loads the flow decoder and BOTH "
+                                  "code embedding tables, leaving r(h) at its zero init. "
+                                  "Step 0 then reproduces the prototype exactly, because "
+                                  "the prototype was trained with context tokens 4-7 held "
+                                  "at zero and r(h) outputs zero. Must be a DIFFERENTIAL-"
+                                  "space prototype: the shipped codec.normalize is "
+                                  "scale(decompose_chunk(.)), so a pose-space checkpoint "
+                                  "predicts velocities in another representation."),
 }
 
 
@@ -102,6 +112,19 @@ class _BuildProxy:
         print(f"[code] attached: +{n_new/1e6:.2f}M params, r(h) zero-init "
               f"(scale {model.code_mixer.residual_scale():.1f}), "
               f"code_loss_weight {ca.code_loss_weight}", flush=True)
+        if ca.code_init_from:
+            import torch
+            ck = torch.load(ca.code_init_from, map_location="cpu", weights_only=False)
+            model.decoder.load_state_dict(ck["decoder"], strict=True)
+            ctx = ck["ctx"]
+            # The prototype names the second table `emb_th`; the mixer names it
+            # `emb_theta`. One rename, asserted by shape rather than assumed.
+            model.code_mixer.emb_xy.weight.data.copy_(ctx["emb_xy.weight"])
+            model.code_mixer.emb_theta.weight.data.copy_(ctx["emb_th.weight"])
+            assert model.code_mixer.residual_scale() == 0.0, "r(h) must stay zero"
+            print(f"[code] WARM START from {ca.code_init_from}: decoder "
+                  f"({len(ck['decoder'])} tensors) + both code tables loaded; "
+                  f"r(h) still zero, so step 0 reproduces the prototype", flush=True)
         return model
 
 
