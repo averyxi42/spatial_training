@@ -135,6 +135,12 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--mem-fraction", type=float, default=0.10)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--resume-from", default=None,
+                    help="warm-start decoder+context from a previous code_flow_head.pt. "
+                         "The LR schedule restarts, which is the point: a OneCycle anneal "
+                         "to ~0 makes a flat tail nearly certain regardless of whether "
+                         "more training would help, so a second cycle from these weights "
+                         "separates 'converged' from 'out of learning rate'.")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -171,6 +177,11 @@ def main():
                                 n_dims=3, use_incoming_motion=False).to(dev)
     codec = FlowActionCodec(decoder, num_inference_steps=NUM_INFERENCE_STEPS,
                             action_scales=ACTION_SCALES).to(dev)
+    if args.resume_from:
+        prev = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        decoder.load_state_dict(prev["decoder"])
+        ctx.load_state_dict(prev["ctx"])
+        print(f"warm start from {args.resume_from} (epoch tag {prev.get('epoch')})")
     n_par = sum(p.numel() for p in decoder.parameters()) + \
         sum(p.numel() for p in ctx.parameters())
     print(f"head params {n_par/1e6:.3f}M | context tokens: "
