@@ -208,26 +208,35 @@ def main():
         return F.mse_loss(v_t, u_t)
 
     @torch.no_grad()
-    def evaluate(n=4096, spread_m=None):
+    def evaluate(n=4096, spread_m=None, chunk_rows=2048):
+        """`chunk_rows` caps the working batch. The K-sample expansion multiplies it by
+        `k_samples`, so evaluating 16k rows in one call asks for 131k decoder rows --
+        which is how the first run of this script died AFTER finishing training."""
         decoder.eval(); ctx.eval()
         idx = torch.from_numpy(v_idx[:n])
-        actions, cx, ct, true_chunk = batch_of(idx)
-        res = {"flow_mse": float(flow_loss(actions, cx, ct))}
-
-        # -- generation, in physical units against the true anchor-relative chunk
-        gen = codec.denormalize(ctx(cx, ct)).float()
-        err = (gen - true_chunk)
-        res["gen_rmse_xy_m"] = float(err[..., :2].pow(2).mean().sqrt())
-        res["gen_rmse_theta_rad"] = float(err[..., 2].pow(2).mean().sqrt())
-
-        # -- OBEDIENCE, per channel: does the generated chunk carry the code it was told?
-        g = gen.clone()
-        g[..., :2] /= ck["xy_scale"]; g[..., 2] /= ck["theta_scale"]
-        _, gx = tok.xy.encode(g[..., :2])
-        _, gt = tok.theta.encode(g[..., 2:3])
-        res["obey_xy"] = float((gx == cx).float().mean())
-        res["obey_theta"] = float((gt == ct).float().mean())
-        res["obey_both"] = float(((gx == cx) & (gt == ct)).float().mean())
+        mses, e_xy, e_th, ox, ot = [], [], [], [], []
+        for i in range(0, len(idx), chunk_rows):
+            sl = idx[i:i + chunk_rows]
+            actions, cx, ct, true_chunk = batch_of(sl)
+            mses.append(float(flow_loss(actions, cx, ct)) * len(sl))
+            gen = codec.denormalize(ctx(cx, ct)).float()
+            err = gen - true_chunk
+            e_xy.append(err[..., :2].pow(2).mean(dim=(1, 2)).cpu())
+            e_th.append(err[..., 2].pow(2).mean(dim=1).cpu())
+            g = gen.clone()
+            g[..., :2] /= ck["xy_scale"]; g[..., 2] /= ck["theta_scale"]
+            _, gx = tok.xy.encode(g[..., :2])
+            _, gt = tok.theta.encode(g[..., 2:3])
+            ox.append((gx == cx).cpu()); ot.append((gt == ct).cpu())
+        ox, ot = torch.cat(ox), torch.cat(ot)
+        res = {
+            "flow_mse": float(sum(mses) / len(idx)),
+            "gen_rmse_xy_m": float(torch.cat(e_xy).mean().sqrt()),
+            "gen_rmse_theta_rad": float(torch.cat(e_th).mean().sqrt()),
+            "obey_xy": float(ox.float().mean()),
+            "obey_theta": float(ot.float().mean()),
+            "obey_both": float((ox & ot).float().mean()),
+        }
 
         # -- z_0-INDUCED SPREAD at fixed c, against the EMPIRICAL within-cell spread.
         # The model's spread is only meaningful next to what the cell actually holds:
@@ -276,11 +285,14 @@ def main():
               f"{r['corpus_within_cell_xy_m']:.4f}) th {r['z0_spread_theta_rad']:.4f} "
               f"(cell {r['corpus_within_cell_theta_rad']:.4f})", flush=True)
 
+    # SAVE FIRST. The first run of this script finished all six epochs and then died in
+    # the final evaluation, losing every weight. Evaluation is a diagnostic; training is
+    # the artefact, and the artefact must survive a diagnostic that throws.
+    torch.save({"decoder": decoder.state_dict(), "ctx": ctx.state_dict(),
+                "decoder_config": decoder.to_config()}, out / "code_flow_head.pt")
     final = evaluate(n=args.val_chunks)
     (out / "summary.json").write_text(json.dumps(
         {"args": vars(args), "params": int(n_par), "final": final}, indent=2))
-    torch.save({"decoder": decoder.state_dict(), "ctx": ctx.state_dict(),
-                "decoder_config": decoder.to_config()}, out / "code_flow_head.pt")
     print(json.dumps(final, indent=2))
     print(f"wrote {out}")
 
