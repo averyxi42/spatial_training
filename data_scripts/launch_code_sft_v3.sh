@@ -75,6 +75,14 @@ RUN_NAME=${RUN_NAME:-run_code_v4_mlp_warm}
 OUT=${OUT:-$DUMP/pose_injection/$RUN_NAME}
 GPUS=${GPUS:-0,1,2,3}
 
+LOG=${LOG:-$DUMP/pose_injection/${RUN_NAME}.log}
+mkdir -p "$(dirname "$LOG")"
+# The script owns its own logging. Launching as `tmux new-session "bash script | tee"`
+# puts a pipeline between tmux and torchrun, which leaves the elastic launcher unreaped
+# and makes kills hang for minutes.
+exec > >(tee "$LOG") 2>&1
+echo "=== $(date -Is)  $RUN_NAME -> $OUT"
+
 cd "$REPO"
 # The env's torchrun, not whatever is first on PATH: the bare name resolves to a
 # python without transformers and every rank dies on import.

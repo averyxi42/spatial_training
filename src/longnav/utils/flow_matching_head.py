@@ -898,6 +898,18 @@ class FlowActionCodec(nn.Module):
         #: pinning `z_0` to a single tensor, which holds it at one arbitrary slice of the
         #: policy -- measured at 2.4x the ensemble's mean path length.
         self.latent_generator: Optional[torch.Generator] = None
+        #: Inference-time code sampling. `argmax` is deterministic and comparable across
+        #: checkpoints; `sample` is what RL will do. Its own generator, separate from the
+        #: one driving `z_0`, for the same reason `latent_generator` is separate: seeding
+        #: a visualisation reproducibly must not also freeze the flow noise.
+        self.code_mode = "argmax"
+        self.code_temperature = 1.0
+        self.code_generator: Optional[torch.Generator] = None
+        self.last_code = self.last_logp = self.last_logits = None
+        #: >0 decodes that many top-p(c|h) modes per decision for the video overlay.
+        #: 0 (the default) costs nothing -- rollout must not pay for a debug view.
+        self.code_modes_k = 0
+        self.last_mode_chunks = self.last_mode_codes = self.last_mode_probs = None
 
     # -- the scaling, in both directions ------------------------------------------------
     def scale(self, diffs: torch.Tensor) -> torch.Tensor:
@@ -1000,6 +1012,45 @@ class FlowActionCodec(nn.Module):
             return context
         ctx = context
         noise = None
+        # THE ROLLOUT SEAM. With a code slot installed, `c` is drawn HERE from p(c|h) --
+        # so rollout, every eval backend, the policy bridge and serving pick it up
+        # without a line of change, exactly as the latent split does below. The sampled
+        # code and its log-prob are stashed for the caller (RL needs both, and a chunk
+        # return value has nowhere to put them); the pattern mirrors the value head's
+        # `last_distance_m`.
+        _code_head = getattr(self, "code_head", None)
+        if _code_head is not None:
+            _lg = _code_head.logits(context.float())
+            if self.code_mode == "argmax":
+                _idx = _lg.argmax(dim=-1)
+            else:
+                _p = torch.softmax(_lg / max(float(self.code_temperature), 1e-6), dim=-1)
+                _idx = torch.multinomial(
+                    _p, 1, generator=self.code_generator).squeeze(-1)
+            _cx = _idx // _code_head.n_theta
+            _ct = _idx % _code_head.n_theta
+            self.last_code = torch.stack([_cx, _ct], dim=-1).detach()
+            self.last_logp = torch.log_softmax(_lg, dim=-1).gather(
+                1, _idx[:, None]).squeeze(1).detach()
+            self.last_logits = _lg.detach()
+            ctx = self.code_mixer(context, _cx, _ct)
+            _chunk = compose_chunk(self.generate(ctx, noise=None, prefix=prefix))
+            # TOP-K ALTERNATIVE MODES, for the video overlay only. Decoded here because
+            # this is already where `c` is chosen, so nothing else needs to know the code
+            # slot exists; the rollout just reads `last_mode_chunks` off the codec.
+            if int(self.code_modes_k) > 0 and context.shape[0] == 1:
+                k = min(int(self.code_modes_k), _lg.shape[-1])
+                top = _lg[0].topk(k).indices
+                mx = self.code_mixer(context.expand(k, -1),
+                                     top // _code_head.n_theta,
+                                     top % _code_head.n_theta)
+                self.last_mode_chunks = compose_chunk(
+                    self.generate(mx, prefix=prefix)).detach().float().cpu().numpy()
+                self.last_mode_codes = torch.stack(
+                    [top // _code_head.n_theta, top % _code_head.n_theta], -1).cpu()
+                self.last_mode_probs = torch.softmax(
+                    _lg[0], -1)[top].detach().cpu()
+            return _chunk
         if self.latent is not None:
             ctx = self.latent.draw(
                 context.float(), mode=self.latent_mode,
