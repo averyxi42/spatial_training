@@ -253,8 +253,21 @@ def main():
     # ever sees it, and widening it is a cheaper fix than anything downstream.
     dp = Pl.shape[1]
     print(f"\nfitting on the {dp}-d POOLED hidden, upstream of the readout projection:")
-    res["pooled_linear"], _ = fit("pooled-linear", nn.Linear(dp, V), Ptr, Ytr, Pva, Yva,
-                                  args.steps, args.lr, args.batch_size, dev)
+    # LAYERNORM ON BOTH SIDES, or the comparison is rigged against the pooled vector.
+    # `standardize_head_inputs=False`, so the pooled hidden arrives raw, and
+    # `TurnVectorHead.fit_input_stats`' own docstring is explicit that the residual
+    # stream carries outlier dimensions orders of magnitude larger than the rest --
+    # a bare Linear on it is badly conditioned and would lose for reasons that have
+    # nothing to do with information content. The 1024-d context does not have that
+    # problem (it is post-MLP), so normalising only the pooled side would be the
+    # opposite bias; both get the same treatment and `linear` above stays bare as the
+    # continuity point with the first run.
+    res["ctx_ln_linear"], _ = fit(
+        "ctx-ln-linear", nn.Sequential(nn.LayerNorm(d), nn.Linear(d, V)),
+        Xtr, Ytr, Xva, Yva, args.steps, args.lr, args.batch_size, dev)
+    res["pooled_linear"], _ = fit(
+        "pooled-ln-linear", nn.Sequential(nn.LayerNorm(dp), nn.Linear(dp, V)),
+        Ptr, Ytr, Pva, Yva, args.steps, args.lr, args.batch_size, dev)
 
     # THE PER-FACTOR PROBES, which are the better-conditioned question. 1600 classes
     # against the available turns is a hopeless ratio; 40 classes each is 40x better
@@ -278,10 +291,12 @@ def main():
     print(f"turns collected      {len(X)}  (train {len(Xtr)} / val {len(Xva)}, "
           f"SPLIT BY ROW over {len(uniq)} episodes)")
     print(f"marginal (bias only) {ce_marg:.4f}   [joint, {V}-way]")
-    print(f"linear on ctx ({d})  {res['linear']:.4f}")
-    print(f"MLP on ctx           {res['mlp']:.4f}")
-    print(f"linear on pooled ({dp}) {res['pooled_linear']:.4f}   "
-          f"[projection cost {res['linear'] - res['pooled_linear']:+.4f} nats]")
+    print(f"linear on ctx ({d})     {res['linear']:.4f}   [bare, as in the first run]")
+    print(f"MLP on ctx              {res['mlp']:.4f}")
+    print(f"LN+linear on ctx        {res['ctx_ln_linear']:.4f}")
+    print(f"LN+linear on pooled ({dp}) {res['pooled_linear']:.4f}   "
+          f"[what the 2048->1024 readout costs: "
+          f"{res['ctx_ln_linear'] - res['pooled_linear']:+.4f} nats]")
     for tag in ("xy", "theta"):
         print(f"{tag:>5}: marginal {res[f'{tag}_marginal_ce']:.4f} -> probe "
               f"{res[f'{tag}_probe_ce']:.4f}  (acc {res[f'{tag}_probe_acc']:.3f})")
