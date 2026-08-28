@@ -63,19 +63,90 @@ This was a deliberate change and the reasoning behind it was sound — quoting
 Removing a *false* history was right. The unexamined side effect is that no *true* history
 replaced it.
 
-**The consequence, stated plainly.** ObjectNav is trained in the `nopose` format. So on an
-ObjectNav episode the continuous policy has:
+**The consequence, stated carefully.** The continuous policy cannot recover its own recent
+actions from frame differences (established), and its action history is a constant. So
+nothing in its input reports what it just did, and the rotation is the expected behaviour of
+an action-memoryless policy deciding as if fresh.
 
-* no egomotion from frames (established),
-* no pose channel (nopose),
-* no action history (constant placeholder).
+### Why this is NOT a pose argument
 
-**No channel of any kind reports what it just did.** It cannot know it turned 60° right one
-step ago. Under that constraint the rotation is not inexplicable — it is the expected
-behaviour of a policy that is action-memoryless, and every decision is made as if fresh.
+It is tempting to add "and ObjectNav trains `nopose`, so there is no pose channel either."
+**That argument is wrong and must not be made here.** Training ObjectNav *with* pose is
+known to make minimal difference to performance — which is why every run after v3 dropped
+the `objectnav_pose` stream entirely (see `launch_code_sft_v3.sh`).
 
-Corroboration from the other direction: PointNav trains *with* pose, so it does have an
-egomotion channel, and its code CE is 2.418 against ObjectNav's 4.427 (step 1200).
+That fact cuts against the naive reading of this whole hypothesis, and the hypothesis is
+better for confronting it:
+
+> If the mechanism were "the policy needs to know what it just did", then **pose would have
+> supplied exactly that** — metrically exact egomotion, strictly more informative than a
+> code index — and it would have helped. It did not.
+
+So the value of an action history **cannot** be that it conveys egomotion. Whatever it
+provides, pose already provides more of, and better. The mechanism has to be something pose
+*cannot* give: a **low-dimensional stream of repeated discrete symbols**, over which
+next-token machinery can match patterns directly ("this alternation has repeated six
+times"). A pose sequence is three continuous floats per turn — it carries the geometry but
+offers no symbol to pattern-match on, and the established finding is that the model does
+little with the geometry.
+
+This is the load-bearing distinction in the whole document: the claim is about **symbolic
+sequence structure**, not about information content. It also means the two channels are not
+substitutes and the experiment is not "action history instead of pose".
+
+For the same reason, **do not read the PointNav/ObjectNav code-CE split (2.418 vs 4.427) as
+pose evidence.** PointNav differs from ObjectNav in being point-to-point rather than search,
+in corpus, and in having a fixed 198 turns per row; pose is one difference among several and
+the direct experiment says it is not the operative one. `H(c|h)` being genuinely higher for
+search remains the simplest explanation of that gap.
+
+### The real axis: cost of the operation, not power of the representation
+
+The sharper form of the point above. Pose is the **strictly more powerful** representation
+— exact SE(2), everything a code index says and more — and it may be **worse in practice**,
+because extracting the relevant fact from it requires computation the model does not
+reliably have:
+
+| to answer "have I already turned this way?" | pose history | symbol history |
+|---|---|---|
+| integrate a sequence of relative SE(2) poses | required | not needed |
+| transform between anchor and body frames | required | not needed |
+| compare current heading to past headings numerically | required | not needed |
+| match a repeated literal in the sequence | — | **the whole operation** |
+
+The left column is exactly the class of internal spatial transform the model is established
+to be bad at. The right column is matching repeated symbols in a sequence, which attention
+implements natively and cheaply — it is close to the canonical thing induction heads do.
+
+So the ranking is not "codes carry more than pose". It is:
+
+> **pose > codes in information, and codes ≫ pose in usability**, because the operation the
+> policy actually needs is cheap over symbols and expensive over geometry.
+
+A representation is only as good as the computation the model can afford to run on it. This
+is the load-bearing idea, and it generalises past this one design decision — including as a
+caution against reasoning about the conditioning path purely in terms of width and capacity
+(cf. `ARCHITECTURAL_DEBT.md`, where the measured answer was that a 2× wider representation
+bought nothing). Bandwidth was not the binding constraint there either.
+
+### The experiment that discriminates form from content
+
+The above makes a prediction that the "action history is informative" reading does not, and
+it is directly testable: **hold the information fixed and vary only the representation.**
+
+Feed the same egomotion history twice over —
+
+* **continuous**: the existing `<pose>` channel, three floats per turn;
+* **symbolic**: the same pose quantised into a small number of heading/displacement bins and
+  injected as discrete symbols, carrying strictly *less* information than the floats.
+
+If the cost-of-operation account is right, **the symbolic version wins despite carrying
+less**. If information content is what matters, it cannot. Nothing else in the setup
+changes, which is what makes it clean — and it is cheaper than the full code-history build,
+so it is the right first experiment if compute is scarce.
+
+Corollary prediction: once a symbolic action history is present, **adding pose on top should
+buy little**, because the operation it enables is already cheap through the symbols.
 
 ## 3. Why a low bar is the point
 
