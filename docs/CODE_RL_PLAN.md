@@ -140,9 +140,68 @@ the option of training `proj` during RL.
   be assumed.
 * `chain/h_drift_from_init` and `ref_kl` keep their meanings.
 
-## 9. The gate that comes before all of it
+## 9. The gate — RUN, AND PASSED (checkpoint-2000, 2026-08-28)
 
-**Measure obedience on the actual trained checkpoint before building any of the above.**
+`data_scripts/measure_obedience.py`, ObjectNav validation, 250 held-out episodes,
+11,822 valid turns, 4 z₀ draws each = 47,288 decodes. Miss is **L∞ on the FSQ lattice**
+(see the metric note below).
+
+| condition | strict xy | strict θ | strict joint | **within-1 joint** | gross ≥2 (xy / θ) |
+|---|---|---|---|---|---|
+| teacher `c* = g(A*)` | 0.836 | 0.757 | **0.637** | **0.966** | 2.3% / 1.2% |
+| policy argmax | 0.948 | 0.800 | **0.754** | **0.996** | 0.3% / 0.1% |
+| *c-only prototype* | *0.840* | *0.795* | *0.672* | *0.940 (not comparable)* | — |
+
+**`c` still steers the decode. The RL lever is connected and the plan is not void.** Teacher
+strict joint 0.637 against the prototype's 0.672 is a small drop, not a collapse, despite
+`r(h)` having grown from nothing to `res/code = 0.56`.
+
+Three readings worth carrying into the build:
+
+* **Policy codes are obeyed BETTER than teacher codes** (0.754 vs 0.637 strict). Expected
+  rather than surprising: the argmax code is the one the head is confident about, which
+  correlates with `h` sitting where the decoder renders cleanly, and argmax codes are the
+  frequent ones that training covered. It is also the favourable direction for RL, which
+  conditions on policy codes, not teacher codes.
+* **θ is the weaker channel on strict (0.757) but the stronger on within-1 (0.988)**, while
+  xy carries the fat tail — xy's histogram has 110–182 counts out at misses of 5, 6 and 7,
+  θ's is empty past 4. So xy fails rarely but badly; θ jitters by one step often. Different
+  failure shapes, and only xy's produces a genuinely different trajectory.
+* **z₀ moves the sample out of its cell often: only 0.551 (teacher) / 0.707 (policy) of
+  extra draws land in the same cell as the first.** This is the §3.2 premise — that z₀'s
+  influence is *sub-cell* — and measured, it is not: z₀ jitter is on the order of one
+  lattice step, not less. Consistent with the obedience numbers (draws land within one step
+  of `c` but not reliably in the same cell as each other), and bounded in behavioural terms
+  because an adjacent code is a neighbouring mode. But it is **not** the clean separation
+  §3.2 assumed.
+
+  **This strengthens the case for Option A** (§1). With `z₀` pinned and the decode
+  deterministic, that ~45% cross-cell jitter disappears entirely and the code is the whole
+  action. Under Option B it compounds: `sde_noise_a` would add chain noise on top of a
+  z₀ that already moves `g(A')` by about a cell, and the two-sided bound §8 asks for has to
+  be derived against that, not against zero.
+
+### Metric note: the first version of this measurement was wrong
+
+Miss distance was initially computed as `|flat index difference|`. FSQ here is `levels
+[8, 5]` per channel, so the flat index is mixed-radix `d0 + 8*d1`, and that metric
+
+* counted a difference of **8** — one step in dim 1, an **adjacent cell** — as a gross
+  8-step miss. It showed as a hard spike at exactly 8 in the histogram, which is what
+  exposed it;
+* counted a difference of **1** across a row boundary (7 → 8) as a near miss, when dim 0
+  actually moves 7 steps.
+
+Corrected to L∞ on the lattice, the gross-failure rate fell from ~11% to ~1.7% — the bug
+inflated it more than 6×. Any earlier within-N obedience number computed on flat indices is
+wrong in the same way.
+
+**Consequence for the prototype comparison:** the recorded 94.0%-within-one-step figure
+cannot be trusted as a target. The surviving diagnostic (`diagnose_code_flow_head.py`)
+computes only strict equality, so how that 94% was derived is not recoverable from the
+code; if it used flat indices it is wrong. **Only the strict columns compare.**
+
+### The original gate rationale, for the record
 
 The 94%-within-one-step figure is from the **c-only prototype**, a head with no backbone and
 no competing flow objective. If obedience has degraded in the full model, then `c` does not
@@ -164,7 +223,7 @@ Two further readings worth having at the same time, both cheap:
 ## 10. Ordering
 
 ```
-GATE   obedience on the trained checkpoint          (offline, no sim)
+GATE   obedience on the trained checkpoint          DONE 2026-08-28, PASSED (section 9)
   │
 P0     restore_code_slot in load_flow_stack          (blocker, small)
   │
