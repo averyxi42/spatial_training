@@ -909,6 +909,9 @@ class FlowActionCodec(nn.Module):
         #: >0 decodes that many top-p(c|h) modes per decision for the video overlay.
         #: 0 (the default) costs nothing -- rollout must not pay for a debug view.
         self.code_modes_k = 0
+        #: Flow samples per mode. >1 shows the z_0 spread INSIDE each code cell, which is
+        #: what distinguishes "the codes separate modes" from "the codes slice one blob".
+        self.code_mode_samples = 1
         self.last_mode_chunks = self.last_mode_codes = self.last_mode_probs = None
 
     # -- the scaling, in both directions ------------------------------------------------
@@ -1038,18 +1041,58 @@ class FlowActionCodec(nn.Module):
             # TOP-K ALTERNATIVE MODES, for the video overlay only. Decoded here because
             # this is already where `c` is chosen, so nothing else needs to know the code
             # slot exists; the rollout just reads `last_mode_chunks` off the codec.
-            if int(self.code_modes_k) > 0 and context.shape[0] == 1:
+            if int(self.code_modes_k) > 0:
+                # Row 0, whatever the batch: the readout can be several positions
+                # (`n_readout`) and `vector_rollout` executes `[0]`, so the modes must
+                # describe THAT row. The earlier `shape[0] == 1` guard silently skipped
+                # the decode whenever n_readout > 1 -- the chunk still drew, the modes
+                # never did, which is exactly what the first live video showed.
+                # THE DIAGNOSTIC MUST NOT MOVE THE ROBOT. Decoding the modes draws
+                # noise, and every generator here is shared with the executed decode --
+                # `self.generator` drives it directly, and an unset `code_generator`
+                # falls through to the global RNG. Consuming from either leaves the
+                # NEXT step's executed chunk different, so merely switching the overlay
+                # on changed the trajectory. Snapshot and restore, so a run with the
+                # overlay is bit-identical to one without it.
+                _rng_global = torch.get_rng_state()
+                _rng_codec = (self.generator.get_state()
+                              if self.generator is not None else None)
+                _rng_code = (self.code_generator.get_state()
+                             if self.code_generator is not None else None)
+                _rng_cuda = (torch.cuda.get_rng_state_all()
+                             if torch.cuda.is_available() else None)
                 k = min(int(self.code_modes_k), _lg.shape[-1])
+                m = max(int(self.code_mode_samples), 1)
                 top = _lg[0].topk(k).indices
-                mx = self.code_mixer(context.expand(k, -1),
+                # M flow samples PER MODE, with the noise SHARED across modes: chunk
+                # (i, j) and (i', j) differ only by the code, so spread across colours is
+                # mode separation while spread within a colour is the z_0 residual inside
+                # one cell. Independent noise per (mode, sample) would confound exactly
+                # the comparison the overlay exists to make.
+                z = torch.randn(m, self.decoder.n_ticks, self.decoder.n_dims,
+                                device=context.device, dtype=torch.float32,
+                                generator=self.code_generator)
+                mx = self.code_mixer(context[:1].expand(k, -1),
                                      top // _code_head.n_theta,
                                      top % _code_head.n_theta)
-                self.last_mode_chunks = compose_chunk(
-                    self.generate(mx, prefix=prefix)).detach().float().cpu().numpy()
+                # repeat_interleave the codes and tile the noise, so row (i*m + j) is
+                # (mode i, sample j). `repeat` on the codes would transpose the pairing.
+                self.last_mode_chunks = compose_chunk(self.generate(
+                    mx.repeat_interleave(m, dim=0), noise=z.repeat(k, 1, 1),
+                    prefix=prefix,
+                )).detach().float().cpu().numpy().reshape(k, m, -1, self.decoder.n_dims)
                 self.last_mode_codes = torch.stack(
                     [top // _code_head.n_theta, top % _code_head.n_theta], -1).cpu()
                 self.last_mode_probs = torch.softmax(
                     _lg[0], -1)[top].detach().cpu()
+                # Put every stream back exactly where the executed decode left it.
+                torch.set_rng_state(_rng_global)
+                if _rng_codec is not None:
+                    self.generator.set_state(_rng_codec)
+                if _rng_code is not None:
+                    self.code_generator.set_state(_rng_code)
+                if _rng_cuda is not None:
+                    torch.cuda.set_rng_state_all(_rng_cuda)
             return _chunk
         if self.latent is not None:
             ctx = self.latent.draw(
