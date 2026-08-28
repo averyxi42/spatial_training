@@ -203,7 +203,73 @@ content (`turn_vectors.py:144-150`). So writing the code into the turn body:
 
 Cost is 1–2 extra cached tokens per turn against ~326 already, i.e. nothing.
 
-### 4.3 The design questions that need answering
+### 4.3 How well the conversation template and the modality systems actually fit
+
+The concrete proposal is to swap the assistant placeholder `**____**` for `**<action>**`,
+where `<action>` is a modality marker carrying the executed code. This section records what
+was read in the source, and — separately — what was not checked. It is a compatibility
+sketch, not a green light.
+
+**Read directly and quoted:**
+
+* The modality contract is turn- and role-agnostic. `modality_embed.py`: *"the k-th
+  occurrence of a marker token in the sequence receives the k-th value row. That is the
+  whole contract. Turns do not appear in it."* A marker inside an assistant turn is not a
+  case the mechanism has to handle specially.
+* The only placement restriction is that a marker must not sit immediately after
+  `<|vision_start|>` (it would break `get_rope_index`'s image-vs-video test); *"anywhere
+  else in the text is fine"*, asserted by `check_placement`.
+* No vocabulary coupling: marker ids are rewritten by a forward pre-hook and never index
+  the embedding table — *"no `resize_token_embeddings`, no `modules_to_save`, and no
+  coupling to `vocab_size`"*.
+* Windowing already counts modality markers generically, by scanning message text parts
+  (`vector_sft.py:323`), *"the modality analogue of `n_images_in_message`"*, and the
+  modality column is sliced through that same window path (`:520`).
+* The rollout already defers the placeholder. `split_assistant_turn`
+  (`vector_rollout.py:500`) splits at the readout boundary using `find_turn_spans` — *"the
+  same function training used — so any affix/placeholder combination is handled without
+  special cases"* — and a live shard log prints `owed to next turn: ['____', '**',
+  '<|im_end|>', '\n']`. The placeholder is already emitted on the *following* forward pass,
+  after the readout.
+* Values for owed tokens already have a documented path: `reset(modality=...)` states
+  *"the prologue's tokens are owed to the first `step()`, so its occurrences come first in
+  the sequence and its value rows are prepended to that step's."*
+* Encoders support `zero_init` (`BucketEncoder`, and the interface generally), so a
+  zero-initialised action encoder emits zeros and step 0 reproduces the warm-started
+  checkpoint — the same device `r(h)` already uses.
+
+**Inference from the above, not itself verified:** because the placeholder is already in the
+owed tail, a code decoded at step *t* would fill a marker emitted at step *t+1*, which is the
+schedule this design wants. That follows from the two quoted facts but was not tested.
+
+**Causality.** `shift_left=True` puts the readout at the `**` that opens the turn, before
+the content, so turn *t*'s own readout cannot attend to action *t*, while turn *t+1*'s
+readout sees it in the cache. This is the asymmetry the design needs and it is a
+pre-existing property, not something to add.
+
+**The cost is in the data, not the model.** The assistant text lives in the *formatted
+dataset* — the conversation builder wrote it — so the change means rewriting assistant text
+and adding a per-turn code column. That is a `.map()` over existing formatted data rather
+than a rebuild, following `add_distance_targets.py`, which joins a sidecar into existing
+formatted datasets by `frame_indices`.
+
+**Not checked — where a surprise would come from:**
+
+1. Whether the per-example marker-count check (`_modality_kwargs`, `vector_sft.py:499`)
+   behaves when a window cuts an episode mid-way *and* markers sit in assistant turns. It
+   counts what it finds, so it probably does, but the path was not traced.
+2. Whether anything downstream relies on the assistant content being **constant**. The
+   `**____**` invariant is load-bearing in the docs and possibly in code that was not read.
+3. Whether `step(modality=...)` in practice accepts values destined for the owed tail rather
+   than only for tokens emitted in that call. The prologue precedent suggests yes; not
+   confirmed.
+4. Nothing here has been run. No smoke test, no shape check, no training step.
+
+The honest summary: the interfaces look designed for this kind of extension and no blocker
+was found, but "no blocker found by reading" is weaker than "works", and items 1–4 are the
+difference.
+
+### 4.4 The design questions that need answering
 
 1. **Teacher forcing vs executed code.** In SFT the history should carry the dataset's code
    (frozen tokenizer on the ground-truth chunk). At rollout it carries the policy's own
