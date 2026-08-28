@@ -215,10 +215,32 @@ Two further readings worth having at the same time, both cheap:
   (`ARCHITECTURAL_DEBT.md`). RL would start from a weaker prior than `h` supports. Not a
   blocker — RL improves the head — but it is a reason to prefer starting from a later
   checkpoint over an earlier one.
-* **`res/code` trend.** `ctx_res_over_code` rose monotonically 0.075 → 0.561 over 1200 steps
-  with `code_rms` flat. If `r(h)` keeps taking share, `c`'s authority over the decode weakens
-  over training — the same thing the obedience gauge measures, from the input side. Watch it
-  to the end of the SFT run.
+* **`res/code` — RETRACTED as a decision variable.** `ctx_res_over_code` rises
+  monotonically and had crossed 1.0 by step ~2200. It was described in `CodeContextMixer`
+  as "the number that decides this design"; it is not, on two independent grounds:
+
+  1. **The decoder cannot see it.** `FlowActionDecoder` is a pre-norm transformer
+     (`norm_first=True`), so each of the 8 context tokens is LayerNorm'd over `d_model`
+     before attention, with q/k/v all built from the normalised tensor. The code tokens
+     and the `r(h)` tokens reach attention at the same scale whatever the ratio says. Raw
+     magnitude survives only in each token's own residual stream; the path by which
+     context reaches the action ticks is magnitude-blind.
+  2. **It does not track obedience.** The prototype had `res/code = 0` by construction and
+     strict joint 0.672; checkpoint-2000 sits near 1.0 with 0.637 and within-1 0.966. The
+     proxy crossed its entire alarming range while the measured quantity moved 0.035.
+
+  Also `code_rms` is near-constant (0.0374 → 0.0376), so the ratio is `res_rms` over a
+  fixed divisor — a one-variable metric with a two-variable name — and `r` is
+  zero-initialised, so the climb from zero is the design working rather than a signal.
+
+  It remains a valid **liveness tripwire** (is the continuous branch contributing at all,
+  which is invisible in the loss), which is what `residual_scale`'s docstring actually
+  claims. 0 vs not-0 is real; 0.5 vs 1.0 is not.
+
+  **Replace it with obedience as a periodic eval metric.** That is the direct measurement
+  and it now exists. It costs a generation pass, which SFT does not otherwise do, so it
+  belongs at eval cadence on a subset of turns rather than per step — the decoder is 0.87M
+  parameters and ~10 Euler steps, so this is affordable.
 
 ## 10. Ordering
 

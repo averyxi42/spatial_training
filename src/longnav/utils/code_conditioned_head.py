@@ -99,10 +99,30 @@ class CodeContextMixer(nn.Module):
         hf = h.float()
         code = torch.cat([self.emb_xy(c_xy), self.emb_theta(c_theta)], dim=-1)
         res = self.r(hf)
-        # THE NUMBER THAT DECIDES THIS DESIGN. If r(h)'s block grows much larger than the
-        # code block, the decoder fits through `h` and `c` becomes decorative -- the
-        # latent programme's collapse, reproduced. `r`'s weight RMS alone cannot say so,
-        # because the output scale also depends on how large `h` is.
+        # A LIVENESS TRIPWIRE, NOT AN INFLUENCE MEASURE. It was originally commented here
+        # as "the number that decides this design" -- that claim is retracted, on two
+        # independent grounds:
+        #
+        #   * The decoder cannot see it. `FlowActionDecoder` is a PRE-norm transformer
+        #     (`norm_first=True`), so each of the 8 context tokens is LayerNorm'd over
+        #     d_model before attention and q/k/v are all built from the normalised
+        #     tensor. The code tokens (0-3) and the r(h) tokens (4-7) therefore reach
+        #     attention at the SAME scale whatever this ratio says. Raw magnitude
+        #     survives only in each token's own residual stream; the path by which
+        #     context reaches the action ticks is magnitude-blind.
+        #   * Measured, it does not track what it claims to. The c-only prototype had
+        #     res/code = 0 by construction and strict joint obedience 0.672;
+        #     checkpoint-2000 sits near 1.0 with 0.637 (within-1 still 0.966). The proxy
+        #     crossed its whole "alarming" range while obedience moved 0.035.
+        #
+        # Two lesser problems: `code_rms` is near-constant (0.0374 -> 0.0376 over 1000
+        # steps), so the ratio is really `res_rms` over a fixed divisor; and `r` is
+        # zero-initialised, so the climb from 0 is the design working, not a signal.
+        #
+        # Keep logging it -- distinguishing 0 from not-0 is genuinely useful and is
+        # invisible in the loss. Do not use it to decide anything. The quantity that
+        # decides this design is OBEDIENCE (data_scripts/measure_obedience.py,
+        # docs/CODE_RL_PLAN.md section 9), which measures the decode directly.
         with torch.no_grad():
             self._last_code_rms = float(code.pow(2).mean().sqrt())
             self._last_res_rms = float(res.pow(2).mean().sqrt())
