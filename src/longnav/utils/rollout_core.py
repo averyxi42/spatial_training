@@ -344,16 +344,7 @@ class EpisodeRolloutMixin:
                 # D. Step Simulator (Blocking) ---------------------------RAY----------------------------- 
                 t0 = time.time()
                 # del rgb,state_dict
-                # Alternative modes for the video overlay, when the policy head has a
-                # code slot and the run asked for them. Passed as an explicit kwarg and
-                # only when non-empty, so every other env keeps its exact signature.
-                _step_kw = {}
-                _codec = getattr(getattr(self, "model", None), "normalizer", None)
-                _modes = getattr(_codec, "last_mode_chunks", None)
-                if _modes is not None:
-                    _step_kw["mode_chunks"] = _modes
-                    _codec.last_mode_chunks = None
-                state_ref = ray.get(env_handle.step.remote(action_to_env if self.policy_head_config['type'] == "continuous" else action_id,supplementary_logs=vlm_logs,**_step_kw))
+                state_ref = ray.get(env_handle.step.remote(action_to_env if self.policy_head_config['type'] == "continuous" else action_id,supplementary_logs=vlm_logs))
                 if len(state_ref)==2:
                     rgb,state_dict = state_ref
                 elif len(state_ref)==3:
