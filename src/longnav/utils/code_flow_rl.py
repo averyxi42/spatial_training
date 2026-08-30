@@ -116,7 +116,16 @@ class CodeFlowHead(FlowSDEHead):
             idx = logits.argmax(dim=-1)
         else:
             probs = logp.exp()
-            idx = torch.multinomial(probs, 1, generator=self._gen).squeeze(-1)
+            if self._gen is not None and self._gen.device != probs.device:
+                # `seed()` runs at build time, BEFORE the worker moves the head to its
+                # device (vlm_worker builds then `.to(device)`), so a seeded generator is
+                # typically CPU while `probs` is CUDA -- and torch.multinomial requires
+                # them to match. Draw on the GENERATOR's device: 1,600 floats, cost nil,
+                # and the seeded stream keeps its state instead of being re-created.
+                idx = torch.multinomial(probs.to(self._gen.device), 1,
+                                        generator=self._gen).squeeze(-1).to(probs.device)
+            else:
+                idx = torch.multinomial(probs, 1, generator=self._gen).squeeze(-1)
         lp = float(logp[0, idx].item())
         cx, ct = int(idx.item()) // self.n_theta, int(idx.item()) % self.n_theta
         table = self._ensure_table()
