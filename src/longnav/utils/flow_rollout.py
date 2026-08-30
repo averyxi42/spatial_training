@@ -159,6 +159,28 @@ def seed_latent(policy: VectorRolloutPolicy, seed: Optional[int]) -> None:
     codec.latent_generator = gen
 
 
+def seed_code(policy: VectorRolloutPolicy, seed: Optional[int]) -> None:
+    """Seed the CODE stream -- `c ~ p(c|h)` -- leaving `z_0` and the latent alone.
+
+    Needed for reproducibility, not tidiness: `codec.code_generator` defaults to `None`,
+    and `torch.multinomial` with no generator draws from the GLOBAL RNG, which
+    `seed_sampling` does not touch (it seeds `codec.generator`). So a `code_mode="sample"`
+    rollout is NOT reproducible across invocations unless this is called.
+
+    A third stream rather than a reuse of the other two, for the same common-random-numbers
+    reason `latent_generator` is separate: holding `z_0` fixed while varying `c` is how the
+    code's own contribution is isolated, and that needs them independently seedable.
+    """
+    codec = policy.model.codec
+    if seed is None:
+        codec.code_generator = None
+        return
+    device = codec.action_scales.device
+    gen = torch.Generator(device=device if device.type == "cuda" else "cpu")
+    gen.manual_seed(int(seed))
+    codec.code_generator = gen
+
+
 def seed_sampling(policy: VectorRolloutPolicy, seed: Optional[int]) -> None:
     """Reseed the codec's fallback noise generator, or clear it if `seed is None`.
 

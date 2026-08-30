@@ -898,11 +898,34 @@ class FlowActionCodec(nn.Module):
         #: pinning `z_0` to a single tensor, which holds it at one arbitrary slice of the
         #: policy -- measured at 2.4x the ensemble's mean path length.
         self.latent_generator: Optional[torch.Generator] = None
-        #: Inference-time code sampling. `argmax` is deterministic and comparable across
-        #: checkpoints; `sample` is what RL will do. Its own generator, separate from the
-        #: one driving `z_0`, for the same reason `latent_generator` is separate: seeding
-        #: a visualisation reproducibly must not also freeze the flow noise.
-        self.code_mode = "argmax"
+        #: Inference-time code sampling. `sample` IS THE TRAINED POLICY -- SFT fits
+        #: `p(c|h)` by cross-entropy and RL will sample from it -- so it is the default
+        #: and what an ordinary eval must run.
+        #:
+        #: This defaulted to `argmax` when the rollout seam was written, justified as
+        #: "deterministic and comparable across checkpoints". That justification does not
+        #: hold: a constant policy is deterministic too. Determinism is a property of the
+        #: measurement, not a reason to measure a policy other than the one trained.
+        #: Argmax is mode-seeking, and with ObjectNav `code_pred_entropy` ~4.23 against a
+        #: 4.84 marginal it visits materially different codes. Every live rollout before
+        #: 2026-08-28 ran under it, so those behaviour readings describe argmax.
+        #:
+        #: `argmax` stays available as an explicit opt-in for diagnostics that need a
+        #: fixed decode. It has to be asked for, not inherited.
+        #:
+        #: Its own generator, separate from the one driving `z_0`, for the same reason
+        #: `latent_generator` is separate: seeding a visualisation reproducibly must not
+        #: also freeze the flow noise. UNSEEDED IT FALLS THROUGH TO THE GLOBAL RNG, so a
+        #: sampled rollout is not reproducible unless `seed_code` has been called.
+        self.code_mode = "sample"
+        #: `mean`: the probability-weighted MEAN of the decodes of the top-K codes, with
+        #: one shared z_0 -- the "expected action" a categorical head otherwise has no way
+        #: to produce (argmax executes the modal cell, sample executes a draw). Measured
+        #: open-loop on 9,623 held-out ObjectNav turns (dump/audits/policy_pose_error.py):
+        #: per-tick pose RMSE dtheta 0.416 vs 0.553 argmax / 0.586 sample / 0.526 for the
+        #: vanilla h-only head on the same rows. `last_code`/`last_logp` report the argmax
+        #: under this mode, since no single code was executed.
+        self.code_mean_topk = 16
         self.code_temperature = 1.0
         self.code_generator: Optional[torch.Generator] = None
         self.last_code = self.last_logp = self.last_logits = None
@@ -1024,7 +1047,7 @@ class FlowActionCodec(nn.Module):
         _code_head = getattr(self, "code_head", None)
         if _code_head is not None:
             _lg = _code_head.logits(context.float())
-            if self.code_mode == "argmax":
+            if self.code_mode in ("argmax", "mean"):
                 _idx = _lg.argmax(dim=-1)
             else:
                 _p = torch.softmax(_lg / max(float(self.code_temperature), 1e-6), dim=-1)
@@ -1036,8 +1059,29 @@ class FlowActionCodec(nn.Module):
             self.last_logp = torch.log_softmax(_lg, dim=-1).gather(
                 1, _idx[:, None]).squeeze(1).detach()
             self.last_logits = _lg.detach()
-            ctx = self.code_mixer(context, _cx, _ct)
-            _chunk = compose_chunk(self.generate(ctx, noise=None, prefix=prefix))
+            if self.code_mode == "mean":
+                _k = min(int(self.code_mean_topk), _lg.shape[-1])
+                _p = torch.softmax(_lg / max(float(self.code_temperature), 1e-6), dim=-1)
+                _tp, _ti = _p.topk(_k, dim=-1)                       # (N, K)
+                _w = _tp / _tp.sum(dim=-1, keepdim=True)
+                _n = context.shape[0]
+                _mx = self.code_mixer(context.repeat_interleave(_k, dim=0),
+                                      (_ti // _code_head.n_theta).reshape(-1),
+                                      (_ti % _code_head.n_theta).reshape(-1))
+                # ONE z_0 per decision, shared across its K codes: the K decodes then
+                # differ only by the code, so the weighted mean averages over the head's
+                # uncertainty and not over the flow noise as well.
+                _z = torch.randn(_n, self.decoder.n_ticks, self.decoder.n_dims,
+                                 device=_mx.device, dtype=_mx.dtype,
+                                 generator=self.generator)
+                _ch = compose_chunk(self.generate(
+                    _mx, noise=_z.repeat_interleave(_k, dim=0), prefix=prefix))
+                _ch = _ch.reshape(_n, _k, *_ch.shape[1:])
+                _chunk = (_w.to(_ch.dtype)[:, :, None, None] * _ch).sum(dim=1)
+                ctx = self.code_mixer(context, _cx, _ct)
+            else:
+                ctx = self.code_mixer(context, _cx, _ct)
+                _chunk = compose_chunk(self.generate(ctx, noise=None, prefix=prefix))
             # TOP-K ALTERNATIVE MODES, for the video overlay only. Decoded here because
             # this is already where `c` is chosen, so nothing else needs to know the code
             # slot exists; the rollout just reads `last_mode_chunks` off the codec.
@@ -1714,6 +1758,10 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
                 "tok_xy": int(_mx.tok_xy), "tok_theta": int(_mx.tok_theta),
                 "r_hidden": int(_mx.r[0].out_features),
                 "has_tokenizer": getattr(self.normalizer, "tokenizer", None) is not None,
+                # Provenance only: the soft-label kernel is a training-time choice and is
+                # recomputed from the tokenizer when needed, never restored from here.
+                "label_sigma": float(getattr(self, "code_label_sigma", 0.0) or 0.0),
+                "label_metric": str(getattr(self, "code_label_metric", "tick_diff")),
             }
         path.write_text(json.dumps(meta, indent=2))
 
