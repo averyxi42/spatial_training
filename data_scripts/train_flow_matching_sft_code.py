@@ -72,6 +72,21 @@ _CODE_FLAGS = {
                             help="per-factor embedding width in the code head"),
     "--code-r-hidden": dict(type=int, default=None,
                             help="hidden width of r(h); default context_dim"),
+    "--code-label-sigma": dict(type=float, default=0.0,
+                               help="SOFT code targets: width of a Gaussian kernel around "
+                                    "the true code, in the distance metric's units "
+                                    "(tick_diff: multiples of action_scales per tick; the "
+                                    "1600 joint centroids' median nearest-neighbour spacing "
+                                    "is 0.19). 0.10 spreads the target over ~3 cells with "
+                                    "~0.7 of the mass on the true code; 0.15 over ~16. "
+                                    "0 (default) = one-hot CE, bit-identical to every "
+                                    "earlier run. See docs/CODE_SOFT_LABELS.md"),
+    "--code-label-metric": dict(default="tick_diff", choices=["tick_diff", "grid"],
+                                help="distance the soft target is built on. tick_diff "
+                                     "(DEFAULT) = RMS of per-tick body-frame differentials "
+                                     "between cell centroids in action_scales units, all "
+                                     "ticks weighted equally -- the vanilla flow head's own "
+                                     "metric. grid = FSQ lattice L1, a non-metric control"),
     "--code-init-from": dict(default=None,
                              help="WARM START from a c-only prototype head "
                                   "(code_flow_head.pt): loads the flow decoder and BOTH "
@@ -171,7 +186,16 @@ class _BuildProxy:
                                  code_r_hidden=ca.code_r_hidden,
                                  code_head_kind=ca.code_head_kind,
                                  code_head_hidden=ca.code_head_hidden,
-                                 code_log_prior=_load_prior(ca.code_prior))
+                                 code_log_prior=_load_prior(ca.code_prior),
+                                 code_label_sigma=ca.code_label_sigma,
+                                 code_label_metric=ca.code_label_metric)
+        if ca.code_label_sigma > 0:
+            import torch
+            d = model.code_head.label_dist
+            off = d + torch.eye(len(d), device=d.device) * 1e9
+            print(f"[code] SOFT LABELS: metric {ca.code_label_metric}, sigma "
+                  f"{ca.code_label_sigma}; centroid nearest-neighbour distance median "
+                  f"{off.min(1).values.median():.3f}", flush=True)
         n_new = (sum(p.numel() for p in model.code_mixer.parameters())
                  + sum(p.numel() for p in model.code_head.parameters()))
         print(f"[code] attached: +{n_new/1e6:.2f}M params, r(h) zero-init "

@@ -38,6 +38,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from longnav.utils.bin_codec import decompose_chunk
 from longnav.utils.chunk_tokenizer import FrozenChunkTokenizer
 from longnav.utils.flow_matching_head import (
     FlowMatchingSFTTrainer, TurnFlowActionRegressor,
@@ -47,12 +48,107 @@ from longnav.utils.flow_matching_head import (
 #: `code_pred_hist` is a (V,) histogram that sums elementwise into a batch-level
 #: prediction distribution, which is how collapse is detected.
 CODE_METRIC_KEYS = (
-    "code_ce_sum", "code_correct_sum", "code_correct_xy_sum", "code_correct_theta_sum",
+    "code_ce_sum", "code_soft_ce_sum", "code_target_entropy_sum",
+    "code_correct_sum", "code_correct_xy_sum", "code_correct_theta_sum",
     "code_top5_sum", "code_pred_entropy_sum", "code_conf_sum",
     "code_grid_l1_xy_sum", "code_grid_l1_theta_sum",
     "code_within1_xy_sum", "code_within1_theta_sum", "code_within1_both_sum",
+    # METRIC-space diagnostics (need `code_head.label_dist`; installed whenever the
+    # tokenizer is present, soft labels or not, so hard- and soft-label runs share them):
+    #   mdist_argmax     d(argmax code, true code) in action_scales units per tick
+    #   mdist_expected   sum_c p(c|h) d(c, true)  -- what `sample` executes, in expectation
+    #   mass_near        p-mass within `code_near_radius` of the true code
+    #   pmass_target     p(true code) -- the soft loss lets this sit below 1 by design
+    #   stationary_*     stationary-xy share of the teacher, of argmax, and of p in
+    #                    expectation -- the closed-loop-relevant bias, watched from SFT
+    "code_mdist_argmax_sum", "code_mdist_expected_sum", "code_mass_near_sum",
+    "code_pmass_target_sum", "code_stationary_tgt_sum", "code_stationary_argmax_sum",
+    "code_stationary_expected_sum",
     "code_n_valid", "code_pred_hist",
 )
+
+#: Metric radius for `code_mass_near` when no soft label is in force. 0.2 is about one
+#: nearest-neighbour spacing on dual_fsq_40x40 (median 0.19); a soft-label run uses its
+#: own sigma instead, so the number reads as "mass inside the kernel".
+CODE_NEAR_RADIUS_DEFAULT = 0.2
+
+#: Distance metrics a soft code target can be built on. See `code_distance_matrix` and
+#: docs/CODE_SOFT_LABELS.md for why `tick_diff` is the default and `grid` is a control.
+CODE_LABEL_METRICS = ("tick_diff", "grid")
+
+
+@torch.no_grad()
+def code_centroid_chunks(tokenizer: FrozenChunkTokenizer) -> torch.Tensor:
+    """(V, T, 3) PHYSICAL anchor-relative chunk decoded from every joint code.
+
+    Row `c_xy * n_theta + c_theta` (the `joint_index` layout). The tokenizer's `decode`
+    consumes only the quantised code, so this is the exact set of chunks the flow decoder
+    is asked to reproduce -- one centroid per cell, no sampling.
+    """
+    m = tokenizer.model
+    ix = torch.arange(m.vocab_xy, device=tokenizer.xy_scale.device)
+    it = torch.arange(m.vocab_theta, device=tokenizer.xy_scale.device)
+    xy = m.xy.decode(m.xy.fsq.codes_from_index(ix)) * tokenizer.xy_scale           # (Vx, T, 2)
+    th = m.theta.decode(m.theta.fsq.codes_from_index(it)) * tokenizer.theta_scale  # (Vt, T, 1)
+    vx, vt, T = xy.shape[0], th.shape[0], xy.shape[1]
+    xy = xy[:, None].expand(vx, vt, T, 2)
+    th = th[None].expand(vx, vt, T, 1)
+    return torch.cat([xy, th], dim=-1).reshape(vx * vt, T, 3)
+
+
+@torch.no_grad()
+def code_distance_matrix(tokenizer: FrozenChunkTokenizer, action_scales,
+                         metric: str = "tick_diff") -> torch.Tensor:
+    """(V, V) distance between every pair of joint codes, for soft targets.
+
+    `tick_diff` (the default) is the flow head's OWN metric: decode each cell's centroid
+    chunk, take per-tick body-frame differentials with `decompose_chunk` -- the quantity
+    the vanilla flow loss regresses -- divide by `action_scales` (the same exchange rate
+    between translation and rotation the vanilla head was trained under: 0.03 m of
+    translation per tick weighs as much as 0.05 rad of rotation per tick), and take the
+    RMS over ALL ticks and dims with EQUAL tick weights. Equal weights are deliberate:
+    the vanilla loss does not weight ticks either, and differentials -- unlike cumulative
+    poses, whose magnitude grows ~19x from tick 0 to tick 19 -- do not favour the tail on
+    their own. Two codes are close under this metric exactly when the flow decoder would
+    be asked to produce nearly the same velocities, tick for tick.
+
+    `grid` is the L1 lattice distance summed over the two FSQ factors, included as a
+    control: it is what `code_within1_*` reports, and it is NOT metric -- adjacent grid
+    points can be 4 degrees or 40 degrees apart, and the FSQ geometry was fit on cumulative
+    chunks, so its neighbourhoods are endpoint- and tail-shaped.
+    """
+    if metric not in CODE_LABEL_METRICS:
+        raise ValueError(f"metric must be one of {CODE_LABEL_METRICS}, got {metric!r}")
+    m = tokenizer.model
+    V = m.vocab_xy * m.vocab_theta
+    if metric == "grid":
+        idx = torch.arange(V, device=tokenizer.xy_scale.device)
+        cx, ct = idx // m.vocab_theta, idx % m.vocab_theta
+        gx = m.xy.fsq.per_dim_index(cx).float()          # (V, dx)
+        gt = m.theta.fsq.per_dim_index(ct).float()       # (V, dt)
+        g = torch.cat([gx, gt], dim=-1)
+        return (g[:, None] - g[None]).abs().sum(-1)
+    chunks = code_centroid_chunks(tokenizer).double()                 # (V, T, 3)
+    scales = torch.as_tensor([float(s) for s in action_scales], dtype=torch.float64,
+                             device=chunks.device)
+    x = (decompose_chunk(chunks) / scales).reshape(V, -1)             # (V, T*3) unit-ish
+    n = x.shape[1]
+    sq = (x * x).sum(-1)
+    d2 = (sq[:, None] + sq[None] - 2.0 * x @ x.t()) / n               # mean over ticks & dims
+    d2 = d2.clamp_min(0.0)
+    d2.fill_diagonal_(0.0)
+    return d2.sqrt().float()
+
+
+def soft_code_targets(dist: torch.Tensor, tgt: torch.Tensor, sigma: float) -> torch.Tensor:
+    """(N, V) target distribution: a Gaussian kernel in `dist` around each true code.
+
+    `q(c) ∝ exp(-d(c, c*)^2 / (2 sigma^2))`, normalised over the vocabulary. `sigma` is in
+    the units of `dist` (for `tick_diff`, multiples of `action_scales` per tick). As
+    `sigma -> 0` this is the one-hot target and the loss is the ordinary cross-entropy.
+    """
+    d = dist.index_select(0, tgt)                                     # (N, V)
+    return torch.softmax(-(d * d) / (2.0 * float(sigma) ** 2), dim=-1)
 
 
 class CodeContextMixer(nn.Module):
@@ -275,13 +371,33 @@ class TurnFlowActionRegressorWithCode(TurnFlowActionRegressor):
         self._code_cache = None
         logits = self.code_head.logits(context)
         tgt = self.code_head.joint_index(c_xy, c_theta)
-        ce = F.cross_entropy(logits, tgt, reduction="none")
+        sigma = float(getattr(self, "code_label_sigma", 0.0) or 0.0)
+        dist = getattr(self.code_head, "label_dist", None)
+        if sigma > 0.0 and dist is not None:
+            # SOFT TARGET: cross-entropy against a metric kernel around the true code
+            # instead of a one-hot. The 1600 cells are a partition of a METRIC space and
+            # a one-hot scores a 4-degree miss exactly like a 90-degree one; the kernel
+            # says how wrong each cell is in the flow head's own per-tick units. See
+            # docs/CODE_SOFT_LABELS.md. sigma == 0 keeps every existing run bit-identical.
+            q = soft_code_targets(dist, tgt, sigma)
+            ce = -(q * F.log_softmax(logits, dim=-1)).sum(dim=-1)
+        else:
+            q = None
+            ce = F.cross_entropy(logits, tgt, reduction="none")
         # Multiply, never index: an all-invalid batch must still reach every code-head
         # parameter with a (zero) gradient or DDP waits forever for a bucket that never
         # fires -- the same failure class as the cycle-142 NCCL hang.
         w = valid.to(ce.dtype)
         per_turn = self.code_loss_weight * ce * w
-        return per_turn, self._code_metrics(logits.detach(), tgt, c_xy, c_theta, valid)
+        metrics = self._code_metrics(logits.detach(), tgt, c_xy, c_theta, valid)
+        if q is not None:
+            # The hard CE stays in `code_ce_sum` so runs with and without soft labels
+            # compare on the same number; the trained objective and the target's own
+            # entropy (its effective support, in nats) are reported alongside.
+            metrics["code_soft_ce_sum"] = (ce.detach() * w).sum()
+            metrics["code_target_entropy_sum"] = (
+                -(q * q.clamp_min(1e-12).log()).sum(-1) * w).sum()
+        return per_turn, metrics
 
     # -- metrics -----------------------------------------------------------------------
     @torch.no_grad()
@@ -308,7 +424,31 @@ class TurnFlowActionRegressorWithCode(TurnFlowActionRegressor):
 
         hist = torch.zeros(head.vocab, device=logits.device, dtype=torch.float32)
         hist.scatter_add_(0, pred, w)                # collapse detector, see the trainer
+        extra: Dict[str, torch.Tensor] = {}
+        dist = getattr(head, "label_dist", None)
+        if dist is not None:
+            # METRIC diagnostics: the quantity a soft label optimises is distance in the
+            # flow head's per-tick units, and the grid metrics above cannot see it -- a
+            # head can lose strict accuracy while moving its mass to the right
+            # neighbourhood, or keep it while scattering mass across the vocabulary.
+            p = logp.exp()
+            d_row = dist.index_select(0, tgt)                       # (N, V) d(c, true)
+            sigma = float(getattr(self, "code_label_sigma", 0.0) or 0.0)
+            radius = sigma if sigma > 0 else CODE_NEAR_RADIUS_DEFAULT
+            stat = getattr(head, "stationary_code", None)
+            extra = {
+                "code_mdist_argmax_sum": (d_row.gather(1, pred[:, None]).squeeze(1) * w).sum(),
+                "code_mdist_expected_sum": ((p * d_row).sum(-1) * w).sum(),
+                "code_mass_near_sum": ((p * (d_row <= radius).float()).sum(-1) * w).sum(),
+                "code_pmass_target_sum": (p.gather(1, tgt[:, None]).squeeze(1) * w).sum(),
+            }
+            if stat is not None:
+                s = stat.float()
+                extra["code_stationary_tgt_sum"] = (s[tgt] * w).sum()
+                extra["code_stationary_argmax_sum"] = (s[pred] * w).sum()
+                extra["code_stationary_expected_sum"] = ((p * s[None]).sum(-1) * w).sum()
         return {
+            **extra,
             "code_ce_sum": (ce * w).sum(),
             "code_correct_sum": ((pred == tgt).float() * w).sum(),
             "code_correct_xy_sum": ((p_xy == c_xy).float() * w).sum(),
@@ -384,6 +524,9 @@ class CodeSFTTrainer(FlowMatchingSFTTrainer):
             return float(sums[k]) / n
         out[f"{prefix}code_ce"] = mean("code_ce_sum")
         out[f"{prefix}code_perplexity"] = float(torch.tensor(mean("code_ce_sum")).exp())
+        if "code_soft_ce_sum" in sums:
+            out[f"{prefix}code_soft_ce"] = mean("code_soft_ce_sum")
+            out[f"{prefix}code_target_entropy"] = mean("code_target_entropy_sum")
         out[f"{prefix}code_acc"] = mean("code_correct_sum")
         out[f"{prefix}code_acc_xy"] = mean("code_correct_xy_sum")
         out[f"{prefix}code_acc_theta"] = mean("code_correct_theta_sum")
@@ -397,6 +540,22 @@ class CodeSFTTrainer(FlowMatchingSFTTrainer):
         out[f"{prefix}code_within1_xy"] = mean("code_within1_xy_sum")
         out[f"{prefix}code_within1_theta"] = mean("code_within1_theta_sum")
         out[f"{prefix}code_within1"] = mean("code_within1_both_sum")
+        if "code_mdist_argmax_sum" in sums:
+            # Metric-space diagnostics, see CODE_METRIC_KEYS. `mdist_expected` is the
+            # number to watch under soft labels: it is the per-step error the sampled
+            # policy pays, in the units the flow head is trained in.
+            out[f"{prefix}code_mdist_argmax"] = mean("code_mdist_argmax_sum")
+            out[f"{prefix}code_mdist_expected"] = mean("code_mdist_expected_sum")
+            out[f"{prefix}code_mass_near"] = mean("code_mass_near_sum")
+            out[f"{prefix}code_pmass_target"] = mean("code_pmass_target_sum")
+        if "code_stationary_tgt_sum" in sums:
+            out[f"{prefix}code_stationary_tgt"] = mean("code_stationary_tgt_sum")
+            out[f"{prefix}code_stationary_argmax"] = mean("code_stationary_argmax_sum")
+            out[f"{prefix}code_stationary_expected"] = mean("code_stationary_expected_sum")
+            # >0 means the head over-predicts standing still relative to the teacher --
+            # the bias that turns into the look-around loop closed-loop.
+            out[f"{prefix}code_stationary_excess"] = (
+                mean("code_stationary_expected_sum") - mean("code_stationary_tgt_sum"))
         out[f"{prefix}code_n_valid"] = n
         # COLLAPSE DETECTION. A policy head that will later be SAMPLED from is useless if
         # it only ever emits the modal code, and cross-entropy alone will not say so --
@@ -427,7 +586,9 @@ def attach_code_heads(model: TurnFlowActionRegressor, tokenizer: FrozenChunkToke
                       code_loss_weight: float = 1.0, code_d_factor: int = 256,
                       code_r_hidden: Optional[int] = None, code_head_kind: str = "mlp",
                       code_head_hidden: Optional[int] = None,
-                      code_log_prior: Optional[torch.Tensor] = None
+                      code_log_prior: Optional[torch.Tensor] = None,
+                      code_label_sigma: float = 0.0,
+                      code_label_metric: str = "tick_diff",
                       ) -> "TurnFlowActionRegressorWithCode":
     """Promote a normally-built flow head into the `(c, r(h))`-conditioned one.
 
@@ -463,8 +624,40 @@ def attach_code_heads(model: TurnFlowActionRegressor, tokenizer: FrozenChunkToke
     if code_log_prior is not None:
         codec.code_head.init_prior(code_log_prior.to(next(model.parameters()).device))
     model.code_loss_weight = float(code_loss_weight)
+    install_soft_labels(model, code_label_sigma, code_label_metric)
     model._code_cache = None
     return model
+
+
+def install_soft_labels(model, sigma: float, metric: str = "tick_diff") -> None:
+    """Attach the (V, V) code distance matrix the soft target is built from.
+
+    A NON-persistent buffer on the code head: it is a pure function of the frozen tokenizer
+    and `action_scales`, so it is recomputed at build time rather than saved -- and a
+    checkpoint written before this existed still loads strictly. `sigma <= 0` installs
+    nothing and the loss is the one-hot cross-entropy it always was.
+    """
+    codec = model.normalizer
+    sigma = float(sigma or 0.0)
+    model.code_label_sigma = sigma
+    model.code_label_metric = str(metric)
+    tok = getattr(codec, "tokenizer", None)
+    if tok is None:
+        if sigma > 0.0:
+            raise ValueError("soft code labels need the tokenizer on the codec")
+        return
+    # The matrix is installed WHENEVER the tokenizer is present -- with sigma == 0 the
+    # loss stays one-hot, but the metric diagnostics (`code_mdist_*`, `code_mass_near`,
+    # `code_stationary_*`) are then logged for hard-label runs too, so a soft-label run
+    # has a baseline to be read against.
+    dev = next(model.parameters()).device
+    dist = code_distance_matrix(tok, codec.action_scales, metric=metric)
+    codec.code_head.register_buffer("label_dist", dist.to(dev), persistent=False)
+    # Which joint codes stand still: the executed xy displacement of the centroid is
+    # under 0.1 m. Used for the stationary-bias diagnostics.
+    chunks = code_centroid_chunks(tok)
+    stationary = chunks[:, -1, :2].norm(dim=-1) < 0.1
+    codec.code_head.register_buffer("stationary_code", stationary.to(dev), persistent=False)
 
 
 def restore_code_slot(model, spec: Dict) -> None:
@@ -478,6 +671,15 @@ def restore_code_slot(model, spec: Dict) -> None:
     """
     codec, dec = model.normalizer, model.decoder
     model.__class__ = TurnFlowActionRegressorWithCode
+    build_code_slot_shell(codec, dec, spec)
+    model._code_cache = None
+
+
+def build_code_slot_shell(codec, dec, spec: Dict) -> None:
+    """The codec-level half of `restore_code_slot`: shape-only modules, ready for a
+    STRICT weight load. Factored out (2026-08-30, byte-identical construction) so the
+    RL loader (`flow_sde_policy.load_flow_stack`), which has a codec but no
+    `TurnVectorRegressor`, can restore the same slot the SFT/eval loader does."""
     codec.code_mixer = CodeContextMixer(
         int(spec["n_xy"]), int(spec["n_theta"]), context_dim=dec.context_dim,
         d_model=dec.d_model, n_tokens=dec.n_context_tokens,
@@ -488,7 +690,7 @@ def restore_code_slot(model, spec: Dict) -> None:
         kind=spec.get("head_kind", "mlp"), hidden=spec.get("head_hidden"),
         d_factor=int(spec.get("d_factor") or 256))
     if spec.get("has_tokenizer"):
-        # Shape-only shell; `load_trainable` fills it. Built from the recorded levels so
+        # Shape-only shell; the strict load fills it. Built from the recorded levels so
         # the FSQ grids match the ones the codes were assigned with.
         from longnav.utils.chunk_tokenizer import DualTokenizer
 
@@ -504,7 +706,6 @@ def restore_code_slot(model, spec: Dict) -> None:
         shell.strict_wrap_guard = True
         shell.checkpoint_path = "<restored from checkpoint>"
         codec.tokenizer = shell
-    model._code_cache = None
 
 
 def _levels_for(vocab: int):
