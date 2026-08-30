@@ -52,6 +52,10 @@ rollout:
     - type: text
       text: '**forward**'
   stop_prob_threshold: null
+  use_oracle_action: false
+  rtc_overlap: false
+  reject_blind_episodes: false
+  reject_blind_keep_physical_terminal: true
 vlm:
   model_id: Phyllis1/qwen3_sft_sft_sparse_03drop_single_action_20260103_210803_ckpt10800
   attn_impl: flash_attention_2
@@ -71,9 +75,11 @@ vlm:
     gaussian_max_log_std: 2.0
     continuous_action_clip_low: -1.0
     continuous_action_clip_high: 1.0
+    action_head_init_seed: null
   offload_cache: false
   use_sparse: true
   save_outputs: false
+  merge_adapter_dir: null
 sim:
   _target_: longnav.env.env_base.DummyContinuousEnvActor
 task:
@@ -82,10 +88,15 @@ task:
     _target_: longnav.utils.logging_workers.WandbLoggerActor
     project: cont_dev
   shard_size: 6
-  subset_label: sample400_a
+  subset_label: ''
   episode_json: ''
   output_dir: ./dump/results
   jobtype: eval
+  eval_every: 4
+  eval_set_size: 0
+  eval_seed: 0
+  eval_uids_file: null
+  eval_ode: true
 training:
   checkpoint: null
   load_optim: false
@@ -98,6 +109,9 @@ training:
   warmup_steps: 32
   save_step: 8
   action_head_learning_rate: 0.0005
+  weight_decay: null
+  max_grad_norm: 1.0
+  freeze_backbone: false
   peft_config:
     r: 128
     lora_alpha: 256
@@ -116,7 +130,9 @@ training:
     use_rslora: false
   rl_config:
     value_head: null
+    state_probe: null
     advantage_estimator: reinforce_plus_plus
+    retime_commit_rewards: true
     n_rollout: 16
     n_adv: 256
     n_epoch: 2
@@ -141,8 +157,12 @@ training:
     distance_pad_mode: replicate
     distance_pad_val: null
     entropy_bonus: 0.0
+    token_weighted_loss: false
+    bootstrap_truncated: false
     use_ref: true
     kl_coeff: 0.001
     kl_target: 0.1
+    ref_kl: false
+    ref_kl_coeff: 0.0
     global_batch_info: {}
   sft_config: null
