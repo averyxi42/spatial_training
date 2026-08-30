@@ -278,8 +278,12 @@ def compute_advantages_and_returns(
         r_commit = traj_batch["r_commit"]
         next_commit = torch.zeros_like(r_commit)
         next_commit[:, :-1] = r_commit[:, 1:]
-        rewards = traj_batch["r_fresh"] + (rewards - traj_batch["r_fresh"]
-                                           - r_commit) + gamma * next_commit
+        rewards = (traj_batch["r_fresh"] + (rewards - traj_batch["r_fresh"]
+                                            - r_commit) + gamma * next_commit).float()
+        # .float(): r_commit/r_fresh arrive float64 when the env emits numpy scalars,
+        # and a float64 rewards tensor propagates into Double returns/baseline while
+        # the kernel critic predicts float32 -- the index_put dtype crash of the first
+        # code_rl_a0 launch. Identity for float32 inputs.
         # (rewards - r_fresh - r_commit) preserves any non-split reward component
         # exactly; with the env's exhaustive split it is ~0 by construction.
         traj_batch["rewards"] = rewards

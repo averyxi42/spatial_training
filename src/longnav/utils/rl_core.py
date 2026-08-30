@@ -54,7 +54,7 @@ def collate_trajectories(trajectory_list: list[dict], device='cpu'):
         try:
             for arr in arrays:
                 t = torch.tensor(arr, device=device)
-                if key in ['rewards', 'values', 'old_logprobs', 'old_log_prob', 'logprobs', 'ref_logprobs', 'rollout_logprobs', 'actions_continuous']:
+                if key in ['rewards', 'values', 'old_logprobs', 'old_log_prob', 'logprobs', 'ref_logprobs', 'rollout_logprobs', 'actions_continuous', 'r_commit', 'r_fresh']:
                     t = t.float() # Ensure float32
                 elif key in ['actions']:
                     t = t.long()  # Ensure int32 for pointer
