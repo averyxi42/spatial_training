@@ -10,6 +10,21 @@ turning, `corr(|forward|,|rotation|) = -0.835`); the search is not (34 m travell
 of net approach). The hypothesis below explains the rotation specifically, and it is the
 user's, recorded here with the mechanism made precise.
 
+> **RETRACTION OF THE ORIGIN (2026-08-30).** Every rollout cited above — and every
+> `dump/code_viz/live*` rollout through `live12000` — executed at `--gap 5 --dt 0.05`
+> (their own `episodes.partial.jsonl`: 5 ticks/step, `motion.dt_s` 0.05), against the
+> corpus's `obs_stride_frames 10, dt 0.04`. That is the harness's documented "Silently
+> wrong #1" (`habitat_physical_nav_rtc/docs/SAMPLE101_EVALS.md`): twice the trained replan
+> rate, a longer tick, half of every chunk discarded. The vanilla SFT checkpoint
+> (`run_cotrain_v3_nopose_mix`) spins and freezes identically under it. At the trained
+> cadence the same `ck12000` moves like the expert (stationary share 0.45 vs corpus 0.46,
+> turn sign-flip 0.25 vs 0.21, lag-1 autocorr 0.51 vs 0.70) under both `sample` and
+> `argmax`; see `dump/code_viz/g10_*` and `dump/audits/code_sft_conditioning_audit_2026-08-30.md`
+> §9. The "aggressive, inexplicable rotation" was the harness, not the policy, and this
+> document's motivating observation is withdrawn. The hypothesis below is retained as a
+> hypothesis only; the separate measurement that non-overlapping code history adds ~0.07
+> nats on top of the image (audit §8) does not support it as a priority.
+
 ---
 
 ## 1. The observation the hypothesis has to explain

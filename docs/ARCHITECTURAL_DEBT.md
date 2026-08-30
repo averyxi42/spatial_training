@@ -219,3 +219,8 @@ competing explanations are still open and some are more likely:
   rollout ran with pose injection ON, feeding markers the model never saw on an ObjectNav
   conversation. Reruns use `--no-pose-injection`
   (`habitat_physical_nav/scripts/run_code_modes_viz.sh`).
+* **The eval cadence was mismatched too, and this one changed the conclusion.** Every
+  `live*` rollout ran at `--gap 5 --dt 0.05` against a corpus stride of 10 at dt 0.04; at
+  the trained cadence the checkpoint's motion statistics match the expert. Do not read any
+  behavioural claim from a rollout whose `episodes.partial.jsonl` shows `ticks/steps != 10`.
+  See `docs/LIVE_ROLLOUT_CADENCE.md`.
