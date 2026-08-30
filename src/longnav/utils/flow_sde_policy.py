@@ -572,6 +572,15 @@ def load_flow_stack(checkpoint_dir, dtype: torch.dtype = torch.float32):
         action_scales=(meta.get("fm_config") or {}).get("action_scales", (0.03, 0.03, 0.05)),
         latent=latent,
     )
+    if meta.get("fm_code"):
+        # A code-conditioned checkpoint: rebuild the code slot (code_head / code_mixer /
+        # tokenizer shell) so the strict load below has somewhere to put those weights --
+        # the same restore the SFT/eval loader performs (flow_matching_head.py, from
+        # from_pretrained). GUARDED on the meta key: a checkpoint without `fm_code` takes
+        # the path below byte-identically to before this branch existed.
+        from longnav.utils.code_conditioned_head import build_code_slot_shell
+
+        build_code_slot_shell(codec, decoder, meta["fm_code"])
     blob = torch.load(d / HEAD_WEIGHTS_FILE, map_location="cpu", weights_only=False)
     readout.load_state_dict(blob["head"], strict=True)
     codec.load_state_dict(blob["normalizer"], strict=True)

@@ -1,0 +1,8 @@
+description: "Path A0 code-only RL (code_flow_head over the a09 held128 recipe)."
+composables: []
+overrides:
+  - +resources=quad
+  - +training=hapo
+  - +experiment=code_rl_held128
+assert_sim_target: longnav.env.objectnav_continuous.ContinuousObjectNavEnvActor
+assert_policy_head_type: continuous

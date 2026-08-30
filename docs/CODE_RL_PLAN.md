@@ -1,6 +1,6 @@
 # RL with the code-conditioned policy: what is pending
 
-Status: **plan.** Nothing built. The design was settled in `CODE_CONDITIONED_POLICY.md` §6;
+Status: **plan.** Nothing built. **Superseded in ordering by `CODE_RL_PLAN_V2.md` (2026-08-30)**; the §9 gate result, §1 option analysis and the addendum below still stand. The design was settled in `CODE_CONDITIONED_POLICY.md` §6;
 this is the gap between that design and the code as it stands, in dependency order, plus the
 decisions that must be taken before any of it starts.
 
@@ -269,3 +269,38 @@ SMOKE  one cycle on the dummy env, then a real short run
   discrete action is more sample-efficient here is the hypothesis the build exists to test.
 * Nothing has been run. The blocker in §2 was found by reading, and the rest of the gap
   analysis is a `grep` plus the design doc.
+
+## Addendum (2026-08-30): metric generalisation of RL credit, and a kernel on the advantage
+
+Measured on the hard-CE `run_code_v4_mlp_warm` checkpoints
+(`dump/audits/code_head_geometry.py`): the policy head's output rows are only weakly
+organised by motion similarity (Spearman +0.24 at ck12000 against the per-tick metric;
++0.15 cosine to the 5 metric-nearest cells vs 0.00 to random), while the decoder-side code
+embeddings are strongly metric (+0.67 / +0.76). Consequence for RL: a policy-gradient
+update on a sampled code stays mostly on that code — 1,600 arms per state with a thin
+metric prior from the shared hidden layer. See `CODE_SOFT_LABELS.md` §"Experiment plan"
+for the SFT-side fix (soft targets) and the before/after measurement.
+
+**Where the metric prior should live, and where it must not.** The goal is a learnt
+inductive bias: efficient by default, correctable by an unbiased objective when its
+assumptions are wrong. That rules the prior *in* for two places and *out* for one:
+
+1. **The representation** (soft-label SFT, `CODE_SOFT_LABELS.md`). Neighbouring output rows
+   start correlated, so a plain per-code policy gradient spills credit onto metric
+   neighbours through the shared hidden layer — yet the rows stay independent parameters,
+   so if the reward says two neighbours differ, RL can pull them apart, paying in samples
+   rather than in bias. This is the preferred mechanism.
+2. **The reference policy.** With the soft-labelled SFT checkpoint as `π_ref`, the existing
+   `KL(π‖π_ref)` term pulls exploration toward metric-smooth distributions. That is an
+   unbiased gradient of the *regularised* objective, and the regularisation weight is an
+   explicit dial that can go to zero. Nothing new to build.
+3. **NOT the estimator.** Spreading the advantage over neighbours with the distance matrix
+   (`A(c') = Σ_c A(c) K(c, c')`) changes the policy gradient into one that is no longer the
+   gradient of the return under the sampling policy, and it can never learn that two
+   neighbouring cells should differ unless the kernel width goes to zero. Whatever it
+   assumes is permanent. Keep it as a diagnostic (does metric credit help at all?) or a
+   last resort if (1) fails to move the output-row geometry; do not make it the plan.
+
+The soft-label run's geometry numbers (`CODE_SOFT_LABELS.md` §"Experiment plan") decide
+whether (1) has done its job; the RL objective itself stays the plain per-code policy
+gradient in every case.

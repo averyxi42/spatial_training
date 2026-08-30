@@ -1,0 +1,146 @@
+# @package _global_
+# Path A0: code-only RL over the fixed table actuator -- the held128 twin of
+# flow_sde_freezehead_a09_held128, differing ONLY in the policy head (and the keys that
+# head does not have). docs/CODE_RL_PLAN_V2.md sections 2 and 9; longnav/utils/code_flow_rl.py.
+#
+# WHAT THE ACTION IS. One code c in [0,1600) per decision, sampled from the tempered
+# categorical pi_T = softmax(logits(h)/T), T = 0.5 (the sample101 decode comparison; the
+# ratio, the reference KL and rollout sampling all use the same T). The executed chunk is
+# a PRECOMPUTED lookup decoder(mixer(c, r=0), z0=0) -- measured the best decode of every
+# z0 regime and independent of theta, which is what keeps the code-only estimator exact
+# (V2 sections 9.1/9.12). Eval cycles (task.eval_ode) run ARGMAX -- the fixed decode,
+# mirroring the chain runs' eval-ODE convention.
+#
+# THE FREEZE, load-bearing twice: action_head_learning_rate 0.0 freezes readout, decoder,
+# mixer AND code head, so (1) the trainable surface is the LoRA alone (pi moves only
+# through h, the freeze-head arm's structure), and (2) disable_adapter() remains an EXACT
+# SFT reference -- rl_config.ref_kl stays meaningful with no frozen-copy machinery.
+# Training the code head itself requires that machinery (V2 section 2.3 A6); do not just
+# raise the lr.
+#
+# entropy_bonus MUST stay 0: rl_loss's chain-head guard raises otherwise (this head rides
+# the chain seams by design). The anti-collapse watch is ref/kl_k1 plus the ratio/clip
+# gauges; the code-entropy TERM (V2 section 2.3 A5) is not built, so watch, don't leash.
+#
+# CHECKPOINT: v4 (hard CE) for now -- the v6 soft-label run decides its replacement on
+# sample101 + geometry (V2 section 5); this file changes two lines when it does
+# (checkpoint_dir and merge_adapter_dir must always point at the SAME checkpoint).
+#
+# LAUNCH FROM THIS WORKTREE, EXPLICITLY: the longnav_vlm env's editable install points at
+# /Projects/spatial_training/src (the flowsde worktree), which has neither this head nor
+# this yaml. Launch with
+#   bash data_scripts/launch_code_rl_a0.sh          # (or the documented shape:)
+#   cd /Projects/spatial_training_tok && PYTHONPATH=/Projects/spatial_training_tok/src \
+#     python3 -m longnav.scripts.train_rl +resources=quad +training=hapo \
+#     +experiment=code_rl_held128 task.run_name=<name>
+# and note resources.vlm_conda_env / habitat_conda_env spawn Ray actors that re-import:
+# the runtime_env must carry the same PYTHONPATH or the actors run flowsde code silently.
+#
+# Everything below the head block is byte-for-byte the a09 held128 recipe: same 128
+# train uids, same pinned eval 26, same reward shape, lr 2e-6, grad_accum 2, HAPO via
+# `+training=hapo` on the command line, same wandb project.
+
+defaults:
+  - override /policy_head@vlm.policy_head: code_flow_head
+  - override /sim: objectnav_continuous
+
+resources:
+  # The documented landmine (LATENT_RL_ENV.md): config_schema defaults vlm_conda_env to
+  # "longnav" but this machine's env is longnav_vlm. Pinned here as on flow_sde_rtc_held128.
+  vlm_conda_env: longnav_vlm
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  # The SFT LoRA baked into the base; the trainable LoRA is a fresh zero-delta, and
+  # peft's disable_adapter() is therefore an exact reference to SFT.
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_code_v4_mlp_warm/checkpoint-12000/adapter
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_code_v4_mlp_warm/checkpoint-12000
+    gap: 10
+    policy_temperature: 0.5
+    # Seeded: the code draw is the ONLY policy stochasticity (the actuator is a table),
+    # so an unseeded run is unrepeatable in its entirety, not just in a diagnostic.
+    code_seed: 0
+    merge_radius: 0.0
+
+sim:
+  episodes: /Projects/spatial_training/data/datasets/objectnav/hm3d/v1_train100x80
+  exclude_categories: [plant]
+  train_uids: /Projects/spatial_training/dump/eval_system/episode_sets/trainset128.txt
+  scene_root: /Projects/spatial_training/data/scene_datasets
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 0.4
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: false
+  reward_lost_steps: 25
+
+rollout:
+  max_steps: 175
+  # Byte-identical to the SFT corpus format (see flow_sde_objectnav_v3.yaml's header).
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  checkpoint: null
+  load_optim: false
+  load_sched: false
+  learning_rate: 2.0e-6
+  # THE FREEZE -- see the header. Gradients flow THROUGH the frozen code head into the
+  # LoRA; the head itself is pinned to SFT.
+  action_head_learning_rate: 0.0
+  grad_accum_steps: 2
+  max_grad_norm: 20.0
+  rl_config:
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    # Measure-only tether, as on the a09 arm. NOTE the code ratio moves in TENTHS of
+    # nats (three orders above the chain term the clip bands were established on):
+    # expect clipping on real fractions of tokens in the first cycles, read
+    # chain/abs_log_ratio_mean against a FRESH band, and set ref_kl_coeff from the
+    # measured k1 scale if the leash is ever armed (V2 section 9.5).
+    ref_kl: true
+    ref_kl_coeff: 0.0
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "cont_dev"
+  run_name: "code_rl_a0_held128"   # change per run to prevent local/wandb conflicts
+  output_dir: /Projects/spatial_training/dump/flow_rl
+  subset_label: "everything"
+  shard_size: 0
+  eval_every: 4
+  eval_set_size: 32
+  eval_uids_file: /Projects/spatial_training/dump/eval_system/episode_sets/fullpool_evalset_servable26.txt
+  # For this head the "ODE" eval switch means ARGMAX (deterministic decode).
+  eval_ode: true

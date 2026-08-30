@@ -170,7 +170,46 @@ class ValueHeadConfig:
     readout_offset: int = 0
 
 
+@dataclass
+class CodeFlowHeadConfig:
+    """Path A0: the discrete code as the whole action, the flow decode as a fixed table.
+
+    See docs/CODE_RL_PLAN_V2.md sections 2 and 9 and `longnav.utils.code_flow_rl`.
+    `type: continuous` for the same reason the chain head's is: dispatch is by head
+    CAPABILITY (`sample_chain_np`/`chain_log_prob_batch`), so every existing path --
+    discrete, Gaussian, latent, chain -- is untouched by this config existing.
+
+    FIRST-RUN CONTRACT (the a09 freeze): `training.action_head_learning_rate: 0.0` and
+    `vlm.merge_adapter_dir` set, so the code head is frozen and `disable_adapter()` is an
+    exact SFT reference. Training the code head itself needs frozen-copy reference
+    machinery that is not built.
+    """
+
+    _target_: str = "longnav.utils.code_flow_rl.CodeFlowHead"
+    type: str = "continuous"
+    # A CODE-CONDITIONED SFT checkpoint (meta carries `fm_code`). No default.
+    checkpoint_dir: Optional[str] = None
+    gap: int = 10
+    # The policy IS the tempered categorical pi_T = softmax(logits/T); sampling, the
+    # ratio, and the reference KL all use the same T (V2 section 1). 0.5 from the
+    # sample101 decode comparison.
+    policy_temperature: float = 0.5
+    # Seeds the head's private code-sampling stream; None = fresh draws.
+    code_seed: Optional[int] = None
+    # V2 section 2.7 class merging -- NOT BUILT; any nonzero value raises at build.
+    merge_radius: float = 0.0
+    # Present-but-unused keys, same reason as on the chain head: config lookups that
+    # assume a Gaussian head must not KeyError.
+    continuous_action_clip_low: float = float("-inf")
+    continuous_action_clip_high: float = float("inf")
+    logprob_reduction: str = "sum"
+    gaussian_init_log_std: float = -0.5
+    gaussian_min_log_std: float = -20.0
+    gaussian_max_log_std: float = 2.0
+
+
 cs.store(name="lm_head", group="policy_head", node=LMHeadConfig())
 cs.store(name="gaussian_head", group="policy_head", node=GaussianHeadConfig())
 cs.store(name="latent_head", group="policy_head", node=LatentHeadConfig())
 cs.store(name="flow_sde_head", group="policy_head", node=FlowSDEHeadConfig())
+cs.store(name="code_flow_head", group="policy_head", node=CodeFlowHeadConfig())
