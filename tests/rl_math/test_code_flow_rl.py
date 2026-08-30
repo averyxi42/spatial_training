@@ -149,3 +149,21 @@ def test_sampling_parity_with_the_denormalize_seam():
         chain, *_ = head.sample_chain_np(hs[i].numpy())
         rl_codes.append([int(chain[0]), int(chain[1])])
     assert rl_codes == seam_codes
+
+
+def test_overlay_modes_fill_matches_the_table_topk():
+    head = _head(T=0.5)
+    head.overlay_modes_k = 3
+    h = np.random.RandomState(2).randn(CTX).astype(np.float32)
+    chain, _, _, _ = head.sample_chain_np(h)
+    assert head.last_mode_chunks is not None and head.last_mode_chunks.shape == (3, 6, 3)
+    logits = head._logits(torch.tensor(h).reshape(1, -1))
+    top = torch.topk(logits[0], 3).indices
+    table = head._ensure_table()
+    assert np.allclose(head.last_mode_chunks, table[top].cpu().numpy(), atol=1e-6)
+    p = head.last_mode_probs
+    assert (np.diff(p) <= 1e-7).all() and p.sum() <= 1.0 + 1e-6
+    # off by default: a fresh head fills nothing
+    h2 = _head()
+    h2.sample_chain_np(h)
+    assert h2.last_mode_chunks is None

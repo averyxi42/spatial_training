@@ -341,10 +341,21 @@ class EpisodeRolloutMixin:
                 # D. Store Transition
                
 
-                # D. Step Simulator (Blocking) ---------------------------RAY----------------------------- 
+                # D. Step Simulator (Blocking) ---------------------------RAY-----------------------------
                 t0 = time.time()
                 # del rgb,state_dict
-                state_ref = ray.get(env_handle.step.remote(action_to_env if self.policy_head_config['type'] == "continuous" else action_id,supplementary_logs=vlm_logs))
+                # Alternative modes for the video overlay, when the ACTION HEAD filled
+                # them this step (CodeFlowHead's table top-K; docs/CODE_RL_PLAN_V2.md
+                # section 10). Read-and-clear from the head, passed as an explicit kwarg
+                # and only when non-empty, so every other env and head keeps its exact
+                # signature and this line is a no-op on every existing path.
+                _step_kw = {}
+                _ah = getattr(getattr(self, "model", None), "action_head", None)
+                _modes = getattr(_ah, "last_mode_chunks", None)
+                if _modes is not None:
+                    _step_kw["mode_chunks"] = _modes
+                    _ah.last_mode_chunks = None
+                state_ref = ray.get(env_handle.step.remote(action_to_env if self.policy_head_config['type'] == "continuous" else action_id,supplementary_logs=vlm_logs,**_step_kw))
                 if len(state_ref)==2:
                     rgb,state_dict = state_ref
                 elif len(state_ref)==3:

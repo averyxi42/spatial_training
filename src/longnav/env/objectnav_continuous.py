@@ -424,6 +424,47 @@ class ContinuousObjectNavEnvActor:
     def _on_tick(self):
         return self._metrics_on_tick if self.tick_metrics else self._video_on_tick
 
+    #: Colour per mode rank. Not cycled -- more modes than this and the extras are
+    #: simply not drawn, because an ambiguous colour is worse than a missing line.
+    MODE_COLORS = ((90, 160, 255), (255, 90, 90), (90, 220, 140), (255, 190, 60),
+                   (200, 130, 255), (80, 220, 230))
+
+    def _overlay_modes(self, rgb: np.ndarray) -> np.ndarray:
+        """Project the policy's alternative mode chunks into the VIDEO frame only.
+
+        Resurrection of the dc4f711 overlay (removed in 09b30b6 because no RL head
+        filled it; CodeFlowHead now does -- docs/CODE_RL_PLAN_V2.md section 10), with one
+        hardening change: the drawing happens on a COPY. `_render()` returns a view of
+        habitat's sensor buffer and cv2 draws in place; habitat re-renders per get_obs so
+        annotation should never persist into the policy's observation, but that guarantee
+        must not rest on the simulator's buffer semantics. The observation path
+        (`_render()` at step/reset) never calls this method.
+
+        Uses `continuous_demos.viewport_overlay` because Habitat's `DebugLineRender`
+        draws into the interactive viewer and NOT into offscreen sensor observations
+        (measured there at 0 pixels changed). Never raises: a debug overlay must not be
+        able to take down a rollout.
+        """
+        modes = getattr(self, "_mode_chunks", None)
+        if modes is None or self._robot_sim is None:
+            return rgb
+        try:
+            from continuous_demos.viewport_overlay import draw_commanded_chunk
+
+            out = rgb.copy()
+            for i, ch in enumerate(modes[: len(self.MODE_COLORS)]):
+                # One call per mode. `draw_commanded_chunk` owns the whole transform --
+                # chunk -> world XY via the exact inverse of the training target
+                # transform, navmesh height, camera matrix, projection, polyline -- and
+                # returns the frame unchanged if anything is missing.
+                out = draw_commanded_chunk(
+                    out, self._robot_sim, self._mode_anchor, ch,
+                    sensor_uuid=self.sensor_uuid,
+                    color=self.MODE_COLORS[i], thickness=2)
+            return out
+        except Exception:
+            return rgb
+
     def _video_on_tick(self, record) -> None:
         """Executor tick hook: capture every `video_tick_stride`-th physics tick.
 
@@ -448,7 +489,8 @@ class ContinuousObjectNavEnvActor:
         if self._video_tick % self._video_tick_stride:
             return
         if self._video_capture:
-            self._video_frames.append(self._encode_frame(self._render()))
+            self._video_frames.append(self._encode_frame(
+                self._overlay_modes(self._render())))
             self._video_meta.append((self._steps, float(record.sim_time)))
 
     def _write_video(self, save_dir: str) -> Dict[str, str]:
@@ -497,6 +539,9 @@ class ContinuousObjectNavEnvActor:
         return [e.uid for e in self._episodes]
 
     def reset(self):
+        # Stale modes from the previous episode would draw against a dead anchor on the
+        # first ticks of the new one; the overlay starts blank until the first step.
+        self._mode_chunks = None
         self._load_episodes()
         while True:
             try:
@@ -625,13 +670,21 @@ class ContinuousObjectNavEnvActor:
         if not self._commit_done:
             self._execute_commitment()
 
-    def step(self, action, supplementary_logs: Optional[Dict[str, Any]] = None):
+    def step(self, action, supplementary_logs: Optional[Dict[str, Any]] = None,
+             mode_chunks=None):
         """`action`: without RTC, the `(gap, 3)` chunk prefix the policy head already
         truncated -- the historical contract, unchanged. With RTC, the FULL
         `(n_ticks, 3)` chunk: this actor owns the slicing (docs/RTC_RL.md section 5) --
         the scheduler tiles the interval as committed ticks + fresh span and retains
         the tail as the next commitment's source."""
         chunk = np.asarray(action, dtype=np.float64).reshape(-1, 3)
+        # Alternative modes the policy considered, for the VIDEO overlay only. A separate
+        # kwarg rather than a key in `supplementary_logs`, which feeds a scalar-metric
+        # aggregator that a (K, T, 3) array would break. Never read by the dynamics and
+        # never written into `obs`.
+        if mode_chunks is not None:
+            self._mode_chunks = np.asarray(mode_chunks, dtype=np.float64)
+            self._mode_anchor = self._robot_sim.get_2d_pose()
         base_geo = self._prev_geodesic
         if not self._rtc:
             if len(chunk) != self.gap:

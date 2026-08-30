@@ -37,7 +37,8 @@ from longnav.utils.flow_sde_policy import (
 class CodeFlowHead(FlowSDEHead):
     """`hidden_states -> {"h"}`, plus the code sampler/scorer and the table actuator."""
 
-    def __init__(self, readout, codec, gap: int, policy_temperature: float = 0.5):
+    def __init__(self, readout, codec, gap: int, policy_temperature: float = 0.5,
+                 overlay_modes_k: int = 0):
         # The SDEConfig is inert scaffolding (nothing here integrates stochastically);
         # constructed only so the parent's shape bookkeeping and module registration are
         # inherited unchanged.
@@ -54,6 +55,13 @@ class CodeFlowHead(FlowSDEHead):
         self.n_theta = int(codec.code_head.n_theta)
         self.vocab = int(codec.code_head.vocab)
         self._table: Optional[torch.Tensor] = None      # (V, n_ticks, 3) physical chunks
+        #: >0 fills `last_mode_chunks` each sample with the top-K tempered-logit codes'
+        #: TABLE ROWS, for the env's video overlay (docs/CODE_RL_PLAN_V2.md section 10).
+        #: Free of decoder passes and of RNG -- pure argsort + lookup -- so unlike the
+        #: denormalize overlay it cannot perturb the executed trajectory. 0 costs nothing.
+        self.overlay_modes_k = int(overlay_modes_k)
+        self.last_mode_chunks: Optional[np.ndarray] = None   # (K, n_ticks, 3) physical
+        self.last_mode_probs: Optional[np.ndarray] = None    # (K,) under pi_T
 
     # -- the fixed actuator ------------------------------------------------------------
     @torch.no_grad()
@@ -111,7 +119,16 @@ class CodeFlowHead(FlowSDEHead):
             idx = torch.multinomial(probs, 1, generator=self._gen).squeeze(-1)
         lp = float(logp[0, idx].item())
         cx, ct = int(idx.item()) // self.n_theta, int(idx.item()) % self.n_theta
-        chunk = self._ensure_table()[int(idx.item()), : self.gap].cpu().numpy()
+        table = self._ensure_table()
+        chunk = table[int(idx.item()), : self.gap].cpu().numpy()
+        if self.overlay_modes_k > 0:
+            # Video-overlay modes: the K most probable codes' full table chunks. The
+            # rollout reads-and-clears `last_mode_chunks` and ships it to the env on a
+            # dedicated step kwarg; the dynamics and the observation never see it.
+            k = min(self.overlay_modes_k, self.vocab)
+            top = torch.topk(logp[0], k)
+            self.last_mode_chunks = table[top.indices].cpu().numpy()
+            self.last_mode_probs = top.values.exp().cpu().numpy()
         return (np.array([cx, ct], dtype=np.float32),
                 np.zeros(1, dtype=np.int64),
                 lp,
@@ -162,7 +179,8 @@ class CodeFlowHead(FlowSDEHead):
                              "SFT checkpoint)")
         readout, codec, _ = load_flow_stack(ckpt, dtype=dtype)
         head = cls(readout=readout, codec=codec, gap=int(cfg["gap"]),
-                   policy_temperature=float(cfg.get("policy_temperature", 0.5)))
+                   policy_temperature=float(cfg.get("policy_temperature", 0.5)),
+                   overlay_modes_k=int(cfg.get("overlay_modes_k", 0) or 0))
         seed = cfg.get("code_seed")
         if seed is not None:
             head.seed(int(seed))

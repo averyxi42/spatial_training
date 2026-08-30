@@ -508,3 +508,61 @@ precomputed 1,600-entry table `decoder(emb(c), 0, z0=0)` — Path A is discrete 
 learned motion primitives, and the decoder is not in the rollout loop at all. RTC-A runs the
 same decoder as a prefix-conditioned completer with `z0 = 0` (the table becomes infinite in
 the prefix; the flow head is needed exactly there). Random `z0` is the ablation.
+
+## 10. Feature analysis: top-K code-path overlay in RL training videos (2026-08-30)
+
+**Requested**: the eval harness's top-K mode overlay, in the videos the RL run logs.
+
+**Videos are logged**: `code_rl_held128.yaml` sets `minimal_logging: false`, so the env
+actor writes one MP4 per episode (`vid/episode_video` to wandb) from frames captured every
+`video_tick_stride: 2` physics ticks.
+
+**A corpse exists and its cause of death is repaired by A0.** Commit dc4f711 built exactly
+this (env `step(mode_chunks=)` kwarg -> `_mode_chunks`/`_mode_anchor` -> `_overlay_modes`
+in `_video_on_tick` via `continuous_demos.viewport_overlay.draw_commanded_chunk`; rollout
+pass-through reading `codec.last_mode_chunks`); 09b30b6 removed it because the Ray path
+never fills `last_mode_chunks` -- RL heads bypass `denormalize`, so the code slot never
+fired. `CodeFlowHead` repairs precisely that: the top-K modes are the K highest tempered
+logits' TABLE ROWS, available inside `sample_chain_np` with no decoder pass and no RNG.
+Resurrect the 56 removed lines, fill `mode_chunks` from the head (K rows + probs), done.
+
+**Cost, bounded**:
+* GPU: **zero** for A0 (table lookups; the old denormalize version decoded K x M chunks and
+  needed RNG snapshot/restore -- none of that exists here).
+* Ray transfer: K=5 x (20,3) float32 + probs ~= 1.3 KB per step, riding the existing
+  `step.remote` call.
+* Sim-actor CPU: `draw_commanded_chunk` is "one 4x4 inverse, an (L+1)-point projection and
+  one cv2.polylines" (its own docstring, quoted against ~3 ms for the render). K=5 draws on
+  each captured frame, ~5 frames per decision (gap 10 / stride 2): ~1-2 ms/frame, so
+  **~5-10 ms per env step**, against a 150-500 ms policy step. Worst case ~3%, typical ~1%
+  -- far inside the 15% budget. If it ever matters, `video_tick_stride` or a
+  draw-every-Nth-frame knob halves it.
+
+**Contamination analysis (the real requirement)**:
+* The policy's observation and the video frames are SEPARATE renders: obs rgb comes from
+  `_render()` at the step/reset boundary (`objectnav_continuous.py:541, :778`); video
+  frames from their own `_render()` calls inside `_video_on_tick`, JPEG-encoded
+  immediately. The overlay lives only in the video path, one function deep.
+* Residual risk: `_render()` returns a VIEW of habitat's sensor buffer and cv2 draws in
+  place; habitat re-renders the buffer on every `get_obs`, so annotation cannot persist
+  into the next obs render -- but the guarantee should not rest on habitat's buffer
+  semantics. **Rule for the resurrection: draw on `rgb.copy()`** (one line, ~1 ms for
+  640x480, inside the budget above).
+* `mode_chunks` stays a SEPARATE step kwarg, never a `supplementary_logs` key (that dict
+  feeds a scalar aggregator, and a (K,T,3) array would break it -- the removed code's own
+  note) and is never written into `obs`; the dynamics never read it.
+* Eval-cycle determinism: unaffected -- the modes are argsorted logits already in hand and
+  the drawing consumes no RNG (unlike the denormalize overlay, which had to snapshot four
+  RNG streams).
+
+**BUILT (2026-08-30, same day):** 09b30b6 reverted with the `.copy()` hardening and a
+reset-time stale-mode clear; the rollout pass-through reads-and-clears the ACTION HEAD's
+`last_mode_chunks` (kwarg emitted only when non-empty, so every other head/env keeps its
+exact signature); `CodeFlowHead.overlay_modes_k` fills the top-K tempered-logit table rows
+(no decoder pass, no RNG); `overlay_modes_k: 5` in `code_rl_held128.yaml`. Tests: the
+head-side top-K fill, and a real-run_episode pass-through test with a recording env actor
+(kwarg present iff filled; historical signature byte-identical when off).
+
+**Verdict: build it with the A0 head** (~70 lines: revert 09b30b6 + `.copy()` + the head
+filling `last_mode_chunks` from the table + an `overlay_modes_k` env/rollout knob,
+default 5, 0 = off). Cost is ~1-3%, well under the bar.

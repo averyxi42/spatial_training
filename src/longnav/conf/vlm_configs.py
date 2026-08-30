@@ -198,6 +198,9 @@ class CodeFlowHeadConfig:
     code_seed: Optional[int] = None
     # V2 section 2.7 class merging -- NOT BUILT; any nonzero value raises at build.
     merge_radius: float = 0.0
+    # >0 draws the top-K code paths into the LOGGED VIDEOS (table lookups, no decoder
+    # pass, no RNG; ~1-3% env-side CPU -- V2 section 10). The observation is untouched.
+    overlay_modes_k: int = 0
     # Present-but-unused keys, same reason as on the chain head: config lookups that
     # assume a Gaussian head must not KeyError.
     continuous_action_clip_low: float = float("-inf")
