@@ -559,7 +559,14 @@ Resurrect the 56 removed lines, fill `mode_chunks` from the head (K rows + probs
 reset-time stale-mode clear; the rollout pass-through reads-and-clears the ACTION HEAD's
 `last_mode_chunks` (kwarg emitted only when non-empty, so every other head/env keeps its
 exact signature); `CodeFlowHead.overlay_modes_k` fills the top-K tempered-logit table rows
-(no decoder pass, no RNG); `overlay_modes_k: 5` in `code_rl_held128.yaml`. Tests: the
+(no decoder pass, no RNG); `overlay_modes_k: 5` in `code_rl_held128.yaml`. Row 0 of
+`mode_chunks` is the SELECTED (executed) code by contract, drawn thick white on top; rows
+1.. are the top-K alternatives by rank colour, selected excluded -- under sampling the
+executed code is not the top-probability one, so without the convention the chosen path is
+anonymous. Also built: `rl_config.code_entropy_coeff`, the discrete-code analogue of
+`entropy_bonus` (which the chain guard rejects for this head); pi_T entropy is logged as
+`code/entropy_piT` always, applied to the loss only at nonzero coeff (default 0.0 --
+watch, don't leash). Tests: the
 head-side top-K fill, and a real-run_episode pass-through test with a recording env actor
 (kwarg present iff filled; historical signature byte-identical when off).
 

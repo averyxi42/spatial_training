@@ -1378,6 +1378,22 @@ class VLMTrainingMixin:
             entropy_loss = -entropy*self.rl_algo_config.entropy_bonus
             metrics['train/entropy'] = entropy.detach().item()
             loss = loss+entropy_loss
+        # DISCRETE-CODE entropy (CodeFlowHead rides the chain branch, whose guard above
+        # rightly rejects entropy_bonus). Additive and inert on every other path: only a
+        # chain-capability head that also exposes `_logits` (the tempered code logits) has
+        # a categorical to take entropy of. Logged ALWAYS for such a head -- the collapse
+        # watch of docs/CODE_RL_PLAN_V2.md section 2.5 -- and applied to the loss only
+        # when rl_config.code_entropy_coeff is nonzero.
+        _code_logits_fn = getattr(_chain_head, "_logits", None) if _is_chain else None
+        if _code_logits_fn is not None and policy_stats is not None:
+            _code_ent_coeff = float(getattr(self.rl_algo_config, 'code_entropy_coeff', 0.0) or 0.0)
+            _hh = policy_stats['h']
+            _lg = _code_logits_fn(_hh.reshape(-1, _hh.shape[-1])).float()
+            _lp = torch.log_softmax(_lg, dim=-1)
+            _ent = (-(_lp.exp() * _lp).sum(-1)).reshape(response_mask.shape)[response_mask]
+            metrics['code/entropy_piT'] = _ent.mean().detach().item()
+            if _code_ent_coeff != 0.0:
+                loss = loss - _code_ent_coeff * _ent.mean()
 
         if self.policy_head_config['type'] != "continuous" and ref_log_probs is not None and self.rl_algo_config.kl_coeff is not None:
             kld = compute_full_kl_penalty(log_probs,ref_log_probs.to(log_probs.device))

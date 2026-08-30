@@ -151,18 +151,23 @@ def test_sampling_parity_with_the_denormalize_seam():
     assert rl_codes == seam_codes
 
 
-def test_overlay_modes_fill_matches_the_table_topk():
+def test_overlay_modes_selected_first_then_topk_alternatives():
     head = _head(T=0.5)
     head.overlay_modes_k = 3
     h = np.random.RandomState(2).randn(CTX).astype(np.float32)
-    chain, _, _, _ = head.sample_chain_np(h)
-    assert head.last_mode_chunks is not None and head.last_mode_chunks.shape == (3, 6, 3)
-    logits = head._logits(torch.tensor(h).reshape(1, -1))
-    top = torch.topk(logits[0], 3).indices
+    chain, _, _, chunk = head.sample_chain_np(h)
+    m = head.last_mode_chunks
+    assert m is not None and m.shape == (4, 6, 3)          # selected + 3 alternatives
     table = head._ensure_table()
-    assert np.allclose(head.last_mode_chunks, table[top].cpu().numpy(), atol=1e-6)
-    p = head.last_mode_probs
-    assert (np.diff(p) <= 1e-7).all() and p.sum() <= 1.0 + 1e-6
+    sel = int(chain[0]) * N_TH + int(chain[1])
+    # row 0 IS the executed code's chunk (its prefix is what the env executed)
+    assert np.allclose(m[0], table[sel].cpu().numpy(), atol=1e-6)
+    assert np.allclose(m[0][: head.gap], chunk, atol=1e-6)
+    # rows 1.. are the top-K by pi_T with the selected code excluded
+    logits = head._logits(torch.tensor(h).reshape(1, -1))
+    alts = [j for j in torch.topk(logits[0], 4).indices.tolist() if j != sel][:3]
+    assert np.allclose(m[1:], table[torch.tensor(alts)].cpu().numpy(), atol=1e-6)
+    assert head.last_mode_probs.shape == (4,)
     # off by default: a fresh head fills nothing
     h2 = _head()
     h2.sample_chain_np(h)

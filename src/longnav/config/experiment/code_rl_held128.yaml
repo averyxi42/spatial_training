@@ -122,7 +122,15 @@ training:
   grad_accum_steps: 2
   max_grad_norm: 20.0
   rl_config:
+    # OVERRIDES hapo's 0.002 (verified in composition): the chain-branch guard raises on
+    # nonzero for this head. The discrete-code analogue is code_entropy_coeff below --
+    # its pi_T entropy is LOGGED as code/entropy_piT regardless, and 0.0 is deliberate:
+    # watch, don't leash; the anti-collapse leash of choice is KL-to-reference
+    # (V2 sections 2.5/9.6 -- a uniform-over-cells bonus is biased toward driving in
+    # motion space). Arm by setting a small positive value (hapo's discrete scale was
+    # 0.002 on a 1.4-nat action space; ours is ~2-4 nats at T=0.5).
     entropy_bonus: 0.0
+    code_entropy_coeff: 0.0
     n_epoch: 1
     token_weighted_loss: true
     bootstrap_truncated: false

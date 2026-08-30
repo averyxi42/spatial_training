@@ -424,8 +424,14 @@ class ContinuousObjectNavEnvActor:
     def _on_tick(self):
         return self._metrics_on_tick if self.tick_metrics else self._video_on_tick
 
-    #: Colour per mode rank. Not cycled -- more modes than this and the extras are
-    #: simply not drawn, because an ambiguous colour is worse than a missing line.
+    #: Row 0 of `mode_chunks` is the SELECTED (executed) code by contract
+    #: (CodeFlowHead.sample_chain_np): drawn thick and white so the chosen path is
+    #: unambiguous -- under sampling the executed code is NOT the top-probability one,
+    #: so rank colours alone cannot identify it.
+    SELECTED_COLOR = (255, 255, 255)
+    SELECTED_THICKNESS = 4
+    #: Colour per ALTERNATIVE rank (rows 1..). Not cycled -- more modes than this and the
+    #: extras are simply not drawn, because an ambiguous colour is worse than a missing line.
     MODE_COLORS = ((90, 160, 255), (255, 90, 90), (90, 220, 140), (255, 190, 60),
                    (200, 130, 255), (80, 220, 230))
 
@@ -452,7 +458,9 @@ class ContinuousObjectNavEnvActor:
             from continuous_demos.viewport_overlay import draw_commanded_chunk
 
             out = rgb.copy()
-            for i, ch in enumerate(modes[: len(self.MODE_COLORS)]):
+            # Alternatives FIRST, selected LAST, so the chosen path is drawn on top
+            # where the polylines overlap near the robot.
+            for i, ch in enumerate(modes[1: 1 + len(self.MODE_COLORS)]):
                 # One call per mode. `draw_commanded_chunk` owns the whole transform --
                 # chunk -> world XY via the exact inverse of the training target
                 # transform, navmesh height, camera matrix, projection, polyline -- and
@@ -461,6 +469,10 @@ class ContinuousObjectNavEnvActor:
                     out, self._robot_sim, self._mode_anchor, ch,
                     sensor_uuid=self.sensor_uuid,
                     color=self.MODE_COLORS[i], thickness=2)
+            out = draw_commanded_chunk(
+                out, self._robot_sim, self._mode_anchor, modes[0],
+                sensor_uuid=self.sensor_uuid,
+                color=self.SELECTED_COLOR, thickness=self.SELECTED_THICKNESS)
             return out
         except Exception:
             return rgb

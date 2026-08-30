@@ -122,13 +122,20 @@ class CodeFlowHead(FlowSDEHead):
         table = self._ensure_table()
         chunk = table[int(idx.item()), : self.gap].cpu().numpy()
         if self.overlay_modes_k > 0:
-            # Video-overlay modes: the K most probable codes' full table chunks. The
-            # rollout reads-and-clears `last_mode_chunks` and ships it to the env on a
-            # dedicated step kwarg; the dynamics and the observation never see it.
+            # Video-overlay modes. CONTRACT (the env draws by it): row 0 is the SELECTED
+            # (executed) code's full table chunk; rows 1.. are the top-K alternatives by
+            # pi_T, the selected code excluded so no line is drawn twice. Under sampling
+            # the executed code is not the top-probability one, so without row 0 the
+            # chosen path would be visually anonymous. The rollout reads-and-clears
+            # `last_mode_chunks` and ships it on a dedicated step kwarg; the dynamics
+            # and the observation never see it.
             k = min(self.overlay_modes_k, self.vocab)
-            top = torch.topk(logp[0], k)
-            self.last_mode_chunks = table[top.indices].cpu().numpy()
-            self.last_mode_probs = top.values.exp().cpu().numpy()
+            top = torch.topk(logp[0], min(k + 1, self.vocab))
+            sel = int(idx.item())
+            alts = [int(j) for j in top.indices.tolist() if j != sel][:k]
+            order = [sel] + alts
+            self.last_mode_chunks = table[torch.tensor(order, device=table.device)].cpu().numpy()
+            self.last_mode_probs = logp[0, torch.tensor(order, device=logp.device)].exp().cpu().numpy()
         return (np.array([cx, ct], dtype=np.float32),
                 np.zeros(1, dtype=np.int64),
                 lp,

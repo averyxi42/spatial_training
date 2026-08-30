@@ -14,11 +14,14 @@ GPUS=${GPUS:-4,5,6,7}
 RUN_NAME=${RUN_NAME:-code_rl_a0_held128}
 RESOURCES=${RESOURCES:-quad}   # 4 VLMs + 5 sims; hapo n_rollout 16 divides 4
 
-# Refuse a launch onto busy devices rather than OOM into someone's job.
+# Refuse a launch without headroom rather than OOM into someone's job. The bound is on
+# FREE memory, not zero-usage: GPUs 4-7 legitimately carry co-tenant eval runs (tens of
+# GB), and the a09 recipe ran beside them; a VLM shard + sim needs ~25 GB.
+MIN_FREE_MIB=${MIN_FREE_MIB:-25000}
 for g in ${GPUS//,/ }; do
-  used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$g")
-  if [ "$used" -gt 2000 ]; then
-    echo "GPU $g has ${used} MiB in use; refusing to launch (set GPUS to free devices)" >&2
+  free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$g")
+  if [ "$free" -lt "$MIN_FREE_MIB" ]; then
+    echo "GPU $g has only ${free} MiB free (< $MIN_FREE_MIB); refusing to launch" >&2
     exit 2
   fi
 done

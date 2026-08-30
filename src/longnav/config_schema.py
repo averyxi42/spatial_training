@@ -66,6 +66,15 @@ class RLAlgoConfig:
     n_rollout: int = 12 # note: must be divisible by num vlms times gradient accumulation
     n_adv: int = 256 # number of trajectories for advantage estimation, must > n_rollout
     n_epoch: int = 2 # number of policy gradient epochs
+    # Entropy coefficient for a DISCRETE-CODE policy head (CodeFlowHead): the analogue of
+    # `entropy_bonus`, which the chain-head guard in rl_loss deliberately rejects (chain
+    # entropy is schedule-fixed; docs/FLOW_SDE_RL.md failure mode 2) -- the code head
+    # rides the chain branch, so it needs its own key. Entropy of pi_T from the head's
+    # own tempered logits; logged as code/entropy_piT whenever the head exposes it,
+    # regardless of this value. 0.0 = watch, don't leash (docs/CODE_RL_PLAN_V2.md
+    # sections 2.5/9.6: the anti-collapse leash of choice is KL-to-reference, because a
+    # uniform-over-cells entropy bonus is biased toward driving in MOTION space).
+    code_entropy_coeff: float = 0.0
 
     # PPO Hyperparameters
     clip_ratio: float = 0.2
