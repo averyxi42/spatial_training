@@ -106,3 +106,19 @@ def test_collect_rollouts_signature_defaults_to_off():
     sig = inspect.signature(collect_rollouts)
     assert sig.parameters["respect_rejections"].default is False
     assert sig.parameters["max_dispatch_factor"].default == 3.0
+
+
+class TestZeroTurnVerdict:
+    """A DOA serve (done at reset, no sentinel) is rejected regardless of the blind
+    flag -- the collector replaces it need-based instead of padding duplicates -- but
+    only for envs that speak the rejection protocol (they emit blind_total)."""
+
+    def test_zero_turn_rejected_even_with_blind_rejection_off(self):
+        w = _Verdict()                                        # feature off
+        assert w._episode_rejected(_info(steps=0)) is True
+        assert w._episode_rejected(_info(steps=3)) is False   # normal episode untouched
+
+    def test_zero_turn_on_a_dummy_env_is_not_rejected(self):
+        w = _Verdict()
+        info = {"episode_label": "s:1", "steps": 0}           # no blind_total: dummy env
+        assert w._episode_rejected(info) is False

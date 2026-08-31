@@ -115,6 +115,16 @@ class EpisodeRolloutMixin:
         does not emit it can never be rejected, which is the right default for the
         dummy/discrete envs that have no such notion.
         """
+        # A ZERO-TURN SERVE (done at reset without the exhausted sentinel -- a DOA
+        # episode) is unusable for any training purpose, so it is rejected REGARDLESS of
+        # the blind-rejection flag: the collector then replaces it need-based (no
+        # duplicate padding, no postprocess dispatch). Scoped by the env's rejection
+        # protocol, not by config: `blind_total` is the continuous env's signature, and
+        # the discrete/dummy envs -- whose flush_logs_to_disk cannot take rejected= --
+        # never emit it, so they are byte-identical to before.
+        if ('blind_total' in final_info and 'steps' in final_info
+                and not int(final_info['steps'] or 0)):
+            return True
         cfg = self.rollout_config
         if not cfg.get('reject_blind_episodes'):
             return False
@@ -705,11 +715,12 @@ class RLActor(RLWorker):
         return is_exhausted,state_dict
     
     def postprocess_episode(self,return_inputs = True,eval=False):
-        # ZERO-TURN GUARD (2026-08-31): an episode that is done at reset without the
-        # exhausted sentinel (a DOA serve) reaches here with no recorded turns, and
-        # `_pack_embeds`'s torch.cat on the empty outputs killed a whole run 23 cycles
-        # in. Same containment as a failed episode: loud print, None trajectory, and
-        # run_rollout_cycle drops it as a unit (pads with duplicated survivors).
+        # ZERO-TURN BACKSTOP (2026-08-31): on the TRAINING path a zero-turn (DOA) serve
+        # is rejected by `_episode_rejected` and replaced need-based before postprocess
+        # is ever dispatched. This guard covers the paths that deliberately IGNORE
+        # rejections (eval keeps its pinned denominator) plus any future caller: without
+        # it, `_pack_embeds`'s torch.cat on the empty outputs killed a whole run 23
+        # cycles in. Failed-episode containment: loud print, None trajectory, dropped.
         if not getattr(self, "outputs", {}).get('position_ids'):
             print("EPISODE_FAILED (zero-turn episode: done before any policy turn); dropped")
             return None, None, None
