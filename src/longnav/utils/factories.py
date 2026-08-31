@@ -193,8 +193,9 @@ class SimWorkerFactory:
         env_actor_cls = get_class(target)
 
         env_dict = {}
-        if res_cfg.habitat_conda_env is not None:
-            env_dict = {"conda": res_cfg.habitat_conda_env}
+        sim_env = getattr(res_cfg, "sim_conda_env", None) or res_cfg.habitat_conda_env
+        if sim_env is not None:
+            env_dict = {"conda": sim_env}
         RemoteSim = ray.remote(env_actor_cls).options(
             resources={res_cfg.sim_resource_tag: 1},
             num_cpus=res_cfg.sim_cpus,

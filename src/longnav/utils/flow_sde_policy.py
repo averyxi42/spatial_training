@@ -355,6 +355,12 @@ class FlowSDEHead(nn.Module):
                 prefix_full[:, :d] = self.codec.scale(p).float()
             time_of = lambda t_k: prefix_time(t_k, prefix_mask)   # noqa: E731
         admissible = K - cfg.n_exclude_last
+        if self._gen.device != dev:
+            # The generator was made at construction (CPU) and the head moved since;
+            # re-home it on the parameters' device, keeping its seed.
+            g = torch.Generator(device=dev)
+            g.manual_seed(int(self._gen.initial_seed()))
+            self._gen = g
         perm = torch.randperm(admissible, generator=self._gen, device=dev)[: cfg.n]
         positions = perm.sort().values
         if self.force_ode:

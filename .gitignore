@@ -20,3 +20,8 @@ panoramic_phase_free_videos/
 
 # From continuous_action: RL scenario fixtures write rendered demos here.
 tests/compose_demos/output/
+# mshab branch: vendored ManiSkill/mshab checkouts and downloaded SAPIEN assets
+third_party/
+data_mshab/
+setup/install_mshab_env.log
+setup/download_assets.log

@@ -1,0 +1,122 @@
+# @package _global_
+# DIAGNOSTIC: the HM3D-trained flow policy on ReplicaCAD scenes RENDERED BY HABITAT.
+# Splits the MS-HAB degradation into content gap (this run) vs renderer gap (SAPIEN).
+# 24 generated episodes in v3_sc1_staging_13 (the MS-HAB eval scene), stock eval stack.
+# RTC eval through the RL stack (`longnav.scripts.eval`) on the pinned sample101 set --
+# the cross-path parity run docs/RTC_RL.md section 6 phase 1 requires: the same
+# checkpoint the harness scored, evaluated by the Ray path, at the same delay points.
+#
+# Legs are CLI overrides on this one file:
+#   baseline (comparable to every historical number; NO scheduler is constructed):
+#       +experiment=flow_rtc_eval_hm3dval
+#   masked latency, d = 5 (200 ms):
+#       +experiment=flow_rtc_eval_hm3dval sim.rtc_delay_source=fixed sim.rtc_delay=5
+#   same, with opportunistic overlap (wall-clock only; trajectories must not move):
+#       ... sim.rtc_delay_source=fixed sim.rtc_delay=5 rollout.rtc_overlap=true
+#
+# The checkpoint must be RTC-trained (fm_config.rtc_delay_max >= rtc_delay); the head
+# raises on a prefix it was not built to read, and eval.py forces the pure ODE sampler
+# on every worker (the interleaved path's own guard, now applied here too).
+
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+resources:
+  num_vlms: 1
+  num_sims: 1
+  vlm_gpu_fraction: 0.5
+  sim_gpu_fraction: 0.3
+  osm_gb: 8
+  vlm_conda_env: longnav_vlm
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_rtc_ft9000_geo/checkpoint-12000/adapter
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_rtc_ft9000_geo/checkpoint-12000
+    gap: 10
+    sde_n: 3
+    # Inert here -- eval.py sets force_ode on every worker -- but SDEConfig requires an
+    # explicit value by design (no default exists to inherit silently).
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+    # Seeds the head's own generator (per worker) so an eval run is reproducible.
+    # Without it the ODE base noise is fresh per run and d>0 oracle moved +-3 pts
+    # across replicates (measured 2026-08-24: 0.485/0.515/0.545 at d=5).
+    sde_seed: 1000
+
+sim:
+  episodes: /Projects/spatial_training_mshab/data_mshab/objnav_replicacad/val
+  scene_root: /Projects/spatial_training_mshab/data_mshab/data/scene_datasets
+  # sample101 comparability: the harness convention exactly -- 1.0 m success radius and
+  # NO category exclusions (the pinned set contains plant episodes).
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 1.0
+  navmesh: dataset
+  minimal_logging: false   # video per episode
+  body: kinematic
+  collision_penalty: 0.0
+  reward_lost_steps: 25
+  # A fixed episode stream so legs are paired episode-for-episode.
+  seed: 0
+  # The harness conventions, both: raw spawns (no navmesh snap), and NO robot-mesh
+  # reachability screen -- the pinned set includes ~30 episodes the robot mesh calls
+  # goal_unreachable, which the harness's reference numbers score as failures.
+  snap_start: false
+  screen_reachability: false
+  tick_metrics: true
+  # RTC off by default (the historical env, bit for bit); legs override on the CLI.
+  rtc_delay_source: none
+  rtc_delay: 0
+  rtc_delay_seed: 0
+
+rollout:
+  max_steps: 175
+  rtc_overlap: false
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  checkpoint: null
+  rl_config:
+    gamma: 0.97
+    n_rollout: 24
+    n_adv: 48
+
+task:
+  eval_uids_file: /Projects/spatial_training_mshab/data_mshab/objnav_replicacad/uids24.txt
+  logger: null
+  # The pinned set, in the env's own uid grammar (the same file the harness uses).
+  # eval.py assigns it explicitly per sim -- see the pinned-eval block there.
+  shard_size: 6
+  run_name: "replicacad_habitat_diag_kinematic"
+  output_dir: /Projects/spatial_training_mshab/dump/mshab_deploy
+  jobtype: eval
+  eval_ode: true

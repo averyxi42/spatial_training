@@ -1,0 +1,102 @@
+# @package _global_
+# Deploy the continuous ObjectNav flow policy (SFT cotrain-v3 rtc_ft9000_geo ck12000, pure
+# ODE) in a ManiSkill-HAB ReplicaCAD apartment on Fetch. Verification of the sim backend,
+# not a benchmark: the policy has never seen this domain. Chunk cadence is the SFT one
+# (dt=0.04, gap=10); lateral motion is dropped by the non-holonomic base. Records a video
+# per episode with the 3-D chunk projected into the MS-HAB third-person camera.
+#
+#   cd /Projects/spatial_training_mshab && PYTHONPATH=src python3 -m longnav.scripts.eval \
+#       +experiment=mshab_flow_deploy resources.ray_address=<isolated head>
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: mshab
+
+resources:
+  num_vlms: 1
+  num_sims: 1
+  vlm_gpu_fraction: 0.5
+  sim_gpu_fraction: 0.3
+  vlm_conda_env: longnav_vlm
+  sim_conda_env: mshab
+  osm_gb: 8
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  merge_adapter_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_rtc_ft9000_geo/checkpoint-12000/adapter
+  policy_head:
+    checkpoint_dir: /Projects/spatial_training/dump/pose_injection/run_cotrain_v3_rtc_ft9000_geo/checkpoint-12000
+    gap: 10
+    sde_n: 3
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+    sde_seed: 1000
+
+sim:
+  task: tidy_house
+  subtask: navigate
+  split: train
+  action_mode: base_chunk
+  gap: 10
+  dt: 0.04
+  max_episode_steps: 175     # 70 s: the corpus/habitat-diag budget (matched protocol)
+  width: 640
+  height: 480
+  fov: 1.094               # VERTICAL fov: corpus hfov 79 deg at 4:3
+  torso_lift: 0.0          # head camera 1.06 m (corpus 0.88 m); rest keyframe would be 1.45 m
+  tuck_arm: true
+  goal_categories: [chair, sofa, plant, tv_monitor]
+  success_distance: 1.0
+  end_on_success: true
+  seed: 0
+  scene_index: 0
+  max_plans: 16
+  end_on_fail: false
+  record_video: true
+  video_every: 1
+  chase_camera: false
+  holonomic_base: true
+  episode_budget: 12         # 4 categories x 3 spawns
+  minimal_logging: true
+
+rollout:
+  max_steps: 175
+  rtc_overlap: false
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  checkpoint: null
+
+task:
+  logger: null
+  shard_size: 3
+  episode_json: ""
+  subset_label: ""
+  run_name: "mshab_objectnav_eval_70s"
+  output_dir: /Projects/spatial_training_mshab/dump/mshab_deploy
+  jobtype: eval
+  eval_ode: true

@@ -16,6 +16,9 @@ class ResourceConfig:
     num_sims: int = 1
     vlm_conda_env: Optional[str] = "longnav"
     habitat_conda_env: Optional[str] = "vln"
+    # Conda env for sim actors when the sim is not habitat (e.g. "mshab"); None falls
+    # back to habitat_conda_env. Sim actors and the VLM env must share the ray version.
+    sim_conda_env: Optional[str] = None
     vlm_gpu_fraction: float = 0.7
     sim_gpu_fraction: float = 0.14
     vlm_cpus: int = 4

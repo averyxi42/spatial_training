@@ -77,6 +77,9 @@ class ContinuousObjectNavEnvActor:
         rtc_delay_base: float = 0.8,
         rtc_delay_seed: int = 0,
         rtc_overrun_rate: float = 0.0,
+        # "physical" (Bullet robot + PID) | "kinematic" (cylinder agent, chunks
+        # executed exactly on the navmesh -- longnav.env.kinematic_sim).
+        body: str = "physical",
         snap_start: bool = True,
         screen_reachability: bool = True,
         tick_metrics: bool = False,
@@ -88,6 +91,7 @@ class ContinuousObjectNavEnvActor:
         self.max_steps = int(max_steps)
         self.success_distance = float(success_distance)
         self.navmesh_choice, self.distance_to = navmesh, distance_to
+        self.body = str(body)
         self.sensor_uuid, self.width, self.height = sensor_uuid, int(width), int(height)
         self.pid_preset = pid_preset
         self.episode_source_kind = episode_source
@@ -1027,7 +1031,12 @@ class ContinuousObjectNavEnvActor:
             self._scene_id = episode.scene_id
             self._rebuild_task_and_executor()
             return
-        self._robot_sim, _ = build_scene_simulator(episode, self._sim_config())
+        if self.body == "kinematic":
+            from longnav.env.kinematic_sim import build_kinematic_sim
+
+            self._robot_sim, _ = build_kinematic_sim(episode, self._sim_config())
+        else:
+            self._robot_sim, _ = build_scene_simulator(episode, self._sim_config())
         self._scene_id = episode.scene_id
         self._rebuild_task_and_executor()
 
@@ -1043,12 +1052,21 @@ class ContinuousObjectNavEnvActor:
             distance_to=self.distance_to, scene_id=self._scene_id,
             scene_root=self.scene_root, live_height=True,
         )
-        self._executor = ChunkExecutor(
-            self._robot_sim, PIDPoseController(self._robot_sim,
-                                               build_pid_config(self.pid_preset, None)),
-            dt=self.dt, gap=self.gap, collect_contacts=self.collision_penalty > 0.0,
-            log_camera=False, sensor_uuid=self.sensor_uuid,
-        )
+        if self.body == "kinematic":
+            from longnav.env.kinematic_sim import KinematicChunkExecutor
+
+            self._executor = KinematicChunkExecutor(
+                self._robot_sim, dt=self.dt, gap=self.gap,
+                collect_contacts=self.collision_penalty > 0.0,
+                sensor_uuid=self.sensor_uuid,
+            )
+        else:
+            self._executor = ChunkExecutor(
+                self._robot_sim, PIDPoseController(self._robot_sim,
+                                                   build_pid_config(self.pid_preset, None)),
+                dt=self.dt, gap=self.gap, collect_contacts=self.collision_penalty > 0.0,
+                log_camera=False, sensor_uuid=self.sensor_uuid,
+            )
         self._screener = None
 
     def _sim_config(self):

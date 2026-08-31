@@ -177,6 +177,63 @@ class ContinuousObjectNavEnvConfig:
     # Injected chunk-toss probability per decision (fallback A: hold). Deployment-time
     # disturbance only; keep 0 during training.
     rtc_overrun_rate: float = 0.0
+    # Embodiment: physical (Bullet robot + PID) | kinematic (exact chunk on navmesh).
+    body: str = "physical"
+
+
+@dataclass
+class MSHabEnvConfig:
+    """ManiSkill-HAB env on SAPIEN (Fetch). docs/MSHAB_INTEGRATION.md.
+
+    Runs in conda env `mshab` -- set resources.sim_conda_env=mshab. action_mode "joint": one
+    env step is a chunk of `gap` 13-d joint-delta actions, one sim step each (20 Hz).
+    action_mode "base_chunk": the continuous ObjectNav (gap, 3) SE(2) chunk at `dt` per tick,
+    tracked by the non-holonomic base (lateral dropped); arm tucked and held."""
+
+    _target_: str = "longnav.env.mshab.MSHabEnvActor"
+    task: str = "tidy_house"           # tidy_house | prepare_groceries | set_table
+    subtask: str = "pick"              # pick | place | open | close | navigate | sequential
+    split: str = "train"
+    asset_dir: Optional[str] = "/Projects/spatial_training_mshab/data_mshab"
+    task_plan_fp: Optional[str] = None
+    spawn_data_fp: Optional[str] = None
+    max_episode_steps: int = 200       # POLICY steps
+    gap: int = 1
+    dt: float = 0.04
+    action_mode: str = "joint"
+    obs_mode: str = "rgb"
+    sim_backend: str = "gpu"
+    shader_dir: str = "minimal"
+    width: int = 256
+    height: int = 256
+    fov: Optional[float] = None        # radians; ManiSkill's Fetch default is 2.0
+    camera: str = "fetch_head"
+    tuck_arm: bool = False
+    head_tilt: float = 0.0
+    torso_lift: Optional[float] = None  # 0.0 puts the head camera at ~1.06 m (rest keyframe: 1.45 m)
+    instruction: Optional[str] = None
+    # ObjectNav on top of the navigate env: cycle these categories per episode; goal = nearest
+    # scene instance (frl_apartment_* template match), geodesic via MS-HAB's floor map.
+    goal_categories: Optional[List[str]] = None
+    # Episode-matched mode: restore this habitat scene_instance furniture arrangement and
+    # serve the habitat-generated episodes (starts/categories/goals) in order.
+    match_scene_instance: Optional[str] = None
+    match_episodes_json: Optional[str] = None
+    success_distance: float = 1.0
+    end_on_success: bool = True
+    seed: Optional[int] = None
+    max_plans: int = 64
+    scene_index: int = 0
+    success_bonus: float = 0.0
+    fail_penalty: float = 0.0
+    end_on_fail: bool = True
+    record_video: bool = False
+    video_every: int = 1
+    chase_camera: bool = False
+    video_layout: str = "full"    # full composite | headcam (bare policy view, tiling parity)
+    holonomic_base: bool = False   # (vx, vy, w) base like the SFT corpus; False = Fetch diff-drive
+    episode_budget: int = 0        # >0: actor reports exhausted after this many episodes
+    minimal_logging: bool = True
 
 
 @dataclass
@@ -196,6 +253,7 @@ class ReplayEnvConfig:
 
 
 cs.store(name="habitat", group="sim", node=HabitatEnvConfig())
+cs.store(name="mshab", group="sim", node=MSHabEnvConfig())
 cs.store(name="voxel", group="sim", node=HabitatEnvConfig(
     voxel_kwargs={
         "patch_size": 32,

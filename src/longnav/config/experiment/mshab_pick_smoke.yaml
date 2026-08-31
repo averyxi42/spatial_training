@@ -1,0 +1,45 @@
+# @package _global_
+# ManiSkill-HAB smoke: Fetch pick subtask (TidyHouse/train) driven by the continuous
+# Gaussian head over the 14-d pd_joint_delta_pos action. Establishes that the sim actor
+# plumbs through Ray/rollout_core, nothing more -- no checkpoint has seen this domain.
+# docs/MSHAB_INTEGRATION.md.
+#
+#   python3 -m longnav.scripts.train_rl +training=hapo +resources=octo +experiment=mshab_pick_smoke \
+#       resources.vlm_conda_env=longnav_vlm
+defaults:
+  - override /policy_head@vlm.policy_head: gaussian_head
+  - override /sim: mshab
+
+resources:
+  sim_conda_env: mshab
+  sim_gpu_fraction: 0.3     # SAPIEN GPU sim + Vulkan renderer; habitat's 0.14 is too tight
+
+vlm:
+  policy_head:
+    action_space_dim: 14
+    continuous_action_clip_low: -1.0
+    continuous_action_clip_high: 1.0
+
+sim:
+  task: tidy_house
+  subtask: pick
+  split: train
+  gap: 1
+  max_episode_steps: 200
+  width: 256
+  height: 256
+
+task:
+  shard_size: 0             # trivial shard: the env samples plans/spawns itself
+  subset_label: ""
+
+rollout:
+  max_steps: 200
+  convo_start_template:
+    - {role: user, content: [{type: text, text: "You control a Fetch robot in a home. $instr_or_goal"}]}
+    - {role: user, content: [{type: image}]}
+    - {role: assistant, content: [{type: text, text: "**____**"}]}
+  convo_turn_template:
+    - {role: user, content: [{type: text, text: "Observation $step:"}]}
+    - {role: user, content: [{type: image}]}
+    - {role: assistant, content: [{type: text, text: "**____**"}]}
