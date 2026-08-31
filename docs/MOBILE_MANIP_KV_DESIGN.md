@@ -49,3 +49,31 @@ pretrain and joint finetune (reader of its turn, never history), so nothing is u
    readout after; coordination decoder-side via zero-init context tokens
    (CodeContextMixer precedent), not backbone cross-attention.
 4. Proprio (qpos/gripper/is_grasped) belongs in the same transient block.
+
+## Prototype + parity results (2026-08-31, no production code modified)
+
+`src/longnav/proto/transient_kv.py`: `TransientFilteredCache` (store persistent slice,
+return full concat), `_TransientShim` (MRO insert between the production TextMixin and
+the HF text model: re-slices the pre-sparse hand mask with the just-computed
+seq_keep_mask, arms the cache, keeps the similarity DB head-only), `install_transient`
+(instance class-swap on a loaded sparse model), `stitched_positions` (production
+get_rope_index called on the chunk with and without the hand image; post-hand tokens
+take the hand-free positions -- RoPE rolled back with the real mrope arithmetic).
+
+`tests/proto/parity_transient_kv.py` (real sparse checkpoint, sdpa, 3 turns x
+[head 256px + hand 128px]): noise floor (plain incremental vs full forward, matched
+mask path) 0.28-0.38 max|dlogit|; transient arm (FilteredCache + stitched RoPE vs full
+forward under the equivalent 4D mask) 0.31-0.34 -- WITHIN the floor. Cache holds
+exactly tokens-minus-hand (462-192=270); sparse-mode smoke: composes with the live
+sparsify path (cache 230), DB excludes hand embeds.
+
+Incidental finding that cost a debugging cycle: under sdpa+bf16, a CACHED prefill and
+an UNCACHED forward of identical inputs differ by ~5.9 max|dlogit| (argmax intact) --
+sdpa's is_causal fast path vs its additive-mask path (`dump/probe_prefill_ab.py`,
+exactly reproducible). Parity comparisons must pin the mask path on both sides; and it
+is one more reason production standardizes on flash_attention_2 for rollout/training
+forward agreement.
+
+Remaining before training on it: flash-attention variant of the reference (or accept
+sdpa-only parity), wiring into a VLMWorker fork for real rollout, and the training-side
+4D-mask builder reusing the same turn/transient bookkeeping.
