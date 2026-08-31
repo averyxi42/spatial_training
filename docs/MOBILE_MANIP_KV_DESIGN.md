@@ -77,3 +77,36 @@ forward agreement.
 Remaining before training on it: flash-attention variant of the reference (or accept
 sdpa-only parity), wiring into a VLMWorker fork for real rollout, and the training-side
 4D-mask builder reusing the same turn/transient bookkeeping.
+
+## Flash-path validation (2026-08-31, second pass -- "using sdpa is pointless")
+
+Rebuilt the validation on the production attention path. Chronicle, each step
+evidence-backed (probes under dump/probe_*.py, tests under tests/proto/):
+
+1. HF's flash integration packed-detects supplied position_ids (`_is_packed_sequence`)
+   and crashes on mrope image chunks -- production already neutralizes this with a
+   monkeypatch in VLMWorker.__init__ (vlm_worker.py:54-57), previously undocumented and
+   load-bearing for every flash rollout. Harnesses must mirror it.
+2. Position convention revised: contiguous WITHIN a turn, RoPE rollback applied to the
+   next turn's START OFFSET (hand-free extent). Flash-admissible, identical cross-turn
+   geometry to a packed training forward, and within-turn geometry exactly matches
+   single-turn (Markovian) manipulation pretraining.
+3. Semantics correction: the mechanism guarantees CACHE GEOMETRY, not information
+   erasure -- the turn's readout attends the hand (intended) and its K/V persist, so
+   hand info reaches later turns THROUGH the readout: measured ~3.0-3.4 max|dlogit| on
+   later turns (production layout). This is the learned bottleneck, a feature.
+4. Bitwise validation (hand-at-suffix layout, nothing persistent after the hand,
+   determinism control passing): DENSE mode -- later-turn readouts bitwise EQUAL under
+   hand-content perturbation, cache tensors bitwise identical at every probed layer.
+   The filter is exact on flash.
+5. Sparse mode residual (~0.4 max|dlogit|) fully attributed: keep-selection identical
+   (layer-0 K bitwise equal), similarity DB bitwise equal (shim strip works), vision
+   tower per-image isolated (co-batched head embeds bitwise equal under hand swap);
+   the residual is SHAPE-dependent flash accumulation -- hand KEEP COUNTS differ with
+   content (post-sparse lengths 151/131/126 vs 147/134/131), changing kernel block
+   partitioning. Numeric, not informational (only the count leaks).
+
+Verdict: mechanism validated for rollout on the production stack. Training-side open
+item stands: the transient 4D mask needs flex_attention (or a chunked-with-cache
+training forward) -- flash cannot express it; microbench before the joint-finetune
+design is finalized.

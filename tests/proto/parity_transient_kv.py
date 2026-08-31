@@ -56,7 +56,7 @@ def strip_hand(processor, turn_inputs, span, hand_grid_idx):
     return {"input_ids": ids, "image_grid_thw": grids[keep], "attention_mask": torch.ones_like(ids)}
 
 
-def run_incremental(model, processor, turns, transient: bool, dense: bool):
+def run_incremental(model, processor, turns, transient: bool, dense: bool, transient_to_end: bool = False):
     from transformers import DynamicCache
     from longnav.proto.transient_kv import (TransientFilteredCache, image_token_spans,
                                             stitched_positions)
@@ -66,6 +66,7 @@ def run_incremental(model, processor, turns, transient: bool, dense: bool):
     offset = 0
     prev_len = 0
     readout_logits, all_ids, all_pos, all_trans = [], [], [], []
+    pre_hand_logits = []
     past_db = None
     for (msgs_all, imgs_all, n_imgs_prev) in turns:
         full = tokenize(processor, msgs_all, imgs_all)
@@ -82,7 +83,10 @@ def run_incremental(model, processor, turns, transient: bool, dense: bool):
         assert len(spans) == 2, spans
         hand_span = spans[1]
         tmask = torch.zeros(chunk["input_ids"].shape[1], dtype=torch.bool)
-        tmask[hand_span[0]:hand_span[1]] = True
+        if transient_to_end:
+            tmask[hand_span[0]:] = True     # hand image + trailing template tokens
+        else:
+            tmask[hand_span[0]:hand_span[1]] = True
         if transient:
             pos, offset = stitched_positions(model.model, chunk,
                                              strip_hand(processor, chunk, hand_span, 1),
@@ -104,8 +108,19 @@ def run_incremental(model, processor, turns, transient: bool, dense: bool):
             fw["past_image_embeds"] = past_db
             fw["save_image_db"] = True
         with torch.inference_mode():
-            out = model.forward(**fw, past_key_values=cache, use_cache=True, logits_to_keep=1)
+            out = model.forward(**fw, past_key_values=cache, use_cache=True,
+                                logits_to_keep=0 if transient_to_end else 1)
         cache = out["past_key_values"]
+        if transient_to_end:
+            # readout position = last token BEFORE the transient tail (the tail's
+            # trailing template tokens attend the hand by construction and are
+            # expected to differ; the readout must not). In sparse mode the logits
+            # are over the POST-sparsification sequence: map the index through the
+            # keep mask (pre-hand keeps depend only on the head image + text, so the
+            # mapped index is identical across perturbation runs).
+            km = out.get("seq_keep_mask", None)
+            idx = int(km[:hand_span[0]].sum()) - 1 if km is not None else hand_span[0] - 1
+            pre_hand_logits.append(out["logits"][0, idx].float().cpu())
         if not dense and getattr(lm, "kept_visual_embeds", None):
             new_db = lm.kept_visual_embeds[0]
             past_db = [new_db if past_db is None else torch.cat([past_db[0], new_db], 0)]
@@ -113,6 +128,8 @@ def run_incremental(model, processor, turns, transient: bool, dense: bool):
         all_ids.append(chunk["input_ids"]); all_pos.append(pos); all_trans.append(tmask)
         all_ids_cat = full["input_ids"]
         prev_len = full["input_ids"].shape[1]
+    if transient_to_end:
+        return pre_hand_logits, torch.cat(all_ids, 1), torch.cat(all_pos, -1), torch.cat(all_trans), cache
     return readout_logits, torch.cat(all_ids, 1), torch.cat(all_pos, -1), torch.cat(all_trans), cache
 
 

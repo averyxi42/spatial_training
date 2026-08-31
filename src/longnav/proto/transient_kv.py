@@ -122,32 +122,26 @@ def install_transient(model) -> None:
 def stitched_positions(vl_model, turn_inputs_full: dict, turn_inputs_nohand: dict,
                        transient_mask: torch.Tensor, offset: int
                        ) -> Tuple[torch.Tensor, int]:
-    """Per-turn mrope positions with the hand block positionally transparent.
+    """Per-turn mrope positions, flash-compatible convention.
 
-    ``turn_inputs_full`` is the real chunk (head + hand images); ``turn_inputs_nohand``
-    is the same chunk with the hand image's tokens and grid removed. Pre-hand tokens
-    take the full chunk's positions; the hand block keeps its natural positions; the
-    tokens AFTER the hand block take the no-hand chunk's positions (RoPE rolled back).
-    The returned offset advances by the no-hand extent -- the cache never sees a gap.
+    WITHIN a turn positions are ordinary and contiguous (HF's flash path rejects
+    non-monotonic position_ids: it packed-detects and crashes on a backward jump).
+    The RoPE "rollback" is applied at the TURN BOUNDARY instead: the running offset
+    advances by the hand-free extent, so future turns sit where they would if the
+    hand block had never existed. Cross-turn relative geometry then matches a packed
+    training forward with the same absolute positions, and within-turn geometry
+    matches single-turn (Markovian) manipulation pretraining exactly.
     """
     pos_full, _ = vl_model.get_rope_index(
         input_ids=turn_inputs_full["input_ids"],
         image_grid_thw=turn_inputs_full.get("image_grid_thw"),
         video_grid_thw=None, attention_mask=turn_inputs_full.get("attention_mask"))
-    pos_nh, delta_nh = vl_model.get_rope_index(
+    _, delta_nh = vl_model.get_rope_index(
         input_ids=turn_inputs_nohand["input_ids"],
         image_grid_thw=turn_inputs_nohand.get("image_grid_thw"),
         video_grid_thw=None, attention_mask=turn_inputs_nohand.get("attention_mask"))
-    m = transient_mask
-    n = m.shape[0]
-    first = int(torch.nonzero(m)[0]) if bool(m.any()) else n
-    stitched = torch.empty_like(pos_full)
-    stitched[..., :first + int(m.sum())] = pos_full[..., :first + int(m.sum())]
-    # after-hand tokens: the no-hand computation's positions for the same tokens
-    stitched[..., first + int(m.sum()):] = pos_nh[..., first:]
-    stitched = stitched + offset
     new_offset = offset + turn_inputs_nohand["input_ids"].shape[1] + int(delta_nh.item())
-    return stitched, new_offset
+    return pos_full + offset, new_offset
 
 
 def image_token_spans(input_ids: torch.Tensor, image_token_id: int):
