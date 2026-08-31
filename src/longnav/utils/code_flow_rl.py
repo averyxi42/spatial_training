@@ -62,6 +62,18 @@ class CodeFlowHead(FlowSDEHead):
         self.overlay_modes_k = int(overlay_modes_k)
         self.last_mode_chunks: Optional[np.ndarray] = None   # (K, n_ticks, 3) physical
         self.last_mode_probs: Optional[np.ndarray] = None    # (K,) under pi_T
+        # THE ACTUATOR IS FROZEN AT THE PARAMETER LEVEL, not merely by an lr-0 group.
+        # Two reasons, one of them load-bearing: (1) A0's estimator is exact only
+        # because the actuator is theta-independent (docs/CODE_RL_PLAN_V2.md 9.1) --
+        # requires_grad False makes that structural; (2) DDP raises "Expected to have
+        # finished reduction" for REQUIRES-GRAD parameters that never receive grad, and
+        # the code-only loss never touches the decoder or the mixer (the chain head's
+        # density does, which is why the a09 lr-0 freeze sufficed there). This killed
+        # every training step from [8/16] of the first launch's cycle 1. The code head
+        # and readout stay requires-grad: the loss flows through them into the LoRA.
+        for mod in (codec.decoder, codec.code_mixer):
+            for p in mod.parameters():
+                p.requires_grad_(False)
 
     # -- the fixed actuator ------------------------------------------------------------
     @torch.no_grad()

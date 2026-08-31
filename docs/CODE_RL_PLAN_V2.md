@@ -278,6 +278,18 @@ code with this yaml's fields. The Ray actors' runtime_env must carry the same pa
 Launch: `data_scripts/launch_code_rl_a0.sh` (defaults GPUS=4,5,6,7, quad resources,
 refuses busy devices, exports the worktree PYTHONPATH, pins conda envs).
 
+First-launch lessons (2026-08-30/31), each fixed and committed: seeded generator built on
+CPU before the head moves to CUDA (draw on the generator's device); the env's
+r_commit/r_fresh emissions arrive float64 and the retime identity rebuilt rewards as
+Double (collate-cast + retime cast); DDP kills training when requires-grad parameters
+never receive grad -- the code-only loss never touches the decoder/mixer, so the A0
+actuator is now frozen at the PARAMETER level, which is also what 9.1's exactness wants
+(the a09 lr-0 freeze sufficed for the chain head only because its density backprops
+through the decoder); a zero-turn (DOA) episode crashed postprocess_episode's empty
+torch.cat 23 cycles in -- guarded to the failed-episode drop path. Also: reusing
+task.run_name across relaunches RESUMES the crashed wandb run and its step watermark
+silently drops early rows (launch script now timestamps the name).
+
 Deferred, refused loudly if requested: A1 completer, class merging, the code-entropy term
 (first runs are the a09 freeze + measure-only ref-KL), frozen-copy reference (unneeded
 under the freeze).

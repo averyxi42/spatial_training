@@ -705,6 +705,14 @@ class RLActor(RLWorker):
         return is_exhausted,state_dict
     
     def postprocess_episode(self,return_inputs = True,eval=False):
+        # ZERO-TURN GUARD (2026-08-31): an episode that is done at reset without the
+        # exhausted sentinel (a DOA serve) reaches here with no recorded turns, and
+        # `_pack_embeds`'s torch.cat on the empty outputs killed a whole run 23 cycles
+        # in. Same containment as a failed episode: loud print, None trajectory, and
+        # run_rollout_cycle drops it as a unit (pads with duplicated survivors).
+        if not getattr(self, "outputs", {}).get('position_ids'):
+            print("EPISODE_FAILED (zero-turn episode: done before any policy turn); dropped")
+            return None, None, None
         trajectory,model_inputs = super().postprocess_episode(eval=eval)
         if return_inputs:
             inputs_tensors,inputs_metadata = TensorPacker.pack(model_inputs)
