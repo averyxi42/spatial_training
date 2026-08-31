@@ -252,3 +252,37 @@ sits ~0.25 m further forward and ~0.10 m lower (1.08 m vs 1.185 m) than the tidy
 camera (which is 0.1 m BEHIND the base axis). Fixable exactly with a local pose offset
 in the fetch_head sensor config; left as-is in `mshab_objnav_matched` (documented
 viewpoint shift), pending a decision on a geometry-exact rerun.
+
+### tv_monitor category caveat (2026-08-31)
+
+Probed after "TV never visible" reports: the matched restore places tv_screen EXACTLY
+at its staging pose (static, stable over 20 steps) -- no SAPIEN bug. The real issue is
+episode design in BOTH engines: the TV is wall-mounted at 1.9 m with floor-level
+view-point rings, and end-frames of successful habitat episodes show the robot reaching
+the ring while the TV sits at the frame edge at best. tv_monitor successes in this
+scene measure layout-prior navigation, not TV recognition. Treat the category as
+weakly grounded in v3_sc1_staging_13; regenerate with visibility-checked view points
+(render-at-viewpoint + object-pixel test) before drawing category-level conclusions.
+Also: FOV measured matched (hfov 78.2 vs 79.0); the only real optical residual is the
+camera mount offset (SETUP.md / camera-geometry note above).
+
+## 11. Final matched benchmark (2026-08-31, run mshab_objnav_matched)
+
+Same 24 episodes (starts, categories, VIEW_POINTS success <= 1.0 m, 70 s budget),
+same staging furniture, three conditions:
+
+| condition | SR | oSPL | mean path |
+|---|---|---|---|
+| habitat, physical robot + PID | 21/24 | 0.60 | -- |
+| habitat, kinematic exact | 24/24 | 0.66 | 10.5 m |
+| SAPIEN matched, fixed drive + tracker | **22/24** | **0.52** | 14.3 m |
+
+SAPIEN per category: chair 6/6 (oSPL 0.77), plant 6/6 (0.43), sofa 6/6 (0.72),
+tv_monitor 4/6 (0.16; the two failures are the weakly-grounded category, see the
+tv_monitor caveat -- habitat kinematic also scored its lowest oSPL there). Bottom line:
+after the drive-gain fix and the matched protocol, the SAPIEN gap is ~2 episodes of SR
+and ~0.14 oSPL against the kinematic-habitat upper bound -- residuals: renderer style,
+camera mount offset (~0.25 m forward / 0.10 m low), PD-drive tracking vs exact
+execution, and the tv_monitor episode design. The original "2/12 collapse" was, in
+order of impact: controller action-normalization bug, protocol mismatch (metric,
+budget, different furniture/goals), and only lastly any visual transfer gap.
