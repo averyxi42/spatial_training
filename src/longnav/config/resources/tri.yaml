@@ -1,0 +1,12 @@
+# @package _global_
+# Three VLM workers + four sims: the degraded-hardware variant of `quad`, for when one
+# of the four target GPUs is held by a co-tenant (2026-08-31: GPU 7 at ~7 GB free while
+# 4/5/6 had 17-39 GB). n_rollout must be divisible by num_vlms -- hapo's 16 is NOT, so a
+# tri launch must override rl_config.n_rollout to 12 on the command line and say so in
+# the run notes: batch-per-cycle changes from the a09 twin, which matters for paired
+# comparisons.
+resources:
+  ray_address: local
+  osm_gb: 96
+  num_vlms: 3
+  num_sims: 4
