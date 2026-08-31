@@ -286,3 +286,17 @@ camera mount offset (~0.25 m forward / 0.10 m low), PD-drive tracking vs exact
 execution, and the tv_monitor episode design. The original "2/12 collapse" was, in
 order of impact: controller action-normalization bug, protocol mismatch (metric,
 budget, different furniture/goals), and only lastly any visual transfer gap.
+
+### Camera-alignment control experiment (2026-08-31)
+
+Same world coordinate, three renders (dump/cross_render/cam_align_3way.png): moving the
+SAPIEN fetch_head camera to the habitat rig's exact pose (head-frame offset
+[-0.264, 0, +0.104], residual 0.0 cm) makes the upper half of the frame lock onto the
+habitat render -- picture, door, clock, plant all coincide. Verdicts: (1) the "smaller
+FOV" impression was entirely the mount offset (intrinsics were already matched);
+(2) the butterfly picture DID restore correctly -- its earlier absence was the more
+-forward default viewpoint, not a restore bug; (3) a habitat-pose-aligned camera is NOT
+usable for runs as-is: the position sits inside/behind the Fetch head, whose geometry
+fills the lower half of the frame. Practical options if closer alignment is wanted:
+raise the aligned camera above the head shell, or hide the robot's head visuals for
+the sensor pass -- both change the observation distribution and need a fresh run.

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -421,18 +422,56 @@ class MSHabEnvActor:
             rearrange / "task_plans" / self.task / self.subtask / self.split / "all.json")
         sd_fp = self.spawn_data_fp or str(
             rearrange / "spawn_data" / self.task / self.subtask / self.split / "spawn_data.pt")
-        plan_data = plan_data_from_file(tp_fp)
-        plans = plan_data.plans
+        # Per-scene cache: the split files are 50-95 MB (100k plans / full spawn dict) and
+        # cost ~60 s to parse per actor build, of which we use <= max_plans entries.
+        # First build writes a filtered json + spawn .pt next to the originals; later
+        # builds load those in ~1 s. Delete the cache dir after regenerating plans.
+        import hashlib
+        cache_key = hashlib.md5(f"{tp_fp}|{self.scene_index}|{self.max_plans}|{self.seed}".encode()).hexdigest()[:12]
+        cache_dir = Path(str(rearrange)) / "longnav_cache"
+        cache_tp = cache_dir / f"plans_{cache_key}.json"
+        cache_sd = cache_dir / f"spawn_{cache_key}.pt"
+        if cache_tp.exists():
+            plan_data = plan_data_from_file(str(cache_tp))
+            plans = plan_data.plans
+            bcs_all = json.load(open(str(cache_tp) + ".meta"))["bcs"]
+            self._scene_name = sorted(bcs_all)[int(self.scene_index) % len(bcs_all)]
+            if cache_sd.exists():
+                sd_fp = str(cache_sd)
+            env_kwargs_cache_hit = True
+        else:
+            plan_data = plan_data_from_file(tp_fp)
+            plans = plan_data.plans
+            env_kwargs_cache_hit = False
         # 100k plans per split over ~40 scenes (build configs). With num_envs=1 MS-HAB
         # requires the plan pool to cover exactly one build config, so pick the
         # `scene_index`-th scene (sorted by name) and cap its plans at `max_plans`.
-        bcs = sorted({tp.build_config_name for tp in plans})
-        bc = bcs[int(self.scene_index) % len(bcs)]
-        plans = [tp for tp in plans if tp.build_config_name == bc]
-        if self.max_plans and len(plans) > self.max_plans:
-            rng = np.random.RandomState(0 if self.seed is None else int(self.seed))
-            plans = [plans[i] for i in sorted(rng.choice(len(plans), self.max_plans, replace=False))]
-        self._scene_name = bc
+        if not env_kwargs_cache_hit:
+            bcs = sorted({tp.build_config_name for tp in plans})
+            bc = bcs[int(self.scene_index) % len(bcs)]
+            plans = [tp for tp in plans if tp.build_config_name == bc]
+            if self.max_plans and len(plans) > self.max_plans:
+                rng = np.random.RandomState(0 if self.seed is None else int(self.seed))
+                plans = [plans[i] for i in sorted(rng.choice(len(plans), self.max_plans, replace=False))]
+            self._scene_name = bc
+            try:
+                cache_dir.mkdir(exist_ok=True)
+                raw = json.load(open(tp_fp))
+                keep_uids = {st for tp2 in plans for st in tp2.subtasks[0].composite_subtask_uids}
+                raw["plans"] = [rp for rp in raw["plans"]
+                                if rp["build_config_name"] == bc
+                                and any(u in keep_uids for st2 in rp["subtasks"]
+                                        for u in st2.get("composite_subtask_uids", [st2.get("uid")]))][: len(plans)]
+                json.dump(raw, open(cache_tp, "w"))
+                json.dump({"bcs": bcs}, open(str(cache_tp) + ".meta", "w"))
+                if self.subtask != "sequential" and os.path.exists(sd_fp):
+                    import torch
+                    full = torch.load(sd_fp, map_location="cpu")
+                    torch.save({k: v for k, v in full.items() if k in keep_uids}, cache_sd)
+                    sd_fp = str(cache_sd)
+                print(f"[mshab] wrote plan/spawn cache {cache_tp.name} ({len(raw['plans'])} plans)")
+            except Exception as exc:
+                print(f"[mshab] cache write skipped: {exc}")
         cam_cfg: Dict[str, Any] = dict(width=self.width, height=self.height)
         if self.fov is not None:
             cam_cfg["fov"] = float(self.fov)
