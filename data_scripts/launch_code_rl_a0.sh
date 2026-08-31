@@ -11,7 +11,10 @@ set -euo pipefail
 
 REPO=/Projects/spatial_training_tok
 GPUS=${GPUS:-4,5,6,7}
-RUN_NAME=${RUN_NAME:-code_rl_a0_held128}
+# Timestamped by default: reusing a name RESUMES the crashed wandb run, whose step
+# watermark then silently swallows the new process's early rows (observed on the
+# 2026-08-30 relaunches; the yaml's run_name comment says "change per run" for a reason).
+RUN_NAME=${RUN_NAME:-code_rl_a0_held128_$(date +%m%d_%H%M)}
 RESOURCES=${RESOURCES:-quad}   # 4 VLMs + 5 sims; hapo n_rollout 16 divides 4
 
 # Refuse a launch without headroom rather than OOM into someone's job. The bound is on
