@@ -118,11 +118,14 @@ def main(cfg: RLConfig):
     with open(os.path.join(run_dir, "eval_set_uids.txt"), "w") as f:
         f.write("\n".join(eval_uids) + "\n")
 
-    # RESUME. `training.checkpoint` already restores weights (and optimizer/scheduler
-    # when load_optim/load_sched are set); rl_state.pt next to it carries the DRIVER's
-    # state -- the advantage buffer and the cycle counter. Absent file => (0, []), i.e.
-    # an ordinary launch is byte-identical to before.
-    start_cycle, trajectory_list = load_rl_state(tcfg.training.checkpoint)
+    # RESUME. `training.checkpoint` always restores weights (and optimizer/scheduler
+    # when load_optim/load_sched are set).  Driver state is separate so a checkpoint can
+    # also initialize an independent study without inheriting its cycle or baseline.
+    if tcfg.training.resume_driver_state:
+        start_cycle, trajectory_list = load_rl_state(tcfg.training.checkpoint)
+    else:
+        start_cycle, trajectory_list = 0, []
+        logger.info("starting fresh driver state from checkpoint weights")
     if start_cycle > 0 and ctx.vector_envs_per_sim > 1:
         if n_rollout % ctx.vector_envs_per_sim:
             raise ValueError(

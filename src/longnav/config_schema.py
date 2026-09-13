@@ -187,6 +187,9 @@ class VLMTrainingConfig:
     checkpoint:Optional[str] = None
     load_optim:bool = False # l
     load_sched:bool = False
+    # Model weights can seed a new study without inheriting the old driver's cycle
+    # counter or time-kernel advantage buffer.
+    resume_driver_state: bool = True
 
     # Optimization
     learning_rate: float = 5e-6

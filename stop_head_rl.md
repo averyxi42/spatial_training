@@ -215,3 +215,13 @@ full-history AUROC as deployment success: four of 16 held-out episodes still sto
 and live episode outcomes—not frame AP—are the authority.  Each arm will retain both its
 metric-best checkpoints and rolling `latest`, with calibration thresholds recorded beside
 future selected checkpoints rather than assumed universally equal to 0.95.
+
+#### Launch isolation correction
+
+The first four drivers were stopped during bootstrap before any rollout or optimizer step:
+although their optimizer/scheduler reset flags were false, the generic launcher also read
+`rl_state.pt` and inherited cycle 340 plus a 256-episode advantage buffer.  That is a
+valid resume behavior but invalid for this independent study.  `resume_driver_state` now
+defaults to true for ordinary resumes and is explicitly false for all stop-study arms;
+the relaunch starts at cycle 0 with c339 model/STOP-head weights only.  The relaunch gate
+again passed 27 tests (2 skipped).

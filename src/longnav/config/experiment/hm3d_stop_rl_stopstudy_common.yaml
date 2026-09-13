@@ -13,6 +13,7 @@ training:
   checkpoint: /home/ubuntu/storage-migrations/20260906-longnav/v12-regeneration/production/rl_stop_experiments/hm3d_stop_rl_exploration_v12_shadow_r6/checkpoints/checkpoint_339
   load_optim: false
   load_sched: false
+  resume_driver_state: false
   learning_rate: 1.0e-6
   max_grad_norm: 10.0
   # With 2 rollout episodes and grad_accum=4, this is 360 driver cycles.
