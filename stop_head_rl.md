@@ -225,3 +225,10 @@ valid resume behavior but invalid for this independent study.  `resume_driver_st
 defaults to true for ordinary resumes and is explicitly false for all stop-study arms;
 the relaunch starts at cycle 0 with c339 model/STOP-head weights only.  The relaunch gate
 again passed 27 tests (2 skipped).
+
+A further launch-time gate found a missing `maybe_save_eval_bests` import after C/D had
+completed their cycle-0 evals but before any optimizer update.  All four drivers were
+then stopped, the import was repaired and covered by a training-driver import gate plus
+17 related tests (2 skipped).  The resulting r1 output and W&B runs are retained as
+invalid audit artifacts, including C's 0.031/0.025 and D's 0.094/0.058 cycle-0 SR/OSPL;
+they are not study results.  The clean, formal runs use fresh `r2` names and directories.

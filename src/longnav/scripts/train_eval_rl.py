@@ -60,6 +60,7 @@ def main(cfg: RLConfig):
         build_vector_eval_groups,
         compute_advantages_and_returns,
         maybe_checkpoint,
+        maybe_save_eval_bests,
         recycle_vector_sims,
         run_eval_cycle,
         run_rollout_cycle,
