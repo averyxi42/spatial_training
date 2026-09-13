@@ -21,4 +21,4 @@ training:
     state_probe_gradient_diagnostic_interval: 16
 
 task:
-  run_name: hm3d_stopstudy_a_shadow_stillness_r2
+  run_name: hm3d_stopstudy_a_shadow_stillness_r3

@@ -231,4 +231,12 @@ completed their cycle-0 evals but before any optimizer update.  All four drivers
 then stopped, the import was repaired and covered by a training-driver import gate plus
 17 related tests (2 skipped).  The resulting r1 output and W&B runs are retained as
 invalid audit artifacts, including C's 0.031/0.025 and D's 0.094/0.058 cycle-0 SR/OSPL;
-they are not study results.  The clean, formal runs use fresh `r2` names and directories.
+they are not study results.
+
+The r2 reset gate itself passed, but C/D then exposed a second bootstrap-only issue: an
+action-head STOP configuration has no binary state probe, while the generic training
+forward still passed it binary STOP targets.  The worker raised before each update, so
+r2 has no valid learned checkpoint and is also retained only as an audit artifact.  The
+worker now drops probe-only training inputs when no probe is configured; the regression
+test exercises that exact path, and the relevant unit suite passes 28 tests (2 skipped).
+All four formal learning runs therefore use fresh `r3` names and directories.

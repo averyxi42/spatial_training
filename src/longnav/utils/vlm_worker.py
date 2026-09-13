@@ -1359,6 +1359,13 @@ class VLMTrainingMixin:
     def _training_forward(self,embeds_inputs, stop_targets=None,
                           shadow_stop_actions=None, shadow_stop_rewards=None):
         # Forward via DDP wrapper (triggers sync)
+        if not self.state_probe_trainable:
+            # Action-head STOP experiments deliberately omit the binary probe.
+            # Their rollout columns retain stop labels for diagnostics, but no
+            # probe objective may enter a head-less forward.
+            stop_targets = None
+            shadow_stop_actions = None
+            shadow_stop_rewards = None
         compute_values = (self.rl_algo_config.value_head is not None
                           or (bool(getattr(self.rl_algo_config, "state_probe", None))
                               and not self.state_probe_trainable))

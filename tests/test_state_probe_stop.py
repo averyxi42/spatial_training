@@ -1,7 +1,9 @@
+from types import SimpleNamespace
+
 import torch
 
 from longnav.utils.state_probe import StateProbe, StateProbeConfig
-from longnav.utils.vlm_worker import _is_probe_objective_term
+from longnav.utils.vlm_worker import VLMTrainingMixin, _is_probe_objective_term
 
 
 def test_stop_head_has_bce_and_firstpass_gradients():
@@ -85,3 +87,34 @@ def test_stop_loss_components_are_not_added_twice_to_the_training_objective():
     assert not _is_probe_objective_term("probe/stop_firstpass_loss")
     assert not _is_probe_objective_term("probe/shadow_stop_rl_loss")
     assert not _is_probe_objective_term("probe/grad_cos_bce_firstpass")
+
+
+def test_action_head_stop_without_probe_drops_probe_training_inputs():
+    captured = {}
+
+    def ddp_model(**kwargs):
+        captured.update(kwargs)
+        return {}, None
+
+    worker = SimpleNamespace(
+        state_probe_trainable=False,
+        rl_algo_config=SimpleNamespace(
+            value_head=None,
+            state_probe=None,
+            state_probe_stop_temperature=1.0,
+            state_probe_shadow_rl_weight=1.0,
+            state_probe_firstpass_weight=None,
+            state_probe_gradient_diagnostic_interval=0,
+        ),
+        ddp_model=ddp_model,
+    )
+    VLMTrainingMixin._training_forward(
+        worker,
+        embeds_inputs={"inputs_embeds": torch.zeros(1)},
+        stop_targets=torch.ones(1, 2),
+        shadow_stop_actions=torch.ones(1, 2),
+        shadow_stop_rewards=torch.ones(1, 2),
+    )
+    assert captured["stop_targets"] is None
+    assert captured["shadow_stop_actions"] is None
+    assert captured["shadow_stop_rewards"] is None
