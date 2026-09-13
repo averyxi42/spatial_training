@@ -198,7 +198,7 @@ class EpisodeRolloutMixin:
         anchored = np.vstack((np.zeros((1, 2), dtype=np.float64), xy))
         return float(np.linalg.norm(np.diff(anchored, axis=0), axis=1).sum())
 
-    def _policy_stop_decision(self, action_to_env, stop_probability):
+    def _policy_stop_decision(self, action_to_env, stop_probability, decision_index=None):
         """Resolve the configured stop actuator from the same decoded action as control."""
         mode = str(self.rollout_config.get("stop_execution_mode", "physical"))
         if self.policy_head_config["type"] != "continuous":
@@ -236,6 +236,11 @@ class EpisodeRolloutMixin:
                     "trajectory_length stop requires a non-negative "
                     "trajectory_stop_threshold_m"
                 )
+            min_steps = int(self.rollout_config.get("trajectory_stop_min_steps", 0))
+            if min_steps < 0:
+                raise ValueError("trajectory_stop_min_steps must be non-negative")
+            if decision_index is not None and int(decision_index) < min_steps:
+                return False, mode, path_length
             return path_length <= float(threshold), mode, path_length
         raise ValueError(
             "stop_execution_mode must be one of shadow, physical, sampled, "
@@ -520,7 +525,9 @@ class EpisodeRolloutMixin:
                 )
                 stop_probability = getattr(self, "last_stop_probability", None)
                 policy_stop, policy_stop_mode, action_path_length_m = (
-                    self._policy_stop_decision(action_to_env, stop_probability)
+                    self._policy_stop_decision(
+                        action_to_env, stop_probability, decision_index=step_count
+                    )
                 )
                 decision_logs["action_path_length_m"] = action_path_length_m
                 decision_logs["policy_stop_mode"] = policy_stop_mode

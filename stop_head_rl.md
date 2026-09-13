@@ -372,8 +372,56 @@ The focused interface tests cover the cumulative-path formula and malformed/non-
 chunks.  Benchmark command construction validates that a trajectory-length setting includes
 its non-negative threshold before a server is started.
 
+The r2 C/D training rule adds `trajectory_stop_min_steps: 30`: action decisions 0–29 always
+execute and action decision 30 is the first eligible decoded-path STOP.  Per the requested
+staging, the external benchmark interface is intentionally not changed for this warm-up
+while training runs.  It will be updated once after a training result is selected, before
+any r2 benchmark claim; no benchmark result may use the older no-warm-up C/D rule.
+
 C/D receive no performance-based early termination.  Their early stop rate, first-stop
 precision, SR, SPL, OSR, and OSPL are logged from cycle 0 onward, but a low initial score
 is an expected part of testing whether RL can teach the new action-stop behavior.  A
 formal run is interrupted only for numerical invalidity, failed fixed-eval coverage,
 repeated actor failure, the reference-density fuse, or insufficient disk headroom.
+
+### Live formal SFT trace — initial verified points
+
+All four fresh drivers completed their fixed cycle-0 `eval32` and saved both metric-best
+snapshots and rolling `latest` checkpoints.  A starts at SR/OSPL `0.5625/0.3549`; B starts
+at `0.5625/0.3605`, with 5 of 32 episodes physically stopped by its fixed `p_stop >= 0.95`
+rule.  These are SFT-started measurements, not the earlier c339 results.
+
+C and D are deliberately kept running despite their expected cold-start mismatch.  C has
+`32/32` physical trajectory-length stops at every completed fixed evaluation through cycle
+112, mean episode length `1.47–1.70` decisions, and SR/OSPL `0/0`.  D has the same `32/32`
+stop rate through cycle 112 and mean length `1.72–2.00`; it reaches one success at cycle 80
+(SR/OSPL `0.03125/0.03125`) and is otherwise `0/0`.  The logged terminal mode is
+`trajectory_length`, so this is the requested C/D actuator rather than a binary-head
+fallback.
+
+This is not a broken PPO credit path.  A trajectory-length STOP preserves the sampled
+continuous action's log probability and policy-action mask, then receives `-1` when it
+stops outside the success radius.  Current C/D PPO losses and gradient norms are finite and
+nonzero.  The effective signal is nevertheless sparse: a first-step false STOP gets no
+progress or exploration reward, so repeated such samples have nearly identical `-1`
+returns and little relative advantage once the critic learns that baseline.  In the most
+recent 32 cycles, 21/64 C and 28/64 D training episodes did continue beyond the first
+decision; 12/64 C and 13/64 D samples had positive total reward.  These are the only
+samples currently supplying a relative incentive to make a longer first chunk.  Thus C/D
+are receiving learning signal, but not a dense or well-conditioned one.  The state remains
+an early-learning observation rather than a stop decision: there is no non-finite loss,
+reference-density fuse, fixed-eval coverage failure, actor failure, or disk-headroom
+failure.
+
+### C/D r1 retirement and warm-up restart
+
+The no-warm-up C/D drivers were deliberately stopped at cycle 128 to replace their terminal
+rule, not for numerical failure.  The generic driver records the requested `SIGTERM` as a
+`SystemExit` emergency checkpoint; those `*_crash` snapshots are retained for audit only
+and are never restart sources.  Their W&B runs remain meaningful diagnostics of the early
+STOP absorbing state and are marked superseded by the warm-up design.
+
+Fresh C/D r2 drivers start only from `checkpoint-12000`, with fresh optimizer, scheduler,
+driver state, W&B run names, and the same exploration reward/eval32 split.  The new
+30-decision prefix makes early motion and exploration rewards observable before action-path
+STOP can end an episode, while preserving the exact 0.10 m / 0.01 m rule thereafter.

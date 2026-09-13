@@ -149,6 +149,22 @@ def test_trajectory_stop_uses_cumulative_xy_path_length():
     assert not stop
 
 
+def test_trajectory_stop_respects_initial_no_stop_prefix():
+    worker = StubEpisodeWorker(
+        policy_head_type="continuous",
+        continuous_action_sequence=[np.zeros(2, dtype=np.float32)],
+        rollout_config={
+            **MINIMAL_ROLLOUT_CONFIG,
+            "stop_execution_mode": "trajectory_length",
+            "trajectory_stop_threshold_m": 0.21,
+            "trajectory_stop_min_steps": 30,
+        },
+    )
+    chunk = np.asarray([[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]], dtype=np.float32)
+    assert not worker._policy_stop_decision(chunk, None, decision_index=29)[0]
+    assert worker._policy_stop_decision(chunk, None, decision_index=30)[0]
+
+
 def test_sampled_stop_uses_a_seeded_episode_hazard():
     worker = StubEpisodeWorker(
         policy_head_type="continuous",

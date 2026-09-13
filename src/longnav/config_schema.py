@@ -264,6 +264,8 @@ class RolloutConfig:
     # near-zero decoded action chunk into STOP.
     stop_execution_mode: str = "physical"
     trajectory_stop_threshold_m: Optional[float] = None
+    # Ignore decoded-path STOP for this many initial zero-based action decisions.
+    trajectory_stop_min_steps: int = 0
     stop_sample_temperature: float = 1.0
     stop_shadow_correct_reward: float = 1.0
     stop_shadow_false_penalty: float = 1.0
