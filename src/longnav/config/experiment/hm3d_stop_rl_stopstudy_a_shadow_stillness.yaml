@@ -1,0 +1,24 @@
+# @package _global_
+# A: historical oracle-success/shadow execution, now with an action-head reward for
+# staying still over four post-goal decisions.  The binary head remains a diagnostic.
+defaults:
+  - hm3d_stop_rl_stopstudy_common
+
+sim:
+  post_goal_stillness_reward: 0.5
+  post_goal_stillness_scale_m: 0.15
+
+rollout:
+  stop_execution_mode: shadow
+  stop_prob_threshold: null
+  learn_post_goal_actions: true
+
+training:
+  rl_config:
+    state_probe: auto
+    state_probe_trainable: true
+    state_probe_shadow_rl_weight: 1.0
+    state_probe_gradient_diagnostic_interval: 16
+
+task:
+  run_name: hm3d_stopstudy_a_shadow_stillness_r1

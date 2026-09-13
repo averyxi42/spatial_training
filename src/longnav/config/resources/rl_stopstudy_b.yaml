@@ -1,0 +1,17 @@
+# @package _global_
+resources:
+  ray_address: "127.0.0.1:26411"
+  object_spilling_directory: "/mnt/nvme_scratch/longnav_rl_runtime/ray_stopstudy_b/spill"
+  osm_gb: 48
+  master_addr: "127.0.0.1"
+  master_port: 29611
+  num_vlms: 2
+  num_sims: 2
+  vlm_gpu_fraction: 0.8
+  sim_gpu_fraction: 0.2
+  paired_gpu_workers: false
+  sim_startup_stagger_s: 0.0
+  vlm_conda_env: null
+  habitat_conda_env: null
+  worker_pythonpath: "/home/ubuntu/Projects/NavVerse-Benchmark/baselines/longnav/longnav_continuous_rl/src:/home/ubuntu/Projects/NavVerse-Benchmark/baselines/longnav/longnav_continuous_rl/verl"
+  habitat_pythonpath: "/home/ubuntu/Projects/NavVerse-Benchmark/baselines/longnav/habitat_physical_nav/src"

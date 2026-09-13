@@ -128,6 +128,27 @@ def test_chain_action_context_uses_executed_chunk_not_credited_chain():
     assert "11.000" not in action_text
 
 
+def test_trajectory_stop_uses_cumulative_xy_path_length():
+    worker = StubEpisodeWorker(
+        policy_head_type="continuous",
+        continuous_action_sequence=[np.zeros(2, dtype=np.float32)],
+        rollout_config={
+            **MINIMAL_ROLLOUT_CONFIG,
+            "stop_execution_mode": "trajectory_length",
+            "trajectory_stop_threshold_m": 0.21,
+        },
+    )
+    chunk = np.asarray([[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]], dtype=np.float32)
+    stop, mode, length = worker._policy_stop_decision(chunk, stop_probability=None)
+    assert mode == "trajectory_length"
+    assert np.isclose(length, 0.2)
+    assert stop
+
+    worker.rollout_config["trajectory_stop_threshold_m"] = 0.19
+    stop, _, _ = worker._policy_stop_decision(chunk, stop_probability=None)
+    assert not stop
+
+
 def test_stop_prob_threshold_guard(ray_session, monkeypatch):
     """When the raw sampled action is `stop` but its probability is below
     stop_prob_threshold, run_episode must resample away from `stop`."""

@@ -64,6 +64,10 @@ class ContinuousObjectNavEnvActor:
         progress_reward_clip: float = 0.75,
         success_reward: float = 0.0,
         post_goal_steps: int = 0,
+        post_goal_stillness_reward: float = 0.0,
+        post_goal_stillness_scale_m: float = 0.1,
+        policy_stop_correct_reward: float = 0.0,
+        policy_stop_false_penalty: float = 0.0,
         escape_penalty: float = 0.0,
         reward_lost_steps: int = 25,
         exclude_categories: Optional[Sequence[str]] = None,
@@ -112,6 +116,12 @@ class ContinuousObjectNavEnvActor:
         # needs its own signal. 0 (default) is the pre-existing progress-only shape.
         self.success_reward = float(success_reward)
         self.post_goal_steps = max(0, int(post_goal_steps))
+        self.post_goal_stillness_reward = float(post_goal_stillness_reward)
+        self.post_goal_stillness_scale_m = float(post_goal_stillness_scale_m)
+        if self.post_goal_stillness_reward and self.post_goal_stillness_scale_m <= 0.0:
+            raise ValueError("post_goal_stillness_scale_m must be positive when rewarded")
+        self.policy_stop_correct_reward = float(policy_stop_correct_reward)
+        self.policy_stop_false_penalty = float(policy_stop_false_penalty)
         # Penalty on the escaped terminal step. "Escaped" is the PHYSICAL fall detector
         # from SFT data collection (continuous_demos.drive_failure: joint_z free-fall
         # sustained fall_duration_s), never the geodesic -- under the earlier
@@ -272,6 +282,15 @@ class ContinuousObjectNavEnvActor:
             and self._post_goal_remaining == 0
         )
         return just_reached, was_active, complete
+
+    @staticmethod
+    def _chunk_path_length_m(chunk: np.ndarray) -> float:
+        """Length of the decoded cumulative SE(2) chunk, anchored at the robot."""
+        xy = np.asarray(chunk, dtype=np.float64).reshape(-1, 3)[:, :2]
+        if not np.isfinite(xy).all():
+            return float("nan")
+        anchored = np.vstack((np.zeros((1, 2), dtype=np.float64), xy))
+        return float(np.linalg.norm(np.diff(anchored, axis=0), axis=1).sum())
 
     def flush_logs_to_disk(self, clear_steps: bool = True):
         """Write this episode's video, summary and wandb payload; ship to the logger actor.
@@ -519,6 +538,7 @@ class ContinuousObjectNavEnvActor:
                 "env must agree on ticks-per-step, or sim time and policy steps quietly mean "
                 "different things and two runs stop being comparable."
             )
+        action_path_length_m = self._chunk_path_length_m(chunk)
         ray_started = time.perf_counter()
         exploration_raw, exploration_cells = self._exploration.predicted_gain(
             chunk, np.asarray(self._robot_sim.get_2d_pose(), dtype=np.float64))
@@ -599,6 +619,13 @@ class ContinuousObjectNavEnvActor:
         )
         if just_reached and self.success_reward:
             reward += self.success_reward
+        stillness_reward = 0.0
+        if was_post_goal_active and self.post_goal_stillness_reward:
+            stillness_reward = self.post_goal_stillness_reward * max(
+                0.0,
+                1.0 - action_path_length_m / self.post_goal_stillness_scale_m,
+            )
+            reward += stillness_reward
         if escaped and self.escape_penalty:
             reward -= self.escape_penalty
         # Emitted EVERY step, not only the terminal one: `_pack_trajectory` takes an
@@ -631,6 +658,7 @@ class ContinuousObjectNavEnvActor:
             "post_goal_active": bool(
                 self._goal_reached_once and self._post_goal_remaining > 0
             ),
+            "post_goal_stillness_reward": float(stillness_reward),
             "escaped": escaped,
             "steps": self._steps,
             "collided": collided,
@@ -653,6 +681,8 @@ class ContinuousObjectNavEnvActor:
             "exploration_reward": float(exploration_reward),
             "exploration_ray_seconds": float(exploration_ray_seconds),
             "distance_progress": float(progress),
+            "action_path_length_m": float(action_path_length_m),
+            "policy_stop_mode": None,
             "pos_rots": self._pos_rots(),
             **info_extra,
             # How far the chunk asked the base to move this step. Paired with the
@@ -674,10 +704,14 @@ class ContinuousObjectNavEnvActor:
 
     def policy_stop(self, supplementary_logs: Optional[Dict[str, Any]] = None):
         """End an episode at the current observation without executing a motion chunk."""
+        supplementary_logs = supplementary_logs or {}
         geodesic = self._prev_geodesic
         reached = bool(np.isfinite(geodesic) and geodesic <= self.success_distance)
         oracle = bool(self._min_geodesic <= self.success_distance)
         start = self._start_geodesic
+        stop_reward = (
+            self.policy_stop_correct_reward if reached else -self.policy_stop_false_penalty
+        )
         info = {
             "episode_label": self._episode.uid,
             "scene_id": getattr(self._episode, "scene_id", None) or self._scene_id,
@@ -698,6 +732,13 @@ class ContinuousObjectNavEnvActor:
             "exploration_reward": 0.0,
             "exploration_ray_seconds": 0.0,
             "distance_progress": 0.0,
+            "action_path_length_m": float(
+                supplementary_logs.get("action_path_length_m", 0.0)
+            ),
+            "post_goal_stillness_reward": 0.0,
+            "policy_stop_mode": str(
+                supplementary_logs.get("policy_stop_mode", "physical")
+            ),
             "pos_rots": self._pos_rots(),
             "oracle_success": oracle,
             "spl_fix": (start / max(start, float(self._task.path_tracker.length)))
@@ -712,10 +753,10 @@ class ContinuousObjectNavEnvActor:
         }
         rgb = self._render()
         self._cache["info"].append(info)
-        self._cache["reward"].append(0.0)
+        self._cache["reward"].append(float(stop_reward))
         return rgb, {
             "obs": {"instr_or_goal": self._episode.object_category},
-            "reward": 0.0,
+            "reward": float(stop_reward),
             "done": True,
             "is_exhausted": self.is_exhausted(),
             "info": info,

@@ -29,6 +29,20 @@ from dataclasses import dataclass,field
 import torch.nn.functional as F
 from longnav.config_schema import VLMTrainingConfig
 
+
+_PROBE_METRIC_ONLY = frozenset({
+    "probe/stop_bce_loss",
+    "probe/stop_firstpass_loss",
+    "probe/shadow_stop_rl_loss",
+    "probe/shadow_stop_reward_mean",
+    "probe/shadow_stop_sample_rate",
+})
+
+
+def _is_probe_objective_term(name: str) -> bool:
+    """Only aggregate each stop objective once; component keys are diagnostics."""
+    return name not in _PROBE_METRIC_ONLY and not name.startswith("probe/grad_")
+
 def compute_full_kl_penalty(log_probs: torch.Tensor, ref_log_probs: torch.Tensor) -> torch.Tensor:
     """
     Computes the token-level KL divergence: KL(pi || ref) = sum(pi * (log_pi - log_ref))
@@ -882,7 +896,8 @@ class VLMWrapper(nn.Module):
     def _forward_embeds(self,embeds_inputs,compute_values=False,value_grad_scale=0.1,
                         stop_targets=None, shadow_stop_actions=None,
                         shadow_stop_rewards=None, shadow_stop_temperature=1.0,
-                        shadow_stop_weight=1.0):
+                        shadow_stop_weight=1.0, stop_firstpass_weight=None,
+                        probe_gradient_diagnostics=False):
         hidden,logits_to_keep,value_logits_to_keep = self._forward_hidden(embeds_inputs)
         if value_logits_to_keep is None:
             value_logits_to_keep = logits_to_keep
@@ -911,6 +926,8 @@ class VLMWrapper(nn.Module):
                 shadow_stop_rewards=shadow_stop_rewards,
                 shadow_stop_temperature=shadow_stop_temperature,
                 shadow_stop_weight=shadow_stop_weight,
+                firstpass_weight=stop_firstpass_weight,
+                gradient_diagnostics=probe_gradient_diagnostics,
                 ordered=True)
         if self.action_space_type == "continuous":
             policy_stats = self.vlm.action_head(hidden[:, logits_to_keep])
@@ -1355,7 +1372,21 @@ class VLMTrainingMixin:
                 getattr(self.rl_algo_config, "state_probe_stop_temperature", 1.0)),
             "shadow_stop_weight": float(
                 getattr(self.rl_algo_config, "state_probe_shadow_rl_weight", 1.0)),
+            "stop_firstpass_weight": getattr(
+                self.rl_algo_config, "state_probe_firstpass_weight", None),
         }
+        diagnostic_interval = int(getattr(
+            self.rl_algo_config, "state_probe_gradient_diagnostic_interval", 0
+        ))
+        if diagnostic_interval < 0:
+            raise ValueError("state_probe_gradient_diagnostic_interval must be non-negative")
+        self._state_probe_training_forwards = (
+            getattr(self, "_state_probe_training_forwards", 0) + 1
+        )
+        forward_kwargs["probe_gradient_diagnostics"] = bool(
+            diagnostic_interval
+            and self._state_probe_training_forwards % diagnostic_interval == 0
+        )
         if self.rl_algo_config.value_head is not None:
             forward_kwargs["value_grad_scale"] = self.rl_algo_config.value_head.value_grad_scale
         policy_stats,vpreds, = self.ddp_model(**forward_kwargs)
@@ -1638,7 +1669,8 @@ class VLMTrainingMixin:
                 loss = loss + loss_part*weight
                 metrics |= metric
             for name, probe_loss in policy_stats.pop("probe_losses", {}).items():
-                loss = loss + probe_loss
+                if _is_probe_objective_term(name):
+                    loss = loss + probe_loss
                 metrics[name] = float(probe_loss.detach().cpu())
             # Token-weighting seam: scales the WHOLE minibatch loss (pg + value + any
             # aux) by T_i/T_bar so gradient accumulation over episode-minibatches equals

@@ -1,0 +1,22 @@
+# @package _global_
+# D: same trajectory-stop implementation as C, at the deliberately much tighter 1 cm
+# threshold.  This separates a useful stationary-action detector from incidental jitter.
+defaults:
+  - hm3d_stop_rl_stopstudy_common
+
+sim:
+  post_goal_stillness_reward: 0.5
+  post_goal_stillness_scale_m: 0.15
+
+rollout:
+  stop_execution_mode: trajectory_length
+  trajectory_stop_threshold_m: 0.01
+  learn_post_goal_actions: true
+
+training:
+  rl_config:
+    state_probe: null
+    state_probe_trainable: false
+
+task:
+  run_name: hm3d_stopstudy_d_path_001_r1

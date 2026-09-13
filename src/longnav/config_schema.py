@@ -76,6 +76,12 @@ class RLAlgoConfig:
     # its own threshold; this value only shapes stochastic stop exploration.
     state_probe_stop_temperature: float = 1.0
     state_probe_shadow_rl_weight: float = 1.0
+    # None preserves the first-arrival weight saved with the SFT state probe.  An
+    # explicit value is useful for controlled loss ablations.
+    state_probe_firstpass_weight: Optional[float] = None
+    # 0 disables the inexpensive h-space gradient-conflict diagnostic.  A positive
+    # interval logs component gradient norms/cosines every N training forwards.
+    state_probe_gradient_diagnostic_interval: int = 0
     # Fail before the first optimizer step if the rollout and PPO chain scorers do
     # not agree.  None keeps compatibility with earlier continuous experiments.
     initial_chain_seam_limit: Optional[float] = None
@@ -250,10 +256,16 @@ class RolloutConfig:
     ])
     stop_prob_threshold: Optional[float] = None
     stop_head_radius_m: float = 1.0
+    # ``shadow`` never interrupts control, ``physical`` applies the binary stop head,
+    # and ``trajectory_length`` turns a near-zero decoded action chunk into STOP.
     stop_execution_mode: str = "physical"
+    trajectory_stop_threshold_m: Optional[float] = None
     stop_shadow_correct_reward: float = 1.0
     stop_shadow_false_penalty: float = 1.0
     stop_shadow_miss_penalty: float = 1.0
+    # The historical post-goal collection tail was masked from the action loss.  Enable
+    # this only when its reward is explicitly intended to teach stationary action chunks.
+    learn_post_goal_actions: bool = False
     # Deterministic-rollout mode: act on the env-provided state_dict['info']['oracle_action']
     # instead of sampling from the policy's own output distribution. The policy still runs a
     # real forward pass; only which action is taken (and fed back into the next turn's prompt)

@@ -1,6 +1,7 @@
 import torch
 
 from longnav.utils.state_probe import StateProbe, StateProbeConfig
+from longnav.utils.vlm_worker import _is_probe_objective_term
 
 
 def test_stop_head_has_bce_and_firstpass_gradients():
@@ -52,3 +53,35 @@ def test_shadow_stop_loss_has_gradients_and_is_temperature_sensitive():
                               warm["probe/shadow_stop_rl_loss"])
     cold["probe/stop_loss"].backward()
     assert any(parameter.grad is not None for parameter in probe.stop_head.parameters())
+
+
+def test_stop_gradient_diagnostics_are_metrics_not_new_objective_terms():
+    cfg = StateProbeConfig(
+        distance=None,
+        value=None,
+        stop={"hidden_dims": [8], "pos_weight": 1.0, "radius_m": 1.0,
+              "loss_weight": 1.0, "firstpass_weight": 1.0, "target_eps": 0.01},
+    )
+    probe = StateProbe(4, cfg)
+    with torch.no_grad():
+        probe.stop_head.mlp[-1].weight.fill_(0.1)
+    losses = probe.losses(
+        torch.randn(1, 3, 4, requires_grad=True),
+        stop_targets=torch.tensor([[0.0, 0.0, 1.0]]),
+        shadow_stop_actions=torch.tensor([[0.0, 1.0, 0.0]]),
+        shadow_stop_rewards=torch.tensor([[0.0, -1.0, -1.0]]),
+        gradient_diagnostics=True,
+    )
+    assert "probe/grad_bce_norm" in losses
+    assert "probe/grad_firstpass_norm" in losses
+    assert "probe/grad_shadow_norm" in losses
+    assert torch.isfinite(losses["probe/grad_bce_norm"])
+    assert torch.isfinite(losses["probe/stop_loss"])
+
+
+def test_stop_loss_components_are_not_added_twice_to_the_training_objective():
+    assert _is_probe_objective_term("probe/stop_loss")
+    assert not _is_probe_objective_term("probe/stop_bce_loss")
+    assert not _is_probe_objective_term("probe/stop_firstpass_loss")
+    assert not _is_probe_objective_term("probe/shadow_stop_rl_loss")
+    assert not _is_probe_objective_term("probe/grad_cos_bce_firstpass")

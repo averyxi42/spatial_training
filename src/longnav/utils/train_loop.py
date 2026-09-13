@@ -460,6 +460,7 @@ def run_eval_cycle(sims, trainers, eval_parts, total, wandb_actor, global_cycle,
         else _m("oracle_spl"),
         "eval/mean_path_length_m": _m("path_length_m")
         if any("path_length_m" in r for r in res) else _m("path_length"),
+        "eval/mean_action_path_length_m": _m("mean_action_path_length_m"),
         "eval/mean_steps": _m("steps"),
         "eval/episodes": len(res),
     }
@@ -513,7 +514,11 @@ def run_eval_cycle(sims, trainers, eval_parts, total, wandb_actor, global_cycle,
                                 "uid": r.get("episode_label"),
                                 "success": int(bool(r.get("success"))),
                                 "ospl_fix": float(r.get("ospl_fix") or 0.0),
-                                "steps": r.get("steps")}) + "\n")
+                                "steps": r.get("steps"),
+                                "termination_reason": r.get("termination_reason"),
+                                "policy_stop_mode": r.get("policy_stop_mode"),
+                                "mean_action_path_length_m": r.get(
+                                    "mean_action_path_length_m")}) + "\n")
     print(f"[eval cycle @ {global_cycle}] n={len(res)} success={row['eval/success_rate']:.3f} "
           f"oracle={row['eval/oracle_success_rate']:.3f} ospl={row['eval/ospl']:.3f}")
     return row
@@ -778,6 +783,17 @@ def stream_results_and_log(
                         traj_stats["exploration_gain_raw_m2"].float().sum().item()
                     rollout_stats["exploration/reward"] = \
                         traj_stats["exploration_reward"].float().sum().item()
+                if "action_path_length_m" in traj_stats.keys():
+                    path_lengths = traj_stats["action_path_length_m"].float()
+                    finite_path_lengths = path_lengths[torch.isfinite(path_lengths)]
+                    if len(finite_path_lengths):
+                        rollout_stats["rollout/mean_action_path_length_m"] = (
+                            finite_path_lengths.mean().item()
+                        )
+                if "post_goal_stillness_reward" in traj_stats.keys():
+                    rollout_stats["rollout/post_goal_stillness_reward"] = (
+                        traj_stats["post_goal_stillness_reward"].float().sum().item()
+                    )
                 if "values" in traj_stats.keys():
                     rollout_stats["probe/value_mae_ep"] = \
                         (traj_stats["values"].float() - traj_stats["returns"].float()).abs().mean().item()
@@ -867,6 +883,12 @@ def aggregate_cycle_metrics(rows: list) -> dict:
         "rollout/out_of_bounds_rate": _reason_rate("terrain_out_of_bounds"),
         "rollout/truncated_rate": _mean("truncated"),
         "rollout/policy_stop_rate": _reason_rate("policy_stop"),
+        "rollout/mean_action_path_length_m": _mean(
+            "rollout/mean_action_path_length_m"
+        ),
+        "rollout/post_goal_stillness_reward": _mean(
+            "rollout/post_goal_stillness_reward"
+        ),
         "probe/stop_precision": _mean("probe/stop_precision"),
         "probe/stop_recall": _mean("probe/stop_recall"),
         "exploration/raw_gain_m2": _mean("exploration/raw_gain_m2"),

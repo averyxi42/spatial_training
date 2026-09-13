@@ -85,8 +85,16 @@ class ContinuousObjectNavEnvConfig:
     # Terminal bonus added to the reached step's reward (discrete-standard success term).
     # 0 keeps the progress-only shape every run before 2026-08-21 used.
     success_reward: float = 0.0
-    # Extra decisions after first success are supervised only by the stop head.
+    # Extra decisions after first success are normally supervised only by the stop head.
     post_goal_steps: int = 0
+    # Optional smooth reward for a stationary decoded chunk while in the post-goal tail.
+    # It is disabled by default and paired with rollout.learn_post_goal_actions.
+    post_goal_stillness_reward: float = 0.0
+    post_goal_stillness_scale_m: float = 0.1
+    # Rewards attached to an explicit policy STOP.  They are disabled by default so
+    # legacy binary-head rollouts preserve their return exactly.
+    policy_stop_correct_reward: float = 0.0
+    policy_stop_false_penalty: float = 0.0
     # Subtracted from the escaped terminal step's reward. Unpenalized escapes end the
     # episode keeping all accumulated progress -- a free exit the policy drifts toward
     # (measured: escape rate doubled over the sd04_noterm run). 0 keeps the old shape.

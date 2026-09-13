@@ -177,6 +177,56 @@ class EpisodeRolloutMixin:
             "probe_p_stop": probability,
         }
 
+    @staticmethod
+    def _trajectory_path_length_m(action_to_env) -> float:
+        """Measure the decoded cumulative XY path that the controller would execute."""
+        action = np.asarray(action_to_env, dtype=np.float64)
+        if action.ndim == 1:
+            if action.size >= 3 and action.size % 3 == 0:
+                xy = action.reshape(-1, 3)[:, :2]
+            elif action.size >= 2:
+                xy = action[:2].reshape(1, 2)
+            else:
+                return float("nan")
+        elif action.shape[-1] >= 2:
+            xy = action.reshape(-1, action.shape[-1])[:, :2]
+        else:
+            return float("nan")
+        if not np.isfinite(xy).all():
+            return float("nan")
+        anchored = np.vstack((np.zeros((1, 2), dtype=np.float64), xy))
+        return float(np.linalg.norm(np.diff(anchored, axis=0), axis=1).sum())
+
+    def _policy_stop_decision(self, action_to_env, stop_probability):
+        """Resolve the configured stop actuator from the same decoded action as control."""
+        mode = str(self.rollout_config.get("stop_execution_mode", "physical"))
+        if self.policy_head_config["type"] != "continuous":
+            return False, mode, float("nan")
+        path_length = self._trajectory_path_length_m(action_to_env)
+        if mode == "shadow":
+            return False, mode, path_length
+        if mode == "physical":
+            threshold = self.rollout_config.get("stop_prob_threshold")
+            return (
+                threshold is not None
+                and stop_probability is not None
+                and stop_probability >= float(threshold),
+                mode,
+                path_length,
+            )
+        if mode == "trajectory_length":
+            threshold = self.rollout_config.get("trajectory_stop_threshold_m")
+            if threshold is None or float(threshold) < 0.0:
+                raise ValueError(
+                    "trajectory_length stop requires a non-negative "
+                    "trajectory_stop_threshold_m"
+                )
+            return path_length <= float(threshold), mode, path_length
+        raise ValueError(
+            "stop_execution_mode must be one of shadow, physical, trajectory_length; "
+            f"got {mode!r}"
+        )
+
     def _pack_trajectory(self, buffer: List[Dict]) -> Dict[str, np.ndarray]:
         """
         Converts list of dicts to a dict of numpy arrays (Columnar format).
@@ -306,6 +356,7 @@ class EpisodeRolloutMixin:
 
         if self.policy_head_config["type"] == "continuous":
             action_for_context = action_to_env if uses_chain_action else action_id
+            logs["action_path_length_m"] = self._trajectory_path_length_m(action_to_env)
             action_text = ",".join(
                 f"{value:.3f}" for value in np.asarray(action_for_context).reshape(-1)
             )
@@ -351,6 +402,10 @@ class EpisodeRolloutMixin:
             "shadow_stop_action": float(shadow_stop_action),
             "shadow_stop_reward": float(shadow_stop_reward),
             "policy_action_mask": bool(policy_action_mask),
+            "action_path_length_m": float(
+                decision_logs.get("action_path_length_m", np.nan)
+            ),
+            "policy_stop_mode": decision_logs.get("policy_stop_mode"),
             "probe_p_stop": (
                 np.nan
                 if getattr(self, "last_stop_probability", None) is None
@@ -443,14 +498,12 @@ class EpisodeRolloutMixin:
                 post_goal_action = bool(
                     state_dict.get("info", {}).get("post_goal_active", False)
                 )
-                threshold = self.rollout_config.get("stop_prob_threshold")
                 stop_probability = getattr(self, "last_stop_probability", None)
-                policy_stop = bool(
-                    self.policy_head_config["type"] == "continuous"
-                    and self.rollout_config.get("stop_execution_mode") != "shadow"
-                    and threshold is not None
-                    and stop_probability is not None
-                    and stop_probability >= float(threshold))
+                policy_stop, policy_stop_mode, action_path_length_m = (
+                    self._policy_stop_decision(action_to_env, stop_probability)
+                )
+                decision_logs["action_path_length_m"] = action_path_length_m
+                decision_logs["policy_stop_mode"] = policy_stop_mode
                 decision_logs["mean/probe_p_stop"] = (
                     np.nan if stop_probability is None else float(stop_probability))
                 # D. Store Transition
@@ -479,12 +532,27 @@ class EpisodeRolloutMixin:
                             stop_target=stop_target,
                             shadow_stop_action=shadow_stop["shadow_stop_action"],
                             shadow_stop_reward=shadow_stop["shadow_stop_reward"],
-                            policy_action_mask=not policy_stop and not post_goal_action,
-                            reward_override=0.0 if post_goal_action else None,
-                    done_override=(
-                        bool(state_dict["done"])
-                        or bool(state_dict.get("info", {}).get("just_reached"))
-                    ),
+                            policy_action_mask=(
+                                (not post_goal_action
+                                 or bool(self.rollout_config.get(
+                                     "learn_post_goal_actions", False)))
+                                and (not policy_stop
+                                     or policy_stop_mode == "trajectory_length")
+                            ),
+                            reward_override=(
+                                0.0 if post_goal_action and not bool(
+                                    self.rollout_config.get(
+                                        "learn_post_goal_actions", False))
+                                else None
+                            ),
+                            done_override=(
+                                bool(state_dict["done"])
+                                or (
+                                    bool(state_dict.get("info", {}).get("just_reached"))
+                                    and not bool(self.rollout_config.get(
+                                        "learn_post_goal_actions", False))
+                                )
+                            ),
                         )
                     )
                 # `step` is the index of the observation the appended turn introduces:
@@ -519,6 +587,14 @@ class EpisodeRolloutMixin:
             final_trajectory = self._pack_trajectory(trajectory_buffer) if collect_trajectory else None
             stop_counterfactual = {}
             if final_trajectory is not None:
+                action_lengths = np.asarray(
+                    final_trajectory.get("action_path_length_m", []), dtype=np.float64
+                )
+                finite_lengths = action_lengths[np.isfinite(action_lengths)]
+                if len(finite_lengths):
+                    final_info_action_length = float(finite_lengths.mean())
+                else:
+                    final_info_action_length = float("nan")
                 probability = np.asarray(final_trajectory.get("probe_p_stop", []), dtype=np.float64)
                 target = np.asarray(final_trajectory.get("stop_target", []), dtype=np.float64)
                 valid = np.isfinite(probability) & np.isfinite(target)
@@ -539,6 +615,9 @@ class EpisodeRolloutMixin:
             final_info = state_dict['info'] | {
                 "steps": step_count,
                 "instr_or_goal": instr_or_goal,
+                "mean_action_path_length_m": (
+                    final_info_action_length if final_trajectory is not None else float("nan")
+                ),
                 "policy_stop_probability": (
                     np.nan
                     if getattr(self, "last_stop_probability", None) is None

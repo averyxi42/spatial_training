@@ -1,0 +1,20 @@
+# @package _global_
+# B: the binary stop head uses its deployed 0.95 threshold to terminate the real
+# episode.  Shadow REINFORCE is disabled because no shadow action exists in this arm.
+defaults:
+  - hm3d_stop_rl_stopstudy_common
+
+rollout:
+  stop_execution_mode: physical
+  stop_prob_threshold: 0.95
+  learn_post_goal_actions: false
+
+training:
+  rl_config:
+    state_probe: auto
+    state_probe_trainable: true
+    state_probe_shadow_rl_weight: 0.0
+    state_probe_gradient_diagnostic_interval: 16
+
+task:
+  run_name: hm3d_stopstudy_b_head_hardstop_r1

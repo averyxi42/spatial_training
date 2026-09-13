@@ -393,6 +393,8 @@ class StateProbe(nn.Module):
                shadow_stop_rewards: Optional[torch.Tensor] = None,
                shadow_stop_temperature: float = 1.0,
                shadow_stop_weight: float = 1.0,
+               firstpass_weight: Optional[float] = None,
+               gradient_diagnostics: bool = False,
                ordered: bool = True) -> dict:
         g = float(self.cfg.grad_scale)
         h = hidden if g >= 1.0 else (hidden * g + hidden.detach() * (1.0 - g))
@@ -408,7 +410,8 @@ class StateProbe(nn.Module):
         if self.stop_head is not None and stop_targets is not None:
             stop_targets = stop_targets.to(h.device)
             _lg = self.stop_head(h)
-            _fp = float(self.cfg.stop.get("firstpass_weight", 0.0) or 0.0)
+            _fp = (float(self.cfg.stop.get("firstpass_weight", 0.0) or 0.0)
+                   if firstpass_weight is None else float(firstpass_weight))
             _bce = self.cfg.stop.get("loss_weight", 1.0) * \
                 self.stop_head.loss(_lg, stop_targets, mask)
             out["probe/stop_bce_loss"] = _bce
@@ -456,6 +459,28 @@ class StateProbe(nn.Module):
                     out["probe/shadow_stop_rl_loss"] = zero
                     out["probe/shadow_stop_reward_mean"] = zero.detach()
                     out["probe/shadow_stop_sample_rate"] = zero.detach()
+            if gradient_diagnostics:
+                components = {
+                    "bce": out["probe/stop_bce_loss"],
+                    "firstpass": out["probe/stop_firstpass_loss"],
+                    "shadow": out.get("probe/shadow_stop_rl_loss", _lg.sum() * 0.0),
+                }
+                gradients = {}
+                for name, component in components.items():
+                    gradient = torch.autograd.grad(
+                        component, h, retain_graph=True, allow_unused=True
+                    )[0]
+                    if gradient is not None:
+                        gradients[name] = gradient.detach().float().reshape(-1)
+                        out[f"probe/grad_{name}_norm"] = gradients[name].norm()
+                for left, right in (("bce", "firstpass"), ("bce", "shadow"),
+                                    ("firstpass", "shadow")):
+                    if left in gradients and right in gradients:
+                        denom = gradients[left].norm() * gradients[right].norm()
+                        out[f"probe/grad_cos_{left}_{right}"] = (
+                            (gradients[left] * gradients[right]).sum()
+                            / denom.clamp_min(1e-12)
+                        )
         return out
 
     @torch.no_grad()
