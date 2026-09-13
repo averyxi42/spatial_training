@@ -17,9 +17,11 @@ class TensorPacker:
             }
             
             # 2. Convert to Numpy
-            # Numpy has no bfloat16, so we must cast to float32
+            # NumPy has no bfloat16 scalar type. Preserve the raw 16-bit payload
+            # instead of doubling every cached visual embedding to float32 in Ray.
             if obj.dtype == torch.bfloat16:
-                data = obj.detach().float().cpu().numpy()
+                data = obj.detach().cpu().contiguous().view(torch.uint16).numpy()
+                meta['storage_dtype'] = 'uint16_bits'
             else:
                 data = obj.detach().cpu().numpy()
             
@@ -67,7 +69,14 @@ class TensorPacker:
             # 2. Convert back to Tensor
             tensor = torch.from_numpy(packed_obj)
             # 3. Cast and Move
-            # Note: from_numpy always creates CPU tensor. We move/cast as needed.
+            # Note: from_numpy always creates CPU tensor. Reinterpret BF16 bitwise;
+            # numeric uint16->bfloat16 conversion would corrupt every embedding.
+            if metadata.get('storage_dtype') == 'uint16_bits':
+                if target_dtype is not torch.bfloat16:
+                    raise ValueError(
+                        "uint16_bits storage is only valid for bfloat16 tensors"
+                    )
+                return tensor.view(torch.bfloat16)
             return tensor.to(dtype=target_dtype)
             
         elif isinstance(packed_obj, dict):

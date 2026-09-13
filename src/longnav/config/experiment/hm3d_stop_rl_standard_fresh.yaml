@@ -1,0 +1,27 @@
+# @package _global_
+# Fresh v12-SFT run with r3's PPO objective and explicit SFT-drift controls.
+defaults:
+  - hm3d_stop_rl_standard
+
+training:
+  checkpoint: null
+  load_optim: false
+  load_sched: false
+  learning_rate: 1.0e-6
+  max_grad_norm: 10.0
+  warmup_steps: 64
+  rl_config:
+    advantage_estimator: reinforce_plus_plus_time_kernel
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    policy_loss:
+      name: clip_cov
+      clip_cov_ratio: 0.0002
+      clip_cov_ub: 5.0
+      clip_cov_lb: 1.0
+    time_kernel_sigma: 40.0
+    ref_kl_coeff: 0.001
+    max_ref_log_ratio_p95: 8.0
+
+task:
+  run_name: hm3d_stop_rl_standard_v12_shadow_r6

@@ -50,7 +50,7 @@ def compute_full_kl_penalty(log_probs: torch.Tensor, ref_log_probs: torch.Tensor
     return kl
 
 class VLMWorker:
-    def __init__(self, model_id="Qwen/Qwen3-VL-2B-Instruct",attn_impl='sdpa',dtype='float16', prefix = '<|im_start|>assistant\n**',postfix = '**<|im_end|>',save_outputs=False,load_model=True,offload_cache=False,use_sparse=False,bev_canvas_size=2000,save_pixels=False,policy_head=None,merge_adapter_dir=None):
+    def __init__(self, model_id="Qwen/Qwen3-VL-2B-Instruct",attn_impl='sdpa',dtype='float16', prefix = '<|im_start|>assistant\n**',postfix = '**<|im_end|>',save_outputs=False,load_model=True,offload_cache=False,use_sparse=False,bev_canvas_size=2000,save_pixels=False,policy_head=None,merge_adapter_dir=None,base_model_is_reference=False,rollout_inference_optimizations=False,batch_vision_inference=False):
         import transformers.modeling_flash_attention_utils as fa_utils
         def patched(position_ids, batch_size):
             return False
@@ -72,6 +72,10 @@ class VLMWorker:
         self.use_sparse = use_sparse
         self.bev_canvas_size = bev_canvas_size
         self.merge_adapter_dir = merge_adapter_dir
+        self.base_model_is_reference = bool(base_model_is_reference)
+        self.rollout_inference_optimizations = bool(rollout_inference_optimizations)
+        self.batch_vision_inference = bool(batch_vision_inference)
+        self._inference_mode_prepared = False
         if self.policy_head_config['type'] not in ["discrete", "continuous"]:
             raise ValueError(f"Unsupported action_space_type: {self.policy_head_config['type']}")
         
@@ -79,14 +83,29 @@ class VLMWorker:
         self._is_lora = None
         self.value_readout_offset = 0   # set by setup_training from value_head config
         self.probe_expected_token_id = None  # pinned id from state_probe_config.json
+        self.state_probe = None
+        self.state_probe_trainable = False
+        self.state_probe_stop_threshold = None
+        self.last_stop_probability = None
         # Warmup the CUDA allocator
         if load_model:
             self.load_model()
         torch.cuda.empty_cache()
         self.reset()
         
-    def reset(self):
-        from transformers import DynamicCache,StaticCache
+    _SEQUENCE_STATE_FIELDS = (
+        "offset",
+        "past_key_values",
+        "outputs",
+        "cumulative_inputs",
+        "seq_keep_mask",
+        "vis_keep_masks",
+        "past_image_embeds",
+        "logit_indices",
+        "value_logit_indices",
+    )
+
+    def reset(self, clear_cuda_cache=True):
         import torch
         self.offset=0
         # self.past_key_values=StaticCache(config=self.model.config, offloading=self.offload_cache,max_cache_len=70000)
@@ -98,7 +117,23 @@ class VLMWorker:
         self.past_image_embeds = None #per batch list of image embed tensors of the form N_patch by N_hidden
         self.logit_indices = []
         self.value_logit_indices = []
-        torch.cuda.empty_cache()
+        self.last_stop_probability = None
+        if clear_cuda_cache:
+            torch.cuda.empty_cache()
+
+    def capture_sequence_state(self):
+        return {name: getattr(self, name) for name in self._SEQUENCE_STATE_FIELDS}
+
+    def restore_sequence_state(self, state):
+        for name in self._SEQUENCE_STATE_FIELDS:
+            setattr(self, name, state[name])
+
+    def new_sequence_state(self):
+        current = self.capture_sequence_state()
+        self.reset(clear_cuda_cache=False)
+        state = self.capture_sequence_state()
+        self.restore_sequence_state(current)
+        return state
 
     def load_model(self):
         if not self.use_sparse:
@@ -412,25 +447,26 @@ class VLMWorker:
             "logits_to_keep": self._get_sparse_logit_indices().cpu()
         }
 
-    def infer_step(self,messages,images,full_logprobs=False,temperature=1.0,check_probs=True,crop_inputs=True,pos_id_kwargs=None):
-        t0 = time.time()
-        self.model.gradient_checkpointing_disable()
-        self.model.eval()
-
+    def _prepare_model_for_inference(self):
         if self.model is None:
             self.load_model()
             self.reset()
+        if not self.rollout_inference_optimizations or not self._inference_mode_prepared:
+            self.model.gradient_checkpointing_disable()
+            self.model.eval()
+            self._inference_mode_prepared = True
         if self.using_lora() and not self.is_merged():
             self.merge_adapter() # for inference speed
-            pass
-        # print(f"lora merge time: {time.time()-t0}",end=" ")
-        
-        t = time.time()
-        turn_inputs = self.tokenize_inputs(messages,images)
 
-        # print(f"tokenize time: {time.time()-t}",end=" ")
-        # First we must crop the sequence so the turns properly lign up.
-        logit_indices,prefix_starts,postfix_starts = self._get_sandwich_indices(turn_inputs['input_ids'])
+    def _prepare_infer_inputs(
+        self,
+        messages,
+        images,
+        crop_inputs=True,
+        pos_id_kwargs=None,
+    ):
+        turn_inputs = self.tokenize_inputs(messages,images)
+        _,prefix_starts,postfix_starts = self._get_sandwich_indices(turn_inputs['input_ids'])
         if crop_inputs:
             if len(prefix_starts)>1:
                 turn_inputs['attention_mask'] = turn_inputs['attention_mask'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)]
@@ -443,9 +479,7 @@ class VLMWorker:
                 if 'mm_token_type_ids' in turn_inputs.keys():
                     turn_inputs["mm_token_type_ids"] = turn_inputs['mm_token_type_ids'][:,:(postfix_starts[-1]-1)]
 
-        t = time.time()
         self._accumulate_inputs(turn_inputs)
-        # print(f"accumulate time: {time.time()-t}",end=" ")
         self.logit_indices.append(self.cumulative_inputs['input_ids'].shape[1]-1) #slice index for the hidden state predicting the last token in this turn.
         if self.value_readout_offset:
             _vi = self.cumulative_inputs['input_ids'].shape[1]-1 + self.value_readout_offset
@@ -459,7 +493,7 @@ class VLMWorker:
                     "template this worker tokenized (chat template or prefix drift)")
             self.value_logit_indices.append(_vi)
         turn_inputs = {k: v.to(self.device) for k, v in turn_inputs.items() if v is not None}
-        t = time.time()
+        current_len = turn_inputs['input_ids'].shape[1]
         if pos_id_kwargs is None or pos_id_kwargs['mode'] == "standard": # use fast pos id calculation
             turn_inputs['position_ids'] = self._pos_id_fast(turn_inputs)
             if 'position_ids' not in self.cumulative_inputs.keys():
@@ -469,45 +503,61 @@ class VLMWorker:
         else:
             self.cumulative_inputs['position_ids'] = self._calculate_pos_id(pos_id_kwargs) # calculate the pos_ids for the whole sequence. hopefully not too expensive...
             turn_inputs['position_ids'] = self.cumulative_inputs['position_ids'][..., -current_len:].to(self.device)
-        # print(f"pos id time: {time.time()-t}",end=" ")
-         # Set up inputs for this turn
-        current_len = turn_inputs['input_ids'].shape[1]
         if self.use_sparse:
             turn_inputs['past_image_embeds'] = self.past_image_embeds
             turn_inputs['save_image_db'] = True # new argument in sparse qwen to signal keeping the db as internal state
+            turn_inputs['offload_image_cache'] = not self.rollout_inference_optimizations
             # sparsify the input attention mask
             turn_inputs['attention_mask'] = None#turn_inputs['attention_mask'] = torch.ones((turn_inputs['input_ids'].shape[0], (self.past_key_values.get_seq_length() if self.past_key_values is not None else 0) + turn_inputs['input_ids'].shape[1]), device=self.device, dtype=turn_inputs['attention_mask'].dtype)# torch.ones(1,seql,device=self.device)
         else:
             turn_inputs['attention_mask'] = self.cumulative_inputs['attention_mask'].to(self.device)
         if self.save_outputs:
             turn_inputs['save_embeds'] = True
+        return turn_inputs
 
+    def _forward_infer_inputs(
+        self,
+        turn_inputs,
+        *,
+        full_logprobs=False,
+        temperature=1.0,
+        precomputed_image_features=None,
+    ):
         with torch.inference_mode():
-            t = time.time()
             outputs = self.model.forward(
                 **turn_inputs,
                 past_key_values=self.past_key_values,
                 use_cache=True,
+                precomputed_image_features=precomputed_image_features,
+                **({"skip_lm_head": True}
+                   if self.use_sparse
+                   and self.rollout_inference_optimizations
+                   and self.policy_head_config['type'] == "continuous"
+                   else {}),
                 # logits_to_keep = logit_indices.to(self.model.device)
                 logits_to_keep=1
             )
             self.past_key_values = outputs['past_key_values']
-             # Compute logprobs directly (1-to-1 mapping)
-            relevant_logits = outputs.logits[0].float()
-            if not full_logprobs:
-                relevant_logits = relevant_logits[...,self.vocab_ids]
-            if np.abs(temperature-1.0) > 1e-7:
-                logprobs = torch.log_softmax(relevant_logits/temperature, dim=-1)
-            else:
-                logprobs = torch.log_softmax(relevant_logits, dim=-1)
-            # print(f"vlm latency: {time.time()-t}",end=" ")
+            if self.state_probe is not None and self.state_probe.stop_head is not None:
+                if not self.value_readout_offset:
+                    raise RuntimeError("state probe requires a nonzero worker readout offset")
+                probe_hidden = outputs.last_hidden_state[:, self.value_readout_offset]
+                probability = self.state_probe.stop_head.probability(
+                    self.state_probe.stop_head(probe_hidden))
+                self.last_stop_probability = float(probability.reshape(-1)[0].cpu())
+            logprobs = None
+            if self.policy_head_config['type'] != "continuous":
+                relevant_logits = outputs.logits[0].float()
+                if not full_logprobs:
+                    relevant_logits = relevant_logits[...,self.vocab_ids]
+                if np.abs(temperature-1.0) > 1e-7:
+                    logprobs = torch.log_softmax(relevant_logits/temperature, dim=-1)
+                else:
+                    logprobs = torch.log_softmax(relevant_logits, dim=-1)
 
             if self.save_outputs:
-                t = time.time()
                 self._store_outputs(outputs)
-                # print(f"store outputs time: {time.time()-t}",end=" ")
             if self.use_sparse:
-                t = time.time()
                 current_keep_mask = self.language_model.seq_keep_mask
                 self.vis_keep_masks.append(self.language_model.vis_keep_mask.cpu())
                 if self.seq_keep_mask is None:
@@ -519,14 +569,6 @@ class VLMWorker:
                 else:
                     for idx, image_embeds in enumerate(self.language_model.kept_visual_embeds):
                         self.past_image_embeds[idx] = torch.cat((self.past_image_embeds[idx],image_embeds)) #handle the batching...
-                # print(f"store sparse states time: {time.time()-t}",end=" ")
-        # if check_probs:
-        #     try:
-        #         assert(torch.argmax(logprobs,dim=-1).item() in self.vocab_ids)
-        #     except:
-        #         print("WARNING: prediction not in provided vocab")
-        # # print("inference done!")
-        # print(f" total time: {time.time()-t0}")
             if self.policy_head_config['type'] == "continuous":
                 hidden_last = outputs.last_hidden_state[:, -1:, :]
                 policy = self.model.action_head(hidden_last)
@@ -534,7 +576,45 @@ class VLMWorker:
                 return policy, outputs
             return logprobs.cpu().float().numpy(),outputs
 
-        
+    def batch_image_features(self, prepared_inputs):
+        if not self.use_sparse:
+            raise ValueError("Batched vision currently requires the sparse Qwen3-VL path")
+        if not prepared_inputs:
+            return []
+        grids = [inputs['image_grid_thw'] for inputs in prepared_inputs]
+        if any(grid.shape[0] != 1 for grid in grids):
+            raise ValueError("Batched rollout vision expects exactly one image per slot")
+        pixels = torch.cat([inputs['pixel_values'] for inputs in prepared_inputs])
+        merged_grids = torch.cat(grids)
+        with torch.inference_mode():
+            image_embeds, deepstack = self.vl_model.get_image_features(
+                pixels, merged_grids
+            )
+        merge_size = self.vl_model.visual.spatial_merge_size
+        split_sizes = (merged_grids.prod(-1) // merge_size**2).tolist()
+        deepstack_splits = [torch.split(layer, split_sizes) for layer in deepstack]
+        return [
+            (
+                [image_embeds[index]],
+                [layer[index] for layer in deepstack_splits],
+            )
+            for index in range(len(prepared_inputs))
+        ]
+
+    def infer_step(self,messages,images,full_logprobs=False,temperature=1.0,check_probs=True,crop_inputs=True,pos_id_kwargs=None):
+        self._prepare_model_for_inference()
+        turn_inputs = self._prepare_infer_inputs(
+            messages,
+            images,
+            crop_inputs=crop_inputs,
+            pos_id_kwargs=pos_id_kwargs,
+        )
+        return self._forward_infer_inputs(
+            turn_inputs,
+            full_logprobs=full_logprobs,
+            temperature=temperature,
+        )
+
     def _calculate_action_logprobs(self,logits):
         import torch
         if not torch.is_tensor(logits):
@@ -576,6 +656,7 @@ class VLMWorker:
     def unmerge_adapter(self):
         print("Unmerging LoRA for training")
         self._is_merged = False
+        self._inference_mode_prepared = False
         self.model.unmerge_adapter()
         
     def is_merged(self):
@@ -782,7 +863,7 @@ class VLMWrapper(nn.Module):
     def _forward_hidden(self,embeds_inputs):
         embeds_inputs = {k:v.to('cuda') for k,v in embeds_inputs.items()}
         embeds_inputs['inputs_embeds'] = embeds_inputs['inputs_embeds'].to(self.vlm.dtype)
-        if self.vlm.training:
+        if torch.is_grad_enabled():
             embeds_inputs['inputs_embeds'].requires_grad_(True)
         embeds_inputs['deepstack_visual_embeds'] = [v.to(self.vlm.dtype) for v in embeds_inputs['deepstack_visual_embeds']]
         logits_to_keep = embeds_inputs.pop('logits_to_keep')
@@ -798,12 +879,15 @@ class VLMWrapper(nn.Module):
     In the discrete case, this will return the logits for the action tokens.
     '''
     
-    def _forward_embeds(self,embeds_inputs,compute_values=False,value_grad_scale=0.1):
+    def _forward_embeds(self,embeds_inputs,compute_values=False,value_grad_scale=0.1,
+                        stop_targets=None, shadow_stop_actions=None,
+                        shadow_stop_rewards=None, shadow_stop_temperature=1.0,
+                        shadow_stop_weight=1.0):
         hidden,logits_to_keep,value_logits_to_keep = self._forward_hidden(embeds_inputs)
         if value_logits_to_keep is None:
             value_logits_to_keep = logits_to_keep
         values = None
-        policy_stats = {}
+        probe_losses = None
         if compute_values:
             value_hidden = hidden[:,value_logits_to_keep].to(self.vlm.value_head.dtype)
             if value_grad_scale<=0:
@@ -817,10 +901,24 @@ class VLMWrapper(nn.Module):
             values = self.vlm.value_head(value_hidden)
             if not getattr(self.vlm.value_head, "is_distributional", False):
                 values = values.squeeze(-1)   # distributional heads emit bin logits
+        if stop_targets is not None:
+            if not hasattr(self, "state_probe"):
+                raise RuntimeError("stop targets were supplied without a state probe")
+            probe_hidden = hidden[:, value_logits_to_keep]
+            probe_losses = self.state_probe.losses(
+                probe_hidden, stop_targets=stop_targets,
+                shadow_stop_actions=shadow_stop_actions,
+                shadow_stop_rewards=shadow_stop_rewards,
+                shadow_stop_temperature=shadow_stop_temperature,
+                shadow_stop_weight=shadow_stop_weight,
+                ordered=True)
         if self.action_space_type == "continuous":
             policy_stats = self.vlm.action_head(hidden[:, logits_to_keep])
         else:
+            policy_stats = {}
             policy_stats['logits'] = self.vlm.lm_head(hidden[:,logits_to_keep])
+        if probe_losses is not None:
+            policy_stats["probe_losses"] = probe_losses
         return policy_stats,values
 
     def forward(self, mode = "embeds_inputs",**inputs):
@@ -952,19 +1050,12 @@ class VLMTrainingMixin:
                 self.value_readout_offset = int(getattr(vh_cfg, "readout_offset", 0))
             sp_mode = getattr(config.rl_config, "state_probe", None)
             if sp_mode:
-                if config.rl_config.value_head is not None:
-                    raise ValueError(
-                        "rl_config.state_probe and rl_config.value_head are mutually "
-                        "exclusive: both claim the worker's value readout slot")
                 sp_dir = (self.policy_head_config.get("checkpoint_dir")
                           if sp_mode == "auto" else sp_mode)
                 import json as _json, os as _os
                 from longnav.utils.state_probe import (
                     load_state_probe, STATE_PROBE_CONFIG_FILE)
                 probe = load_state_probe(sp_dir, input_dim=hidden_size)
-                probe.eval()
-                for _p in probe.parameters():
-                    _p.requires_grad_(False)
                 sp_meta = _json.loads(open(
                     _os.path.join(sp_dir, STATE_PROBE_CONFIG_FILE)).read())
                 w_off = sp_meta.get("worker_value_readout_offset")
@@ -979,9 +1070,27 @@ class VLMTrainingMixin:
                         "worker_value_readout_offset == 0 is unsupported: the worker "
                         "gates index recording on `if self.value_readout_offset:` and "
                         "a zero offset is falsy there")
-                self.model.value_head = StateProbeValueAdapter(probe).to(self.model.device)
                 self.value_readout_offset = int(w_off)
                 self.probe_expected_token_id = sp_meta.get("probe_token_id")
+                self.state_probe_stop_threshold = getattr(
+                    config.rl_config, "state_probe_stop_threshold", None)
+                self.state_probe_trainable = bool(getattr(
+                    config.rl_config, "state_probe_trainable", False))
+                if self.state_probe_trainable:
+                    if probe.stop_head is None:
+                        raise ValueError(
+                            "state_probe_trainable requires a checkpoint with stop config")
+                    self.state_probe = probe.to(self.model.device)
+                    self.state_probe.train()
+                else:
+                    probe.eval()
+                    for _p in probe.parameters():
+                        _p.requires_grad_(False)
+                    if probe.value_head is None:
+                        raise ValueError(
+                            "a frozen state probe requires a value head; enable "
+                            "state_probe_trainable for a stop-only checkpoint")
+                    self.model.value_head = StateProbeValueAdapter(probe).to(self.model.device)
             from verl.trainer.ppo.core_algos import get_policy_loss_fn
             self.policy_loss_fn = get_policy_loss_fn(config.rl_config.policy_loss.name)
             if getattr(config.rl_config, 'ref_kl', False) and self.policy_head_config['type'] == "continuous":
@@ -990,13 +1099,15 @@ class VLMTrainingMixin:
                 # base (vlm.merge_adapter_dir). Without the merge the "reference" is the
                 # raw pretrained VLM and every ref/kl_* number is confidently meaningless
                 # -- a plausible wrong gauge, so refuse loudly instead.
-                if not getattr(self, 'merge_adapter_dir', None):
+                if not (
+                    getattr(self, 'merge_adapter_dir', None)
+                    or getattr(self, 'base_model_is_reference', False)
+                ):
                     raise ValueError(
-                        "rl_config.ref_kl requires vlm.merge_adapter_dir on continuous "
-                        "heads: disable_adapter() references the BASE model, which is "
-                        "the SFT policy only after the merge. Set vlm.merge_adapter_dir "
-                        "to the SFT adapter (and drop training.checkpoint), or turn "
-                        "ref_kl off.")
+                        "rl_config.ref_kl on a continuous head requires either "
+                        "vlm.merge_adapter_dir or vlm.base_model_is_reference=true: "
+                        "disable_adapter() must expose the intended frozen reference "
+                        "policy, not a raw pretrained VLM.")
             if getattr(self, 'merge_adapter_dir', None) and config.checkpoint is not None:
                 import os as _os
                 if _os.path.realpath(str(config.checkpoint)) == _os.path.realpath(str(self.merge_adapter_dir)):
@@ -1028,7 +1139,11 @@ class VLMTrainingMixin:
         # Only optimize parameters that require gradients (i.e., the Adapters)
         print(f"accelerator device: {self.accelerator.device}")
         wrapper = VLMWrapper(self.model,action_space_type = self.policy_head_config['type'])
-        rest_params = [p for n, p in wrapper.named_parameters() if "value_head" not in n and "action_head" not in n and p.requires_grad]
+        if self.state_probe_trainable:
+            wrapper.state_probe = self.state_probe
+        rest_params = [p for n, p in wrapper.named_parameters()
+                       if "value_head" not in n and "action_head" not in n
+                       and "state_probe" not in n and p.requires_grad]
 
         optimizer_grouped_parameters = [
             {
@@ -1051,6 +1166,12 @@ class VLMTrainingMixin:
                     "lr": config.rl_config.value_head.learning_rate,
                     "name": "value_head"
                 }]
+        if self.state_probe_trainable:
+            optimizer_grouped_parameters += [{
+                "params": [p for p in self.state_probe.parameters() if p.requires_grad],
+                "lr": config.learning_rate,
+                "name": "state_probe",
+            }]
         if self.policy_head_config['type'] == "continuous":
             action_head_params = [p for n, p in wrapper.named_parameters() if "action_head" in n and p.requires_grad]
             optimizer_grouped_parameters += [
@@ -1118,6 +1239,38 @@ class VLMTrainingMixin:
             self.model = get_peft_model(self.model, real_peft_config)
         else:
             print("PEFT config not provided; training all model parameters.")
+
+    def setup_state_probe_for_eval(self, config):
+        """Attach the checkpointed stop probe for inference-only RL evaluation."""
+        rl_config = getattr(config, "rl_config", None)
+        sp_mode = getattr(rl_config, "state_probe", None)
+        if not sp_mode:
+            return
+        sp_dir = (self.policy_head_config.get("checkpoint_dir")
+                  if sp_mode == "auto" else sp_mode)
+        import json as _json
+        import os as _os
+        from longnav.utils.state_probe import load_state_probe, STATE_PROBE_CONFIG_FILE
+
+        probe = load_state_probe(
+            sp_dir, input_dim=self.language_model.config.hidden_size)
+        meta = _json.loads(open(
+            _os.path.join(sp_dir, STATE_PROBE_CONFIG_FILE)).read())
+        readout_offset = meta.get("worker_value_readout_offset")
+        if readout_offset in (None, 0):
+            raise ValueError("state probe eval requires a nonzero worker readout offset")
+        if probe.stop_head is None:
+            raise ValueError("state probe eval requires a stop head")
+        self.value_readout_offset = int(readout_offset)
+        self.probe_expected_token_id = meta.get("probe_token_id")
+        self.state_probe_stop_threshold = getattr(
+            rl_config, "state_probe_stop_threshold", None)
+        # `load_checkpoint` uses this flag to restore state_probe_rl.pt. It does not
+        # imply optimizer setup in inference-only workers.
+        self.state_probe_trainable = True
+        self.state_probe = probe.to(self.model.device)
+        self.state_probe.eval()
+
     def train_sft_step(self, batch):
         """
         Standard training step.
@@ -1176,6 +1329,7 @@ class VLMTrainingMixin:
         return policy_stats, values
     
     def _setup_training(self):
+        self._inference_mode_prepared = False
         self.ddp_model.train()
         if self.is_merged():
             self.unmerge_adapter()
@@ -1183,18 +1337,31 @@ class VLMTrainingMixin:
             self.model.gradient_checkpointing_enable({"use_reentrant": False})
         self.reset() #clear internal state, training is (mostly) stateless
         self.accelerator.wait_for_everyone() # ensure all workers have unmerged before training
+
         
-    def _training_forward(self,embeds_inputs):
+    def _training_forward(self,embeds_inputs, stop_targets=None,
+                          shadow_stop_actions=None, shadow_stop_rewards=None):
         # Forward via DDP wrapper (triggers sync)
         compute_values = (self.rl_algo_config.value_head is not None
-                          or bool(getattr(self.rl_algo_config, "state_probe", None)))
-        forward_kwargs = {"embeds_inputs": embeds_inputs, "compute_values": compute_values}
+                          or (bool(getattr(self.rl_algo_config, "state_probe", None))
+                              and not self.state_probe_trainable))
+        forward_kwargs = {
+            "embeds_inputs": embeds_inputs,
+            "compute_values": compute_values,
+            "stop_targets": stop_targets,
+            "shadow_stop_actions": shadow_stop_actions,
+            "shadow_stop_rewards": shadow_stop_rewards,
+            "shadow_stop_temperature": float(
+                getattr(self.rl_algo_config, "state_probe_stop_temperature", 1.0)),
+            "shadow_stop_weight": float(
+                getattr(self.rl_algo_config, "state_probe_shadow_rl_weight", 1.0)),
+        }
         if self.rl_algo_config.value_head is not None:
             forward_kwargs["value_grad_scale"] = self.rl_algo_config.value_head.value_grad_scale
         policy_stats,vpreds, = self.ddp_model(**forward_kwargs)
         return policy_stats,vpreds
     
-    def rl_loss(self, log_probs, actions, advantages, response_mask, old_log_prob, returns, old_values, vpreds, rollout_log_probs=None, ref_log_probs=None, policy_stats=None, actions_continuous=None, sde_positions=None):
+    def rl_loss(self, log_probs, actions, advantages, response_mask, old_log_prob, returns, old_values, vpreds, rollout_log_probs=None, ref_log_probs=None, policy_stats=None, actions_continuous=None, sde_positions=None, stop_targets=None, shadow_stop_action=None, shadow_stop_reward=None):
         from verl.trainer.ppo.core_algos import compute_value_loss,compute_entropy_loss
         # `rl_loss` runs on the WORKER (`self.model`), not the wrapper (`self.vlm`) -- the
         # same resolution note as the actuator seam. getattr-chained so head-less test stubs
@@ -1227,6 +1394,18 @@ class VLMTrainingMixin:
             self._chain_seam_gap = float(
                 (log_prob.detach() - old_log_prob.to(log_prob.device)
                  .reshape(log_prob.shape)).abs().mean())
+            seam_limit = getattr(
+                self.rl_algo_config, "initial_chain_seam_limit", None
+            )
+            if seam_limit is not None and not getattr(
+                self, "_chain_initial_seam_checked", False
+            ):
+                self._chain_initial_seam_checked = True
+                if self._chain_seam_gap > float(seam_limit):
+                    raise RuntimeError(
+                        "initial chain rollout/PPO seam exceeds the configured "
+                        f"limit: {self._chain_seam_gap:.6f} > {float(seam_limit):.6f}"
+                    )
         elif self.policy_head_config['type'] == "continuous":
             if policy_stats is None or actions_continuous is None:
                 raise ValueError("Continuous RL loss requires policy_stats and actions_continuous.")
@@ -1442,7 +1621,11 @@ class VLMTrainingMixin:
         with self.accelerator.accumulate(self.ddp_model):
             loss = torch.tensor(0.0).to(self.device)
             metrics = {}
-            policy_stats,vpreds = self._training_forward(embeds_inputs)
+            stop_targets = loss_kwargs_list.get("rl", {}).get("stop_targets")
+            shadow_stop_actions = loss_kwargs_list.get("rl", {}).get("shadow_stop_action")
+            shadow_stop_rewards = loss_kwargs_list.get("rl", {}).get("shadow_stop_reward")
+            policy_stats,vpreds = self._training_forward(
+                embeds_inputs, stop_targets, shadow_stop_actions, shadow_stop_rewards)
             if self.policy_head_config['type'] == "discrete":
                 log_probs = self._calculate_action_logprobs(policy_stats['logits']) # B by S by N_action space
             else:
@@ -1454,6 +1637,9 @@ class VLMTrainingMixin:
                 loss_part,metric = loss_fn(log_probs=log_probs,vpreds=vpreds,policy_stats=policy_stats,**loss_kwargs_list[loss_fn_name])
                 loss = loss + loss_part*weight
                 metrics |= metric
+            for name, probe_loss in policy_stats.pop("probe_losses", {}).items():
+                loss = loss + probe_loss
+                metrics[name] = float(probe_loss.detach().cpu())
             # Token-weighting seam: scales the WHOLE minibatch loss (pg + value + any
             # aux) by T_i/T_bar so gradient accumulation over episode-minibatches equals
             # the global token mean. 1.0 = the historical episode-weighted objective.
@@ -1486,7 +1672,7 @@ class VLMTrainingMixin:
             self.optimizer.zero_grad()
         return metrics
             
-    def train_rl_step(self,embeds_inputs,actions=None,old_log_prob=None,advantages=None,returns=None,old_values=None,rollout_log_probs=None,ref_log_probs=None,actions_continuous=None,sde_positions=None,loss_scale=1.0):
+    def train_rl_step(self,embeds_inputs,actions=None,old_log_prob=None,advantages=None,returns=None,old_values=None,rollout_log_probs=None,ref_log_probs=None,actions_continuous=None,sde_positions=None,stop_targets=None,shadow_stop_action=None,shadow_stop_reward=None,policy_action_mask=None,loss_scale=1.0):
         '''
         Docstring for train_rl_step
         
@@ -1499,7 +1685,8 @@ class VLMTrainingMixin:
         '''
         if old_log_prob is None or advantages is None or returns is None:
             raise ValueError("old_log_prob, advantages and returns are required for train_rl_step")
-        response_mask = torch.ones_like(old_log_prob, dtype=torch.bool)
+        response_mask = (torch.ones_like(old_log_prob, dtype=torch.bool)
+                         if policy_action_mask is None else policy_action_mask.bool())
         return self.generic_train_step(
             loss_scale=loss_scale,
             embeds_inputs=embeds_inputs,
@@ -1516,6 +1703,9 @@ class VLMTrainingMixin:
                     'rollout_log_probs': rollout_log_probs,
                     'ref_log_probs': ref_log_probs,
                     'response_mask': response_mask,
+                    'stop_targets': stop_targets,
+                    'shadow_stop_action': shadow_stop_action,
+                    'shadow_stop_reward': shadow_stop_reward,
                 }
             }
         )
@@ -1558,12 +1748,19 @@ class VLMTrainingMixin:
         # Standard DDP models are replicated, so Rank 0 has everything.
         # save_pretrained is a local I/O operation.
         self.model.save_pretrained(path)
+        if self.state_probe_trainable:
+            torch.save(self.state_probe.state_dict(),
+                       os.path.join(path, "state_probe_rl.pt"))
         # 2. Save Optimizer & Scheduler
         # In Standard DDP, optimizer states are identical across ranks.
         # Saving Rank 0's copy is sufficient to restore training.
         torch.save(self.optimizer.state_dict(), os.path.join(path, "optimizer.pt"))
         torch.save(self.scheduler.state_dict(), os.path.join(path, "scheduler.pt"))
         print(f"✅ Checkpoint saved to: {path}")
+
+    def checkpoint_required_files(self):
+        """Files whose absence would make this worker resume with different weights."""
+        return ["state_probe_rl.pt"] if self.state_probe_trainable else []
 
     def load_checkpoint(self, path, strict_base_check=True,load_optim=True,load_sched=False):
         """
@@ -1613,6 +1810,18 @@ class VLMTrainingMixin:
              print(" -> ⚠️ No adapter weights found in checkpoint.")
 
         # 3. Load Optimizer
+        probe_path = os.path.join(path, "state_probe_rl.pt")
+        if self.state_probe_trainable:
+            if not os.path.isfile(probe_path):
+                raise FileNotFoundError(
+                    f"trainable state probe checkpoint is missing: {probe_path}")
+            probe_device = (
+                self.accelerator.device if hasattr(self, "accelerator")
+                else self.model.device
+            )
+            self.state_probe.load_state_dict(torch.load(
+                probe_path, map_location=probe_device, weights_only=True))
+            print(" -> Trainable state probe loaded.")
         opt_path = os.path.join(path, "optimizer.pt")
         if os.path.exists(opt_path) and load_optim:
             print("loading optimizer!")

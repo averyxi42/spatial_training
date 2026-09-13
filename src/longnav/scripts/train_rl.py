@@ -16,8 +16,6 @@ eval "$(python3 -m longnav.training_scripts.train_rl.py -sc install=bash)"
 NOTE: tab completion only works if your command uses python not python3. somehow.
 '''
 import os
-
-from verl.single_controller import ray
 # NUCLEAR THREAD CAP: Must be set before importing numpy/torch/ray
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -99,6 +97,11 @@ def main(cfg: RLConfig):
             ray.kill(sim)
         if wandb_actor is not None:
             ray.kill(wandb_actor)
+        if ctx.placement_groups:
+            from ray.util.placement_group import remove_placement_group
+
+            for group in ctx.placement_groups:
+                remove_placement_group(group)
         ray.shutdown()
 
     def debug():
@@ -139,6 +142,12 @@ def main(cfg: RLConfig):
                 trajectory_list,
                 bootstrapper.typed_cfg.training.rl_config.n_rollout,
                 bootstrapper.typed_cfg.training.rl_config.n_adv,
+                ctx.vector_envs_per_sim,
+                sim_rebuilder=ctx.sim_rebuilder,
+                sim_rebuild_validator=ctx.sim_rebuild_validator,
+                episode_soft_timeout_seconds=ctx.episode_soft_timeout_seconds,
+                episode_hard_timeout_seconds=ctx.episode_hard_timeout_seconds,
+                sim_restart_limit=ctx.sim_restart_limit,
             )
 
             print("done collecting")

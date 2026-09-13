@@ -103,6 +103,31 @@ def test_continuous_trajectory_shape(ray_session):
     assert "rollout_probs" not in trajectory
 
 
+def test_chain_action_context_uses_executed_chunk_not_credited_chain():
+    worker = StubEpisodeWorker(
+        policy_head_type="continuous",
+        continuous_action_sequence=[np.zeros(1, dtype=np.float32)],
+    )
+    chain = np.arange(12, dtype=np.float32)
+    chunk = np.asarray([[0.1, 0.0, 0.2], [0.2, 0.0, 0.3]], dtype=np.float32)
+
+    class _ChainHead:
+        @staticmethod
+        def sample_chain_np(_hidden):
+            return chain, np.asarray([0], dtype=np.int64), -1.0, chunk
+
+    worker.model = type("Model", (), {"action_head": _ChainHead()})()
+    sampled = worker._sample_action_for_state(
+        {"h": np.zeros(4, dtype=np.float32)}, None, {}, {}
+    )
+
+    credited, executed, _, _, action_text = sampled
+    np.testing.assert_array_equal(credited, chain)
+    np.testing.assert_array_equal(executed, chunk)
+    assert action_text == "0.100,0.000,0.200,0.200,0.000,0.300"
+    assert "11.000" not in action_text
+
+
 def test_stop_prob_threshold_guard(ray_session, monkeypatch):
     """When the raw sampled action is `stop` but its probability is below
     stop_prob_threshold, run_episode must resample away from `stop`."""

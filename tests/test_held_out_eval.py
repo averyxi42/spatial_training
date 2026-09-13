@@ -90,3 +90,63 @@ def test_pinned_eval_partition_is_verbatim_and_rejects_a_uid_outside_the_pool():
             train_loop.build_eval_partition(sims, 2, 0, uids=["s:1", "nope:1"])
     finally:
         train_loop.ray.get = orig
+
+
+def test_pinned_vector_eval_preserves_same_scene_groups():
+    from longnav.utils import train_loop
+
+    pool = [f"scene_a_{i}" for i in range(8)] + [f"scene_b_{i}" for i in range(8)]
+
+    class _Sims:
+        class list_episode_uids:
+            @staticmethod
+            def remote():
+                return pool
+
+    sims, orig = [_Sims(), _Sims()], train_loop.ray.get
+    train_loop.ray.get = lambda value: value() if callable(value) else value
+    try:
+        uids, groups = train_loop.build_vector_eval_groups(
+            sims, 16, 0, 4, uids=pool
+        )
+        assert uids == pool
+        assert len(groups) == 4
+        assert all(len({label.rsplit("_", 1)[0] for label in group}) == 1 for group in groups)
+        with pytest.raises(ValueError, match="one scene"):
+            train_loop.build_vector_eval_groups(
+                sims, 8, 0, 4,
+                uids=["scene_a_0", "scene_b_0", "scene_a_1", "scene_b_1",
+                      "scene_a_2", "scene_a_3", "scene_a_4", "scene_a_5"],
+            )
+    finally:
+        train_loop.ray.get = orig
+
+
+def test_vector_training_sampler_excludes_pinned_eval_labels(tmp_path):
+    from longnav.utils.scene_sampler import SceneGroupedBatchIterator
+
+    labels = [f"scene_{i}" for i in range(16)]
+    episode_file = tmp_path / "episodes.txt"
+    episode_file.write_text("\n".join(labels) + "\n")
+    held_out = set(labels[:8])
+    sampler = SceneGroupedBatchIterator(
+        str(episode_file), 8, 1, seed=0, excluded_labels=held_out
+    )
+    assert set(next(sampler)) == set(labels[8:])
+
+
+def test_vector_training_sampler_skip_groups_preserves_stream(tmp_path):
+    from longnav.utils.scene_sampler import SceneGroupedBatchIterator
+
+    labels = [f"scene_{scene}_{episode}" for scene in range(4) for episode in range(8)]
+    episode_file = tmp_path / "episodes.txt"
+    episode_file.write_text("\n".join(labels) + "\n")
+    reference = SceneGroupedBatchIterator(str(episode_file), 8, 2, seed=42)
+    resumed = SceneGroupedBatchIterator(str(episode_file), 8, 2, seed=42)
+
+    expected = [next(reference) for _ in range(7)][-1]
+    resumed.skip_groups(6)
+
+    assert next(resumed) == expected
+    with pytest.raises(ValueError, match="non-negative"):
+        resumed.skip_groups(-1)

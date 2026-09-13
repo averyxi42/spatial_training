@@ -84,7 +84,13 @@ def main(cfg: RLConfig):
                 set_noise_a(a)
             for rep in range(M_REPEATS):
                 row = run_eval_cycle(sims, trainers, eval_parts, len(eval_uids),
-                                     None, tick, run_dir, ode=(a is None))
+                                     None, tick, run_dir, ode=(a is None),
+                                     vector_envs_per_sim=ctx.vector_envs_per_sim,
+                                     sim_rebuilder=ctx.sim_rebuilder,
+                                     sim_rebuild_validator=ctx.sim_rebuild_validator,
+                                     episode_soft_timeout_seconds=ctx.episode_soft_timeout_seconds,
+                                     episode_hard_timeout_seconds=ctx.episode_hard_timeout_seconds,
+                                     sim_restart_limit=ctx.sim_restart_limit)
                 tick += 1
                 # per-episode results were appended to eval_episodes.jsonl by the cycle;
                 # re-read the tail we just wrote (cycle id == tick-1)
@@ -93,7 +99,7 @@ def main(cfg: RLConfig):
                         r = json.loads(line)
                         if r["cycle"] == tick - 1:
                             outcomes[arm][r["uid"]].append(r["success"])
-                print(f"[{arm} rep {rep}] success {row['eval/success']:.3f}")
+                print(f"[{arm} rep {rep}] success {row['eval/success_rate']:.3f}")
 
         # ---- summary: per-arm flip statistics over the fixed set ----------------
         print("\n=== H2 PROBE SUMMARY ===")

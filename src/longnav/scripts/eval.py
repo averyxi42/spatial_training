@@ -10,6 +10,7 @@ from longnav.conf.register_configs import register_configs
 from longnav.config_schema import RLConfig
 import os
 import itertools
+import json
 
 DEBUG_FLAG = False
 
@@ -22,7 +23,12 @@ def main(cfg: RLConfig):
     import time
 
     from longnav.utils.rollout_core import collect_rollouts
-    from longnav.utils.train_loop import bootstrap_all
+    from longnav.utils.train_loop import (
+        bootstrap_all,
+        build_eval_partition,
+        build_vector_eval_groups,
+        run_eval_cycle,
+    )
 
     print(f"Model ID: {cfg.vlm.model_id}")
 
@@ -62,6 +68,55 @@ def main(cfg: RLConfig):
         filepath = os.path.join(dirname,f"{filename}.pkl")
         with open(filepath,'wb') as f:
             pickle.dump(obj,f)
+
+    eval_uids_file = getattr(bootstrapper.typed_cfg.task, "eval_uids_file", None)
+    if eval_uids_file:
+        with open(eval_uids_file) as f:
+            uids = [uid.strip() for uid in f.read().replace("\n", ",").split(",")
+                    if uid.strip()]
+        vector_envs_per_sim = ctx.vector_envs_per_sim
+        if vector_envs_per_sim > 1:
+            _, eval_parts = build_vector_eval_groups(
+                sims,
+                len(uids),
+                int(getattr(bootstrapper.typed_cfg.task, "eval_seed", 0)),
+                vector_envs_per_sim,
+                uids=uids,
+            )
+        else:
+            _, eval_parts = build_eval_partition(
+                sims,
+                len(uids),
+                int(getattr(bootstrapper.typed_cfg.task, "eval_seed", 0)),
+                uids=uids,
+            )
+        run_dir = os.path.join(
+            bootstrapper.typed_cfg.task.output_dir,
+            bootstrapper.typed_cfg.task.run_name,
+        )
+        row = run_eval_cycle(
+            sims,
+            trainers,
+            eval_parts,
+            len(uids),
+            wandb_actor,
+            0,
+            run_dir,
+            ode=bool(getattr(bootstrapper.typed_cfg.task, "eval_ode", True)),
+            vector_envs_per_sim=vector_envs_per_sim,
+            sim_rebuilder=ctx.sim_rebuilder,
+            sim_rebuild_validator=ctx.sim_rebuild_validator,
+            episode_soft_timeout_seconds=ctx.episode_soft_timeout_seconds,
+            episode_hard_timeout_seconds=ctx.episode_hard_timeout_seconds,
+            sim_restart_limit=ctx.sim_restart_limit,
+            stop_success_radius=float(bootstrapper.typed_cfg.sim.success_distance),
+        )
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, "eval_summary.json"), "w") as f:
+            json.dump(row, f, indent=2, sort_keys=True)
+        print(json.dumps(row, indent=2, sort_keys=True), flush=True)
+        cleanup()
+        return
 
     # ------------------------------------------- rollouts ------------------------------------------
     batch_size = 32 # fixed batch size decoupled from RL logic for eval

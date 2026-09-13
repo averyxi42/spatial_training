@@ -1,0 +1,126 @@
+# @package _global_
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: objectnav_continuous
+
+vlm:
+  attn_impl: flash_attention_2
+  # Cache inference state during scalar rollouts; semantics unchanged.
+  rollout_inference_optimizations: true
+  save_outputs: true
+  merge_adapter_dir: /home/ubuntu/storage-migrations/20260906-longnav/v12-regeneration/production/training/checkpoint-12000/adapter
+  policy_head:
+    checkpoint_dir: /home/ubuntu/storage-migrations/20260906-longnav/v12-regeneration/production/training/checkpoint-12000
+    gap: 10
+    sde_n: 3
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+
+sim:
+  episodes: /home/ubuntu/storage-migrations/20260906-longnav/received/ff1df307208465bfb3b9d310ef0a0cedabb9dff9/extracted/parts/simulator-rebuild-missing/Projects/data/datasets/objectnav/hm3d/v1_train100x80
+  scene_root: /mnt/nvme_scratch/longnav_rl_runtime/data/scene_datasets
+  exclude_categories: [plant]
+  train_uids: /home/ubuntu/storage-migrations/20260906-longnav/v12-regeneration/production/rl_stop_experiments/splits/train128.txt
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 1.0
+  post_goal_steps: 16
+  success_reward: 0.0
+  escape_penalty: 2.5
+  navmesh: dataset
+  minimal_logging: true
+  reward_lost_steps: 25
+
+rollout:
+  max_steps: 175
+  # Shadow STOP learns from an independent Bernoulli action and never interrupts motion.
+  stop_execution_mode: shadow
+  stop_prob_threshold: null
+  stop_shadow_correct_reward: 1.0
+  stop_shadow_false_penalty: 1.0
+  stop_shadow_miss_penalty: 1.0
+  # Keep the learned stop condition identical to the simulator success condition.
+  stop_head_radius_m: ${sim.success_distance}
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - {type: text, text: "Observation 0:"}
+        - {type: image}
+        - {type: text, text: "Action:"}
+    - role: assistant
+      content:
+        - {type: text, text: "**____**"}
+  convo_turn_template:
+    - role: assistant
+      content:
+        - {type: text, text: "**____**"}
+    - role: user
+      content:
+        - {type: text, text: "Observation $step:"}
+        - {type: image}
+        - {type: text, text: "Action:"}
+    - role: assistant
+      content:
+        - {type: text, text: "**____**"}
+
+training:
+  checkpoint: null
+  load_optim: false
+  load_sched: false
+  learning_rate: 2.0e-6
+  action_head_learning_rate: 0.0
+  grad_accum_steps: 4
+  max_grad_norm: 20.0
+  total_optimization_steps: 4000
+  warmup_steps: 32
+  save_step: 20
+  rl_config:
+    value_head:
+      _target_: longnav.utils.vlm_worker.ValueHead
+      kind: distributional
+      learning_rate: 5.0e-4
+      hidden_dims: [1024, 512]
+      dropout: 0.0
+      dtype: float32
+      n_bins: 51
+      v_min: -5.0
+      v_max: 15.0
+      hl_sigma_ratio: 0.75
+      readout_offset: -2
+      cliprange_value: 0.2
+      value_grad_scale: 0.1
+    state_probe: auto
+    state_probe_trainable: true
+    state_probe_stop_threshold: 0.95
+    state_probe_stop_temperature: 1.0
+    state_probe_shadow_rl_weight: 1.0
+    initial_chain_seam_limit: 0.05
+    gamma: 0.95
+    entropy_bonus: 0.0
+    n_rollout: 16
+    n_adv: 256
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: true
+    ref_kl: true
+    ref_kl_coeff: 0.0
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: cont_dev
+    compact_metrics: true
+  run_name: hm3d_stop_rl_standard_v12
+  output_dir: /home/ubuntu/storage-migrations/20260906-longnav/v12-regeneration/production/rl_stop_experiments
+  subset_label: everything
+  shard_size: 0
+  eval_every: 8
+  eval_set_size: 32
+  eval_uids_file: /home/ubuntu/storage-migrations/20260906-longnav/v12-regeneration/production/rl_stop_experiments/splits/eval32.txt
+  eval_ode: true
+  save_eval_bests: true

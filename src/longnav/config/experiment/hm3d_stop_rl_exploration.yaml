@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - hm3d_stop_rl_standard
+
+sim:
+  exploration_enabled: true
+  # Fixed saturation: p90 raw gain 22 m² maps to roughly 0.625 reward.
+  exploration_reward_weight: 1.25
+  exploration_reward_sigma_m2: 31.8
+  exploration_resolution_m: 0.1
+  exploration_local_window_m: 24.0
+  exploration_ray_range_m: 12.0
+  exploration_n_rays: 31
+  exploration_path_samples: 4
+  exploration_max_depth_m: 12.0
+
+task:
+  run_name: hm3d_stop_rl_exploration_v12
