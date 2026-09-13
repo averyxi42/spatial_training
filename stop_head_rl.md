@@ -301,6 +301,14 @@ decisions, while 32 positive opportunities are missed.  The immediate stop-head 
 for B is therefore recall and sequential decision timing, not a lower global threshold;
 the fixed calibration split remains the only source for any threshold change.
 
+At cycle 16, A is SR/OSPL 0.6562/0.3637 and B is 0.5938/0.3948.  B's OSPL and SPL
+improve materially while SR stays fixed, but its STOP precision/recall (0.6875/0.2558)
+is almost unchanged from cycle 0 (0.7059/0.3000).  That is evidence of more efficient
+successful trajectories, not evidence that the head has solved the missed-stop problem.
+A's OSPL decline after one additional point is likewise insufficient for a trend claim.
+Neither run has a non-finite metric, reference-density fuse, fixed-eval coverage failure,
+or checkpoint-write failure.
+
 ### Action-path semantic diagnostic after C/D
 
 The released C/D GPU pairs ran two no-update, no-W&B full-history shadow traces from c339:
