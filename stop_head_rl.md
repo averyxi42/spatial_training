@@ -309,6 +309,12 @@ A's OSPL decline after one additional point is likewise insufficient for a trend
 Neither run has a non-finite metric, reference-density fuse, fixed-eval coverage failure,
 or checkpoint-write failure.
 
+At cycle 24, A recovers to SR/OSPL 0.6562/0.4429 and records its current best OSPL/SPL
+snapshot.  B temporarily falls to 0.5000/0.3374, with STOP precision 0.4667, but the
+cycle-32 confirmation returns to 0.5938/0.3676 with precision/recall 0.7059/0.3158.
+This is not a sustained collapse: retain B's cycle-16 best OSPL/SPL snapshot and continue
+training, rather than restarting from a one-eval dip or changing its calibrated threshold.
+
 ### Action-path semantic diagnostic after C/D
 
 The released C/D GPU pairs ran two no-update, no-W&B full-history shadow traces from c339:
