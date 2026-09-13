@@ -70,7 +70,8 @@ __all__ = [
 
 def build_messages(example, placeholder: str, goal_column: str, images_column: str,
                    modality_marker=None, goal_marker=None, goal_placement="segment",
-                   segment_column="segment_indices", task_column="task"):
+                   segment_column="segment_indices", task_column="task",
+                   system_prompt=None):
     """Write the conversation for one episode.
 
     The per-turn user block comes from `vector_rollout.user_block_content`, not from a copy
@@ -99,7 +100,7 @@ def build_messages(example, placeholder: str, goal_column: str, images_column: s
     """
     goal = example.get(goal_column) or "the goal object"
     task = example.get(task_column) or "objectnav"
-    prompt = SYSTEM_PROMPTS.get(task, SYSTEM_PROMPT)
+    prompt = system_prompt or SYSTEM_PROMPTS.get(task, SYSTEM_PROMPT)
     # `goal_placement` rides on the config so `render_user_block` derives `inline_goal`
     # from the same field the rollout does; `inline` below stays explicit because
     # `user_block_content` is the shared primitive and takes it directly.
@@ -143,6 +144,9 @@ def main():
                    help="constant assistant text; the real action comes from the head. "
                         "Keep the middle a single token that does not merge into '**' "
                         "(see docs/placeholder_tokens.md)")
+    p.add_argument("--system-prompt", default=None,
+                   help="Optional prompt template containing {goal}; use this to keep a "
+                        "domain-adaptation corpus byte-identical to its rollout config.")
     p.add_argument("--image-root", default=None,
                    help="prepend to relative image paths (the builder may emit relative ones)")
     p.add_argument("--val-fraction", type=float, default=0.1, help = "only used if --val-split is not set")
@@ -347,6 +351,7 @@ def main():
             "goal_placement": args.goal_placement,
             "segment_column": args.segment_column,
             "task_column": args.task_column,
+            "system_prompt": args.system_prompt,
         },
         num_proc=args.num_proc,
         desc="messages",
