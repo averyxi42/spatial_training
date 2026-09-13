@@ -231,7 +231,9 @@ completed their cycle-0 evals but before any optimizer update.  All four drivers
 then stopped, the import was repaired and covered by a training-driver import gate plus
 17 related tests (2 skipped).  The resulting r1 output and W&B runs are retained as
 invalid audit artifacts, including C's 0.031/0.025 and D's 0.094/0.058 cycle-0 SR/OSPL;
-they are not study results.
+they are not study results.  Their eight cloud W&B entries (r1/r2 only) were deleted after
+the local logs had captured the failure evidence, so the project now retains only meaningful
+historical runs and the active r3 runs.
 
 The r2 reset gate itself passed, but C/D then exposed a second bootstrap-only issue: an
 action-head STOP configuration has no binary state probe, while the generic training
