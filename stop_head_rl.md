@@ -9,10 +9,12 @@ The old Ray heads on ports 26380 and 26381 are deliberately left untouched.  The
 uses one dedicated Ray head on 26410 with custom per-experiment resources, so the four two-GPU
 jobs remain isolated without attempting four incompatible heads on one host.
 
-The common initialization is `hm3d_stop_rl_exploration_v12_shadow_r6/checkpoints/checkpoint_339`.
-The fixed evaluation peak was cycle 336; `checkpoint_339` is the closest retained
-numbered/rolling weight, three training cycles later.  Optimizer and scheduler state
-are reset.  This small but real gap is recorded rather than treated as byte-identical.
+Every formal experiment starts from the same v12 SFT `checkpoint-12000`: the base
+experiment merges its SFT adapter and initializes the policy head from that checkpoint.
+`training.checkpoint` is null, and optimizer, scheduler, driver state, and all RL adapter
+weights are fresh.  Historical RL checkpoint c339 is retained only as an A/B diagnostic
+reference; it is not an initialization, calibration source, or early-stop authority for
+the formal experiments.
 
 ## Evidence before changing the objective
 
@@ -73,16 +75,18 @@ cycles plus rolling latest.
 | experiment | GPUs | execution | state probe | post-goal action training | purpose |
 | --- | --- | --- | --- | --- | --- |
 | A | 0,1 | oracle-success + shadow | BCE + first-pass + shadow RL | 4 steps, stillness reward | historical control with a direct stationary-chunk reward |
-| B | 2,3 | binary head hard-stop at calibrated 0.47 | BCE + first-pass; no shadow RL | masked | test true deployment semantics for the existing head |
+| B | 2,3 | binary head hard-stop at benchmark threshold 0.95 | BCE + first-pass; no shadow RL | masked | test true deployment semantics for the existing head |
 | C | 4,5 | decoded path <= 0.10 m | disabled | 4 steps, same stillness reward | action-head STOP with practical 10 cm threshold |
 | D | 6,7 | decoded path <= 0.01 m | disabled | 4 steps, same stillness reward | stricter action-head STOP control |
 
-## Four no-update diagnostics before the study
+## Four no-update diagnostics before the formal SFT study
 
-No 360-cycle experiment starts until these four readings have completed on the frozen c339
-checkpoint.  They use one eight-GPU Ray head with four isolated two-GPU custom-resource
-pairs and write under `diagnostics/`.  They are deliberately short: their job is to reject
-a bad intervention, not to substitute for the actual RL experiments.
+The original four readings completed on frozen c339 using one eight-GPU Ray head with four
+isolated two-GPU custom-resource pairs and write under `diagnostics/`.  They remain useful
+only as A/B implementation and loss-mechanics analysis.  Since C/D were never trained with
+their proposed action-stop semantics in SFT, their c339 outputs cannot reject C/D or choose
+their formal training initialization.  The formal runs below all begin at SFT; the short
+SFT trace verifies the score path but does not select a deployment rule.
 
 1. **Gradient interference.** Four real exploration rollouts are packed as their complete
    history and forwarded without an optimizer step.  BCE, first-pass, and shadow-RL are
@@ -112,13 +116,14 @@ checkpoint, train/eval trend, stop precision/recall, path-stop rate, gradient di
 reference-density drift, and disk headroom.  The automatic drift guard aborts when
 `ref_log_ratio_p95 > 8`.
 
-Manual early-stop/revise triggers after two fixed evals beyond cycle 16:
+For all four formal SFT-started experiments, the first 80 cycles are a cold-start
+adaptation period.  Through the full planned 360 cycles, poor SR/OSPL, low or high
+trajectory-stop rate, and low stop precision are measurements to diagnose—not grounds to
+end C/D early.  Only a correctness or safety failure can stop a formal run:
 
-1. SR < 0.25 and OSPL < 0.15 in both evaluations;
-2. B/C/D policy-stop rate >= 0.25 with precision < 0.50 in both evaluations;
-3. C or D has <= 0.5% trajectory stops through cycle 32 (the threshold is not testing
-   the claimed mechanism), or > 40% stops with poor precision;
-4. non-finite losses, failed fixed-eval UID coverage, repeated actor failures, or disk
+1. non-finite losses or reference-density guard failure;
+2. failed fixed-eval UID coverage or repeated actor failures;
+3. disk
    headroom below 100 GB.
 
 No conclusion will use a W&B run heartbeat, MP4 count, or a connected Ray head as proof
@@ -206,15 +211,15 @@ same rollout threshold for physical STOP.  The first physical pass and a repeat 
 settings at 0.47 have identical per-UID terminal steps/results; the repeat verifies the
 live result and the repair prevents future metric-only disagreement.
 
-#### Decision for the four learning runs
+#### Historical design reading
 
-The diagnostics support the requested matrix without a long preliminary ablation: keep A
-as the shadow/stillness control; use B as the direct test of real absorbing binary STOP;
-and keep C/D as action-head STOP alternatives.  Do not interpret the head's good
-full-history AUROC as deployment success: four of 16 held-out episodes still stop early,
-and live episode outcomes—not frame AP—are the authority.  Each experiment will retain both its
-metric-best checkpoints and rolling `latest`, with calibration thresholds recorded beside
-future selected checkpoints rather than assumed universally equal to 0.95.
+The c339 readings support retaining A as the shadow/stillness control and B as the direct
+test of real absorbing binary STOP.  They do not establish a formal C/D outcome.  In
+particular, C/D's untrained action-path behavior is an expected cold-start distribution
+mismatch, not evidence that RL cannot teach the requested termination signal.  Live episode
+outcomes—not frame AP—remain the authority.  Each formal SFT run retains both metric-best
+checkpoints and rolling `latest`; B's threshold is saved with the SFT calibration artifact
+rather than assumed to be 0.47 or 0.95.
 
 #### Launch isolation correction
 
@@ -241,13 +246,14 @@ forward still passed it binary STOP targets.  The worker raised before each upda
 r2 has no valid learned checkpoint and is also retained only as an audit artifact.  The
 worker now drops probe-only training inputs when no probe is configured; the regression
 test exercises that exact path, and the relevant unit suite passes 28 tests (2 skipped).
-All four formal learning runs therefore use fresh `r3` names and directories.
+Those c339 runs used fresh `r3` names and directories, but are now classified as
+preliminary diagnostics because their initialization violates the formal SFT-only rule.
 
-### r3 initial execution gate
+### Superseded c339 execution gate (diagnostic only)
 
-All four r3 drivers started from fresh state, completed the same cycle-0 fixed `eval32`,
-saved a metric-best checkpoint and a rolling latest checkpoint, and created separate W&B
-runs.  These are execution baselines from identical c339 weights, not learned results:
+All four r3 drivers started from fresh driver state, completed the same cycle-0 fixed
+`eval32`, saved a metric-best checkpoint and a rolling latest checkpoint, and created
+separate W&B runs.  These are c339 execution baselines, not formal learned results:
 
 | experiment | real termination rule | SR | OSPL |
 | --- | --- | ---: | ---: |
@@ -263,29 +269,27 @@ substantial mass below even 0.01 m, producing premature physical STOP.  This is 
 important negative result for the proposed direct thresholds, but it is not yet an
 early-stop decision: the predeclared gate requires two fixed evaluations beyond cycle 16.
 
-### C/D early-stop conclusion
+### Withdrawn C/D c339 early-stop interpretation
 
-The two post-cycle-16 fixed evaluations met the early-stop rule for both action-path
-variants, so C and D were deliberately stopped and their GPU pairs released.  This is not
-an infrastructure failure: each run completed forward/backward updates, fixed-eval UID
-coverage, checkpoint writes and W&B synchronization before the decision.
+The two post-cycle-16 fixed evaluations led to a deliberate C/D stop and GPU release.  This
+was not an infrastructure failure: each run completed forward/backward updates, fixed-eval
+UID coverage, checkpoint writes and W&B synchronization.  The decision is withdrawn as an
+experimental conclusion, however, because it evaluated a c339 policy that had never had
+C/D's action-stop semantics during SFT.  It is retained only as a cold-start observation.
 
 | experiment | eval 24: SR / OSPL | eval 32: SR / OSPL | eval-32 stop rate | eval-32 stop precision |
 | --- | ---: | ---: | ---: | ---: |
 | C, path <= 0.10 m | 0.0625 / 0.0400 | 0.0312 / 0.0250 | 0.9688 | 0.0000 |
 | D, path <= 0.01 m | 0.0625 / 0.0400 | 0.0938 / 0.0623 | 0.9062 | 0.0345 |
 
-The two absolute thresholds therefore fail for the same structural reason: a single
-decoded action can be nearly stationary far from the object, and the absorbing endpoint
-turns that transient into an irreversible false stop.  The post-goal stillness reward
-cannot repair it while most rollouts end in one or two decisions.  C's per-metric best
-snapshots remain at its fixed-eval checkpoints and its rolling latest is
-`.latest_cycle_38`; D's current numbered latest is `checkpoint_39`, with the final
-emergency snapshot `checkpoint_40_crash`.  Both W&B runs are kept, tagged
-`early-stopped`, `negative-result`, and `action-path-stop`, with the reason attached;
-they are retained as meaningful negative evidence rather than deleted as failed garbage.
+At c339, both absolute thresholds frequently caused a near-stationary decoded action far
+from the object to become an irreversible physical STOP.  That observation motivates
+careful monitoring but does not show that the post-goal stillness reward and PPO cannot
+change the action distribution when training begins from SFT.  C's and D's checkpoint
+artifacts remain reproducible diagnostic records.  Their W&B records are retained as
+meaningful preliminary runs, relabeled to remove the invalid `negative-result` conclusion.
 
-### A/B first learned fixed evaluation
+### Superseded c339 A/B learning trace
 
 The remaining two runs passed cycle 8 with nonzero exploration reward, valid PPO updates,
 fixed-eval coverage and both checkpoint classes.  One learned evaluation is only a health
@@ -315,20 +319,53 @@ cycle-32 confirmation returns to 0.5938/0.3676 with precision/recall 0.7059/0.31
 This is not a sustained collapse: retain B's cycle-16 best OSPL/SPL snapshot and continue
 training, rather than restarting from a one-eval dip or changing its calibrated threshold.
 
-### Action-path semantic diagnostic after C/D
+### Historical c339 action-path trace
 
 The released C/D GPU pairs ran two no-update, no-W&B full-history shadow traces from c339:
 calibration16 selects a rule and test16 is used once for validation.  Every action recorded
 its decoded path length and online stop target, so this measures the user-proposed signal
 without the confound that an early physical STOP removes its later history.
 
-Small action-path length is not a STOP signal: its AUROC for stop opportunities is 0.4935
-on calibration16 and 0.4588 on test16.  The median first-action path is only 0.00320 m on
-calibration16 and 0.00278 m on test16, which explains why both 0.10 m and 0.01 m actuate
-near the start of an episode.  A calibration-only grid over 9 thresholds, 4 consecutive
-action counts and 4 minimum-history values (144 rules) chose the degenerate 0.0005 m rule
-that never stops (TP-FP = 0); no candidate had positive TP-FP utility, and its one-time
-test16 result also has zero recall.  Do not relaunch C/D as another absolute threshold or
-a simple consecutive-small-action rule.  A viable action-only method would need a learned
-history-conditioned stopping utility, which is functionally a replacement STOP model;
-the current actionable learning comparison remains A versus B.
+At c339, small action-path length alone has AUROC 0.4935 on calibration16 and 0.4588 on
+test16.  Its median first-action path is 0.00320 m on calibration16 and 0.00278 m on
+test16, which explains the immediate STOP behavior in those preliminary rollouts.  The
+calibration-only grid chose a 0.0005 m never-stop rule.  This establishes that c339 cannot
+be deployed with a fixed action-path threshold; it does not reject a C/D RL run started
+from SFT with direct terminal and post-goal rewards.
+
+## Formal SFT-started training reset
+
+The current formal matrix uses new `*_sft_r1` directories and W&B runs.  Every experiment
+loads only SFT adapter, policy-head, and state-probe files from
+`production/training/checkpoint-12000`; no c339 model, optimizer, scheduler, trajectory
+buffer, calibration score, or checkpoint is loaded.  A/B/C/D use the same exploration
+reward, train/eval split, fixed eval32, cycle budget, and checkpoint policy.
+
+Before B starts, `calibration16` is traced under that same SFT initialization in shadow
+mode without an update.  It verifies finite full-history STOP scores only; it does not
+select B's decision rule.  B uses the exact deterministic `p_stop >= 0.95` condition used
+by the HM3D-PE and Legacy benchmark manifests in training rollout, fixed eval, and later
+benchmark inference.  C and D intentionally retain their requested 0.10 m and 0.01 m
+physical rules, respectively; they are not pre-filtered against the c339 trace.
+
+The SFT calibration first exposed a factory gap: inference-only merge initialization did
+not attach the configured SFT state probe when `training.checkpoint` was null, so its
+trace carried NaN STOP scores.  The worker factory now attaches that probe in this exact
+case; the focused state-probe/trajectory suite passes 25 tests.  The clean rerun
+`sft_calibration_shadow_r2` has 1,767 finite decisions across 16 fixed episodes (AP
+0.5003, AUROC 0.8331, Brier 0.01466, ECE(10) 0.00839).  Its offline utility optimum of
+0.22 is explicitly diagnostic-only and is not used by a formal run.  The disjoint SFT
+`test16` physical trace at 0.95 completes with all 1,395 STOP probabilities finite, SR
+0.6250, OSPL 0.3950, 2 true and 1 false threshold crossings.  It validates the actual
+training/benchmark execution rule without changing that rule.
+
+The current external benchmark server supports this binary rule directly.  It does not
+yet expose the C/D decoded-action-path termination modes, so C/D cannot truthfully claim
+training-to-benchmark execution equivalence until that server interface supports those
+same two rules.  No fallback to binary STOP is permitted for C/D.
+
+C/D receive no performance-based early termination.  Their early stop rate, first-stop
+precision, SR, SPL, OSR, and OSPL are logged from cycle 0 onward, but a low initial score
+is an expected part of testing whether RL can teach the new action-stop behavior.  A
+formal run is interrupted only for numerical invalidity, failed fixed-eval coverage,
+repeated actor failure, the reference-density fuse, or insufficient disk headroom.

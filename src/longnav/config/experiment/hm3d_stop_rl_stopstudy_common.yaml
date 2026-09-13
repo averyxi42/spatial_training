@@ -1,6 +1,6 @@
 # @package _global_
-# All stop-study experiments start from the closest available checkpoint to the fixed-eval
-# exploration peak (cycle 336; checkpoint_339 is three later training cycles).
+# All formal stop-study experiments initialize solely from the shared v12 SFT checkpoint
+# inherited through hm3d_stop_rl_exploration.  Prior RL checkpoints are diagnostics only.
 defaults:
   - hm3d_stop_rl_exploration
 
@@ -10,7 +10,7 @@ sim:
   policy_stop_false_penalty: 1.0
 
 training:
-  checkpoint: /home/ubuntu/storage-migrations/20260906-longnav/v12-regeneration/production/rl_stop_experiments/hm3d_stop_rl_exploration_v12_shadow_r6/checkpoints/checkpoint_339
+  checkpoint: null
   load_optim: false
   load_sched: false
   resume_driver_state: false

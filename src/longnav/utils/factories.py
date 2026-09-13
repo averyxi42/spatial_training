@@ -442,6 +442,13 @@ class ExpBootstrapper:
                     ray.get(worker.setup_state_probe_for_eval.remote(
                         self.typed_cfg.training))
                     ray.get(worker.load_checkpoint.remote(self.typed_cfg.training.checkpoint,False,False))
+            elif getattr(self.typed_cfg.training.rl_config, "state_probe", None):
+                # A merge-only SFT evaluation has no RL checkpoint to trigger this
+                # setup, but its configured probe is still part of deployed inference.
+                print("attaching SFT state probe for eval")
+                for worker in workers:
+                    ray.get(worker.setup_state_probe_for_eval.remote(
+                        self.typed_cfg.training))
         return workers
     
     def bootstrap_sims(self,logger=None, scheduling_strategies=None):

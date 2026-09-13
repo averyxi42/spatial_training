@@ -19,4 +19,4 @@ training:
     state_probe_trainable: false
 
 task:
-  run_name: hm3d_stopstudy_d_path_001_r3
+  run_name: hm3d_stopstudy_d_path_001_sft_r1

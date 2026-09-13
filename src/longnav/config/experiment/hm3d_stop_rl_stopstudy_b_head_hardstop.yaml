@@ -1,21 +1,22 @@
 # @package _global_
-# B: the binary stop head uses the c339 calibration-only threshold to terminate the real
-# episode.  Shadow REINFORCE is disabled because no shadow action exists in this experiment.
+# B: use the exact 0.95 deterministic STOP rule of the HM3D-PE/Legacy benchmark during
+# training, fixed evaluation, and deployment.  Shadow REINFORCE is disabled because no
+# shadow action exists in this experiment.
 defaults:
   - hm3d_stop_rl_stopstudy_common
 
 rollout:
   stop_execution_mode: physical
-  stop_prob_threshold: 0.47
+  stop_prob_threshold: 0.95
   learn_post_goal_actions: false
 
 training:
   rl_config:
     state_probe: auto
     state_probe_trainable: true
-    state_probe_stop_threshold: 0.47
+    state_probe_stop_threshold: 0.95
     state_probe_shadow_rl_weight: 0.0
     state_probe_gradient_diagnostic_interval: 16
 
 task:
-  run_name: hm3d_stopstudy_b_head_hardstop_r3
+  run_name: hm3d_stopstudy_b_head_hardstop_sft_r1
