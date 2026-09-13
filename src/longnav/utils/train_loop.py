@@ -396,7 +396,8 @@ def run_eval_cycle(sims, trainers, eval_parts, total, wandb_actor, global_cycle,
                    sim_rebuilder=None, episode_soft_timeout_seconds: float = 600.0,
                    episode_hard_timeout_seconds: float = 900.0,
                    sim_restart_limit: int = 1, sim_rebuild_validator=None,
-                   stop_success_radius: float = 1.0, save_stop_traces: bool = False):
+                   stop_success_radius: float = 1.0, save_stop_traces: bool = False,
+                   record_media: bool = True):
     """One interleaved eval pass: fixed slices to exhaustion, pure-ODE sampler, no
     training-buffer contamination, one scalar wandb row, per-episode jsonl for pairing.
 
@@ -404,7 +405,7 @@ def run_eval_cycle(sims, trainers, eval_parts, total, wandb_actor, global_cycle,
     fix for the eval-vs-training OOM class (2026-08-14, v3 crash)."""
     if wandb_actor is not None:
         ray.get(wandb_actor.set_context.remote(global_cycle, "eval"))
-    ray.get([sim.set_media_enabled.remote(True) for sim in sims])
+    ray.get([sim.set_media_enabled.remote(record_media) for sim in sims])
     if ode:
         ray.get([t.set_ode_sampling.remote(True) for t in trainers])
     try:

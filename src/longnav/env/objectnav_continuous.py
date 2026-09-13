@@ -717,6 +717,8 @@ class ContinuousObjectNavEnvActor:
             "scene_id": getattr(self._episode, "scene_id", None) or self._scene_id,
             "distance_to_goal": self._finite(geodesic),
             "success": reached,
+            "just_reached": False,
+            "post_goal_active": False,
             "escaped": False,
             "steps": self._steps,
             "collided": False,
@@ -965,6 +967,7 @@ class ContinuousObjectNavEnvActor:
         return SimpleNamespace(
             scene_root=self.scene_root, width=self.width, height=self.height,
             navmesh=self.navmesh_choice,
+            record_video=False, video_bev=False,
             depth_sensor_uuid=(self._exploration_depth_sensor_uuid
                                if self._exploration.cfg.enabled else None),
         )

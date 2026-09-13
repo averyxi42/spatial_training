@@ -67,6 +67,7 @@ def _trace_eval(cfg):
             sim_restart_limit=ctx.sim_restart_limit,
             stop_success_radius=float(typed.sim.success_distance),
             save_stop_traces=True,
+            record_media=False,
         )
         _write_json(os.path.join(run_dir, "stop_trace_summary.json"), row)
         print(json.dumps(row, indent=2, sort_keys=True), flush=True)
@@ -115,12 +116,16 @@ def _gradient_batch(cfg):
         futures = []
         for trainer, index in zip(ctx.trainers, selected):
             tensors, metadata = model_inputs[index]
+            valid = trajectories["response_mask"][index].bool()
             futures.append(trainer.diagnose_stop_loss_gradients.remote(
                 tensors,
                 metadata,
-                trajectories["stop_target"][index:index + 1].cpu().numpy(),
-                trajectories["shadow_stop_action"][index:index + 1].cpu().numpy(),
-                trajectories["shadow_stop_reward"][index:index + 1].cpu().numpy(),
+                # `model_inputs[index]` contains only real action turns.  The
+                # collated rollout columns remain right-padded until this same
+                # response-mask selection in `run_training_epochs`.
+                trajectories["stop_target"][index:index + 1, valid].cpu().numpy(),
+                trajectories["shadow_stop_action"][index:index + 1, valid].cpu().numpy(),
+                trajectories["shadow_stop_reward"][index:index + 1, valid].cpu().numpy(),
             ))
         readings = ray.get(futures)
         payload = {

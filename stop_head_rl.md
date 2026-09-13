@@ -5,7 +5,9 @@
 This study uses the fixed HM3D `eval32.txt` split and the existing exploration
 reward.  It runs four independent two-GPU jobs, not one eight-GPU job with four
 interacting policies.  All arms write to `rl_stop_experiments/stop_head_rl_20260913`.
-The old Ray heads on ports 26380 and 26381 are deliberately left untouched.
+The old Ray heads on ports 26380 and 26381 are deliberately left untouched.  The study
+uses one dedicated Ray head on 26410 with custom per-arm resources, so the four two-GPU
+jobs remain isolated without attempting four incompatible heads on one host.
 
 The common initialization is `hm3d_stop_rl_exploration_v12_shadow_r6/checkpoints/checkpoint_339`.
 The fixed evaluation peak was cycle 336; `checkpoint_339` is the closest retained
@@ -71,16 +73,16 @@ cycles plus rolling latest.
 | arm | GPUs | execution | state probe | post-goal action training | purpose |
 | --- | --- | --- | --- | --- | --- |
 | A | 0,1 | oracle-success + shadow | BCE + first-pass + shadow RL | 4 steps, stillness reward | historical control with a direct stationary-chunk reward |
-| B | 2,3 | binary head hard-stop at 0.95 | BCE + first-pass; no shadow RL | masked | test true deployment semantics for the existing head |
+| B | 2,3 | binary head hard-stop at calibrated 0.47 | BCE + first-pass; no shadow RL | masked | test true deployment semantics for the existing head |
 | C | 4,5 | decoded path <= 0.10 m | disabled | 4 steps, same stillness reward | action-head STOP with practical 10 cm threshold |
 | D | 6,7 | decoded path <= 0.01 m | disabled | 4 steps, same stillness reward | stricter action-head STOP control |
 
 ## Four no-update diagnostics before the study
 
 No 360-cycle arm starts until these four readings have completed on the frozen c339
-checkpoint.  They use four isolated two-GPU Ray heads (eight GPUs total) and write under
-`diagnostics/`.  They are deliberately short: their job is to reject a bad intervention,
-not to substitute for the actual RL experiments.
+checkpoint.  They use one eight-GPU Ray head with four isolated two-GPU custom-resource
+pairs and write under `diagnostics/`.  They are deliberately short: their job is to reject
+a bad intervention, not to substitute for the actual RL experiments.
 
 1. **Gradient interference.** Four real exploration rollouts are packed as their complete
    history and forwarded without an optimizer step.  BCE, first-pass, and shadow-RL are
@@ -124,13 +126,92 @@ of progress.
 
 ## Live log
 
-### 2026-09-13 — setup
+### 2026-09-13 — setup and completed frozen-checkpoint diagnostics
 
 - Fixed-eval history and source checkpoint audited as above.
 - GPU 0–7 were idle at preflight; 433 GB remains on `/mnt/nvme_scratch` and 666 GB on
   `/home/ubuntu/Projects`.
-- Existing Ray heads on 26380/26381 are idle but retained; study heads use 26410–26413.
-- Source/config gate for the initial A–D implementation: 26 passed, 2 skipped.
-- The actual diagnostic implementation now adds full-history trace export and a seeded
-  sampled-hazard actuator; its targeted gate is pending before Ray launch.
-- Diagnostics are pending; no A–D 360-cycle training process has started.
+- Existing Ray heads on 26380/26381 are idle but retained.  The new 26410 head exposes
+  four named VLM/simulator resource pairs, one pair per arm.
+- Targeted source/config gate: 27 passed, 2 skipped.  No A–D 360-cycle training process
+  has started.
+- The diagnostic trace path now disables MP4 capture explicitly.  It also repaired two
+  runtime contracts found before any conclusion: reset may legitimately have no finite
+  goal distance, and a `policy_stop` terminal observation must provide the normal
+  `just_reached`/post-goal fields expected by trajectory packing.
+- The initial gradient replay exposed a separate diagnostic-only sequence error: its
+  targets were still collator-padded to 150 decisions while the packed VLM history had
+  38 real decisions.  The replay now applies the exact `response_mask` selection used by
+  `run_training_epochs`; a subsequent parameter-group aggregation bug was also repaired.
+  The final reading below is from the repaired, no-update full-history replay.
+
+#### 1. Component-gradient interference — completed
+
+Four real exploration rollouts were collected; two reached the success region and were
+replayed as complete 22- and 115-decision histories.  The following norms are already
+loss-weighted and therefore comparable within each row:
+
+| parameter group | history | BCE norm | first-pass norm | shadow norm | notable cosine |
+| --- | ---: | ---: | ---: | ---: | --- |
+| STOP head | 22 | 4.0740 | 0.000207 | 0.2084 | BCE/shadow +0.787; FP/shadow -0.393 |
+| STOP head | 115 | 0.1521 | 0.001960 | 0.4128 | BCE/shadow +0.107; FP/shadow -0.876 |
+| LoRA | 22 | 1.5909 | 0.000040 | 0.1090 | BCE/shadow +0.728; FP/shadow -0.558 |
+| LoRA | 115 | 0.1007 | 0.000333 | 0.1715 | BCE/shadow +0.555; FP/shadow -0.510 |
+
+At the common hidden readout the first-pass norm is only `6.2e-7` and `3.7e-6`, versus
+`2.54e-2` and `1.29e-3` for BCE.  Thus first-pass and shadow often point in opposite
+directions, but first-pass is four or more orders smaller and is not the material source
+of interference at c339.  Shadow is substantial (and exceeds BCE on the 115-step STOP
+head/LoRA replay), but its BCE cosine is positive on both readings; this is evidence of
+large extra optimization pressure, not proof of destructive BCE conflict.  The 6.65M
+other trainable probe parameters have zero gradient because this STOP-only objective does
+not touch them.
+
+The objective-surface ablation gives the same decision cheaply: combined STOP-head norms
+for `BCE+FP+shadow` are 4.240 and 0.454, versus 4.074 and 0.153 for `BCE+FP`; LoRA is
+1.672 and 0.242 versus 1.591 and 0.101.  `BCE+FP` is numerically indistinguishable from
+`BCE` here.  Setting the probe gradient gate to zero would make the LoRA contribution
+exactly zero by construction, not demonstrate a learned-performance gain.  Therefore the
+main study retains first-pass and uses A versus B to test shadow/absorbing-stop semantics
+instead of deleting first-pass speculatively.
+
+#### 2. Full-history calibration — completed
+
+The precommitted calibration16 split has 1,333 decision points and 54 in-radius positives.
+Full-KV-history STOP scoring gives AP 0.6264, AUROC 0.8438, Brier 0.02360 and ECE(10)
+0.02326.  Maximizing episode utility (TP minus FP) selects **0.47**, with 7 correct first
+stops, 1 premature stop, 3 reach-without-stop cases and 5 navigation failures.  This
+threshold was selected before opening test16.
+
+#### 3. Termination-semantics test — completed
+
+All rows use c339, exactly the fixed test16 UIDs and UID-seeded ODE sampling.
+
+| execution | SR | OSPL | mean steps | actual terminal distribution |
+| --- | ---: | ---: | ---: | --- |
+| shadow | 0.6250 | 0.4231 | 62.6 | 10 reached, 4 max-step, 2 escaped |
+| sampled live hazard | 0.5000 | 0.2923 | 40.3 | 10 policy-stop (5 successful), 3 reached, 2 escaped, 1 max-step |
+| deterministic physical, calibrated 0.47 | 0.5000 | 0.3537 | 48.4 | 9 policy-stop (5 successful), 3 reached, 2 escaped, 2 max-step |
+
+On test16 the calibrated threshold's first-stop categories are 5 correct, 4 premature,
+3 reach-without-stop and 4 navigation failures.  Its held-out per-decision AP is 0.3592
+and AUROC 0.8998, but the true absorbing execution remains 12.5 SR points and 6.9 OSPL
+points below shadow.  This separates two effects: calibration improves the sampled
+execution's OSPL, but it does not eliminate the shadow-to-live exposure gap.
+
+An implementation audit found that physical STOP already obeyed
+`rollout.stop_prob_threshold`; an independent checkpoint-side threshold had only been
+used when reporting the counterfactual confusion matrix.  The report path now uses the
+same rollout threshold for physical STOP.  The first physical pass and a repeat with both
+settings at 0.47 have identical per-UID terminal steps/results; the repeat verifies the
+live result and the repair prevents future metric-only disagreement.
+
+#### Decision for the four learning runs
+
+The diagnostics support the requested matrix without a long preliminary ablation: keep A
+as the shadow/stillness control; use B as the direct test of real absorbing binary STOP;
+and keep C/D as action-head STOP alternatives.  Do not interpret the head's good
+full-history AUROC as deployment success: four of 16 held-out episodes still stop early,
+and live episode outcomes—not frame AP—are the authority.  Each arm will retain both its
+metric-best checkpoints and rolling `latest`, with calibration thresholds recorded beside
+future selected checkpoints rather than assumed universally equal to 0.95.

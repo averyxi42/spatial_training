@@ -524,8 +524,10 @@ class EpisodeRolloutMixin:
                 )
                 decision_logs["action_path_length_m"] = action_path_length_m
                 decision_logs["policy_stop_mode"] = policy_stop_mode
-                decision_logs["decision_distance_to_goal_m"] = float(
-                    state_dict.get("info", {}).get("distance_to_goal", np.nan)
+                decision_distance = state_dict.get("info", {}).get("distance_to_goal")
+                decision_logs["decision_distance_to_goal_m"] = (
+                    float(decision_distance)
+                    if decision_distance is not None else float("nan")
                 )
                 decision_logs["history_turns"] = step_count + 1
                 decision_logs["mean/probe_p_stop"] = (
@@ -623,9 +625,15 @@ class EpisodeRolloutMixin:
                 target = np.asarray(final_trajectory.get("stop_target", []), dtype=np.float64)
                 valid = np.isfinite(probability) & np.isfinite(target)
                 if bool(valid.any()):
-                    threshold = self.state_probe_stop_threshold
-                    if threshold is None:
+                    # A physical STOP is actuated by rollout.stop_prob_threshold.
+                    # Report its counterfactual with that same value rather than a
+                    # checkpoint-side calibration default.
+                    if self.rollout_config.get("stop_execution_mode") == "physical":
                         threshold = self.rollout_config.get("stop_prob_threshold")
+                    else:
+                        threshold = self.state_probe_stop_threshold
+                        if threshold is None:
+                            threshold = self.rollout_config.get("stop_prob_threshold")
                     if threshold is not None:
                         predicted = probability[valid] >= float(threshold)
                         positive = target[valid] > 0.5

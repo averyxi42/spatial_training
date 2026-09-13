@@ -1469,7 +1469,8 @@ class VLMTrainingMixin:
                  ("firstpass", "shadow"))
         for group_name, parameters in groups.items():
             group_result = {"n_parameters": int(sum(parameter.numel() for parameter in parameters))}
-            for name, group_gradients in gradients.items():
+            for name, component_gradients in gradients.items():
+                group_gradients = component_gradients[group_name]
                 squared_norm = torch.zeros((), device=self.device)
                 squared_norm = squared_norm + sum(
                     gradient.detach().float().square().sum()

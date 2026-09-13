@@ -2,6 +2,8 @@
 resources:
   ray_address: "127.0.0.1:26410"
   object_spilling_directory: "/mnt/nvme_scratch/longnav_rl_runtime/ray_stopstudy_a/spill"
+  vlm_resource_tag: "stopstudy_a_vlm"
+  sim_resource_tag: "stopstudy_a_sim"
   osm_gb: 48
   master_addr: "127.0.0.1"
   master_port: 29610
