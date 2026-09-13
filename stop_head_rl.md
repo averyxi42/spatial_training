@@ -242,3 +242,23 @@ r2 has no valid learned checkpoint and is also retained only as an audit artifac
 worker now drops probe-only training inputs when no probe is configured; the regression
 test exercises that exact path, and the relevant unit suite passes 28 tests (2 skipped).
 All four formal learning runs therefore use fresh `r3` names and directories.
+
+### r3 initial execution gate
+
+All four r3 drivers started from fresh state, completed the same cycle-0 fixed `eval32`,
+saved a metric-best checkpoint and a rolling latest checkpoint, and created separate W&B
+runs.  These are execution baselines from identical c339 weights, not learned results:
+
+| experiment | real termination rule | SR | OSPL |
+| --- | --- | ---: | ---: |
+| A | shadow / oracle success | 0.6875 | 0.3865 |
+| B | binary head, physical threshold 0.47 | 0.5938 | 0.3508 |
+| C | decoded action path <= 0.10 m | 0.0312 | 0.0250 |
+| D | decoded action path <= 0.01 m | 0.0938 | 0.0583 |
+
+C/D have also completed valid rollout, backward and rolling-latest saves through cycle 7;
+their prior probe-free crash does not recur.  At cycle 8, C reached SR/OSPL 0.0625/0.0405
+and D reached 0.0938/0.0598.  Thus the current action-path distribution already places
+substantial mass below even 0.01 m, producing premature physical STOP.  This is an
+important negative result for the proposed direct thresholds, but it is not yet an
+early-stop decision: the predeclared gate requires two fixed evaluations beyond cycle 16.
