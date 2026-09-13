@@ -396,7 +396,7 @@ def run_eval_cycle(sims, trainers, eval_parts, total, wandb_actor, global_cycle,
                    sim_rebuilder=None, episode_soft_timeout_seconds: float = 600.0,
                    episode_hard_timeout_seconds: float = 900.0,
                    sim_restart_limit: int = 1, sim_rebuild_validator=None,
-                   stop_success_radius: float = 1.0):
+                   stop_success_radius: float = 1.0, save_stop_traces: bool = False):
     """One interleaved eval pass: fixed slices to exhaustion, pure-ODE sampler, no
     training-buffer contamination, one scalar wandb row, per-episode jsonl for pairing.
 
@@ -409,7 +409,7 @@ def run_eval_cycle(sims, trainers, eval_parts, total, wandb_actor, global_cycle,
         ray.get([t.set_ode_sampling.remote(True) for t in trainers])
     try:
         if vector_envs_per_sim > 1:
-            _, result_list, _ = collect_vector_rollouts(
+            rollout_list, result_list, _ = collect_vector_rollouts(
                 sims,
                 trainers,
                 iter(eval_parts),
@@ -426,7 +426,7 @@ def run_eval_cycle(sims, trainers, eval_parts, total, wandb_actor, global_cycle,
             for sim, part in zip(sims, eval_parts):
                 sim.set_log_prefix.remote("eval_env/")
                 sim.assign_shard.remote(list(part))
-            _, result_list, _ = collect_rollouts(
+            rollout_list, result_list, _ = collect_rollouts(
                 sims, trainers, iter([]), total,
                 postprocess_kwargs={"return_inputs": False, "eval": True})
     finally:
@@ -519,6 +519,36 @@ def run_eval_cycle(sims, trainers, eval_parts, total, wandb_actor, global_cycle,
                                 "policy_stop_mode": r.get("policy_stop_mode"),
                                 "mean_action_path_length_m": r.get(
                                     "mean_action_path_length_m")}) + "\n")
+    if save_stop_traces:
+        trace_path = os.path.join(out_dir, "eval_stop_traces.jsonl")
+        trace_keys = (
+            "probe_p_stop", "stop_target", "action_path_length_m",
+            "decision_distance_to_goal_m", "history_turns", "policy_stop_mode",
+        )
+        with open(trace_path, "a") as f:
+            for result, packed in zip(res, rollout_list):
+                trajectory = packed[0] if isinstance(packed, tuple) else packed
+                trajectory = trajectory or {}
+                steps = len(trajectory.get("stop_target", ()))
+                trace = []
+                for index in range(steps):
+                    point = {"step": index}
+                    for key in trace_keys:
+                        values = trajectory.get(key)
+                        value = values[index] if values is not None and index < len(values) else None
+                        if isinstance(value, np.generic):
+                            value = value.item()
+                        point[key] = value
+                    trace.append(point)
+                f.write(json.dumps({
+                    "cycle": global_cycle,
+                    "uid": result.get("episode_label"),
+                    "success": int(bool(result.get("success"))),
+                    "oracle_success": int(bool(result.get("oracle_success"))),
+                    "termination_reason": result.get("termination_reason"),
+                    "final_distance_to_goal_m": result.get("distance_to_goal"),
+                    "trace": trace,
+                }) + "\n")
     print(f"[eval cycle @ {global_cycle}] n={len(res)} success={row['eval/success_rate']:.3f} "
           f"oracle={row['eval/oracle_success_rate']:.3f} ospl={row['eval/ospl']:.3f}")
     return row

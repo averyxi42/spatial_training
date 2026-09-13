@@ -149,6 +149,26 @@ def test_trajectory_stop_uses_cumulative_xy_path_length():
     assert not stop
 
 
+def test_sampled_stop_uses_a_seeded_episode_hazard():
+    worker = StubEpisodeWorker(
+        policy_head_type="continuous",
+        continuous_action_sequence=[np.zeros(2, dtype=np.float32)],
+        rollout_config={
+            **MINIMAL_ROLLOUT_CONFIG,
+            "stop_execution_mode": "sampled",
+            "stop_sample_temperature": 1.0,
+        },
+    )
+    worker._policy_stop_rng = np.random.default_rng(0)
+    stop, mode, _ = worker._policy_stop_decision(np.zeros(2), stop_probability=0.0)
+    assert mode == "sampled"
+    assert not stop
+
+    worker._policy_stop_rng = np.random.default_rng(0)
+    stop, _, _ = worker._policy_stop_decision(np.zeros(2), stop_probability=1.0)
+    assert stop
+
+
 def test_stop_prob_threshold_guard(ray_session, monkeypatch):
     """When the raw sampled action is `stop` but its probability is below
     stop_prob_threshold, run_episode must resample away from `stop`."""

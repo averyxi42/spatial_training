@@ -1391,6 +1391,109 @@ class VLMTrainingMixin:
             forward_kwargs["value_grad_scale"] = self.rl_algo_config.value_head.value_grad_scale
         policy_stats,vpreds, = self.ddp_model(**forward_kwargs)
         return policy_stats,vpreds
+
+    def diagnose_stop_loss_gradients(
+        self,
+        embeds_inputs_np,
+        embeds_inputs_meta,
+        stop_targets,
+        shadow_stop_actions,
+        shadow_stop_rewards,
+    ):
+        """Measure component gradients on one packed, full-history rollout without updating."""
+        if not self.state_probe_trainable or self.state_probe is None:
+            raise RuntimeError("stop-gradient diagnosis requires a trainable state probe")
+        from longnav.utils.tensor_utils import TensorPacker
+
+        self._setup_training()
+        self.optimizer.zero_grad()
+        embeds_inputs = TensorPacker.unpack(embeds_inputs_np, embeds_inputs_meta)
+        policy_stats, _ = self.ddp_model(
+            embeds_inputs=embeds_inputs,
+            compute_values=False,
+            stop_targets=torch.as_tensor(stop_targets),
+            shadow_stop_actions=torch.as_tensor(shadow_stop_actions),
+            shadow_stop_rewards=torch.as_tensor(shadow_stop_rewards),
+            shadow_stop_temperature=float(
+                getattr(self.rl_algo_config, "state_probe_stop_temperature", 1.0)
+            ),
+            shadow_stop_weight=float(
+                getattr(self.rl_algo_config, "state_probe_shadow_rl_weight", 1.0)
+            ),
+            stop_firstpass_weight=getattr(
+                self.rl_algo_config, "state_probe_firstpass_weight", None
+            ),
+            probe_gradient_diagnostics=True,
+        )
+        losses = policy_stats["probe_losses"]
+        components = {
+            "bce": losses["probe/stop_bce_loss"],
+            "firstpass": losses["probe/stop_firstpass_loss"],
+            "shadow": losses["probe/shadow_stop_rl_loss"],
+        }
+        stop_ids = {id(parameter) for parameter in self.state_probe.stop_head.parameters()}
+        groups = {"stop_head": [], "lora": [], "other_trainable": []}
+        for name, parameter in self.ddp_model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if id(parameter) in stop_ids:
+                groups["stop_head"].append(parameter)
+            elif "lora_" in name:
+                groups["lora"].append(parameter)
+            else:
+                groups["other_trainable"].append(parameter)
+
+        gradients = {}
+        for component_name, component in components.items():
+            gradients[component_name] = {}
+            for group_name, parameters in groups.items():
+                if not parameters:
+                    gradients[component_name][group_name] = ()
+                    continue
+                gradients[component_name][group_name] = torch.autograd.grad(
+                    component, parameters, retain_graph=True, allow_unused=True
+                )
+
+        result = {
+            "loss": {
+                name: float(value.detach().float().cpu())
+                for name, value in components.items()
+            },
+            "groups": {},
+            "hidden": {
+                name.removeprefix("probe/grad_"): float(value.detach().float().cpu())
+                for name, value in losses.items() if name.startswith("probe/grad_")
+            },
+        }
+        pairs = (("bce", "firstpass"), ("bce", "shadow"),
+                 ("firstpass", "shadow"))
+        for group_name, parameters in groups.items():
+            group_result = {"n_parameters": int(sum(parameter.numel() for parameter in parameters))}
+            for name, group_gradients in gradients.items():
+                squared_norm = torch.zeros((), device=self.device)
+                squared_norm = squared_norm + sum(
+                    gradient.detach().float().square().sum()
+                    for gradient in group_gradients if gradient is not None
+                )
+                group_result[f"norm_{name}"] = float(squared_norm.sqrt().cpu())
+            for left, right in pairs:
+                left_gradients = gradients[left][group_name]
+                right_gradients = gradients[right][group_name]
+                dot = torch.zeros((), device=self.device)
+                dot = dot + sum(
+                    (left_gradient.detach().float() * right_gradient.detach().float()).sum()
+                    for left_gradient, right_gradient in zip(left_gradients, right_gradients)
+                    if left_gradient is not None and right_gradient is not None
+                )
+                denominator = (
+                    group_result[f"norm_{left}"] * group_result[f"norm_{right}"]
+                )
+                group_result[f"cos_{left}_{right}"] = (
+                    float(dot.cpu()) / denominator if denominator > 0.0 else None
+                )
+            result["groups"][group_name] = group_result
+        self.optimizer.zero_grad()
+        return result
     
     def rl_loss(self, log_probs, actions, advantages, response_mask, old_log_prob, returns, old_values, vpreds, rollout_log_probs=None, ref_log_probs=None, policy_stats=None, actions_continuous=None, sde_positions=None, stop_targets=None, shadow_stop_action=None, shadow_stop_reward=None):
         from verl.trainer.ppo.core_algos import compute_value_loss,compute_entropy_loss

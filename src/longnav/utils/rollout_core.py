@@ -125,7 +125,7 @@ def _align_readouts_to_executed_actions(
 
 class EpisodeRolloutMixin:
     def _seed_ode_episode(self, state_dict):
-        """Give each ODE evaluation episode a stable initial latent trajectory."""
+        """Give each ODE evaluation episode a stable latent trajectory and stop RNG."""
         from hashlib import blake2b
         from longnav.utils.flow_sde_policy import FlowSDEHead
 
@@ -133,6 +133,7 @@ class EpisodeRolloutMixin:
         if not label:
             return
         seed = int.from_bytes(blake2b(label.encode(), digest_size=8).digest(), "little")
+        self._policy_stop_rng = np.random.default_rng(seed)
         model = getattr(self, "model", None)
         if model is None:
             return
@@ -214,6 +215,20 @@ class EpisodeRolloutMixin:
                 mode,
                 path_length,
             )
+        if mode == "sampled":
+            if stop_probability is None:
+                return False, mode, path_length
+            temperature = float(self.rollout_config.get("stop_sample_temperature", 1.0))
+            if temperature <= 0.0:
+                raise ValueError("stop_sample_temperature must be positive")
+            probability = float(np.clip(stop_probability, 1e-6, 1.0 - 1e-6))
+            logit = np.log(probability / (1.0 - probability)) / temperature
+            probability = 1.0 / (1.0 + np.exp(-logit))
+            rng = getattr(self, "_policy_stop_rng", None)
+            if rng is None:
+                rng = np.random.default_rng()
+                self._policy_stop_rng = rng
+            return bool(rng.random() < probability), mode, path_length
         if mode == "trajectory_length":
             threshold = self.rollout_config.get("trajectory_stop_threshold_m")
             if threshold is None or float(threshold) < 0.0:
@@ -223,7 +238,8 @@ class EpisodeRolloutMixin:
                 )
             return path_length <= float(threshold), mode, path_length
         raise ValueError(
-            "stop_execution_mode must be one of shadow, physical, trajectory_length; "
+            "stop_execution_mode must be one of shadow, physical, sampled, "
+            "trajectory_length; "
             f"got {mode!r}"
         )
 
@@ -406,6 +422,10 @@ class EpisodeRolloutMixin:
                 decision_logs.get("action_path_length_m", np.nan)
             ),
             "policy_stop_mode": decision_logs.get("policy_stop_mode"),
+            "decision_distance_to_goal_m": float(
+                decision_logs.get("decision_distance_to_goal_m", np.nan)
+            ),
+            "history_turns": int(decision_logs.get("history_turns", 0)),
             "probe_p_stop": (
                 np.nan
                 if getattr(self, "last_stop_probability", None) is None
@@ -504,6 +524,10 @@ class EpisodeRolloutMixin:
                 )
                 decision_logs["action_path_length_m"] = action_path_length_m
                 decision_logs["policy_stop_mode"] = policy_stop_mode
+                decision_logs["decision_distance_to_goal_m"] = float(
+                    state_dict.get("info", {}).get("distance_to_goal", np.nan)
+                )
+                decision_logs["history_turns"] = step_count + 1
                 decision_logs["mean/probe_p_stop"] = (
                     np.nan if stop_probability is None else float(stop_probability))
                 # D. Store Transition

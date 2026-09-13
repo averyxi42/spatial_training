@@ -75,11 +75,35 @@ cycles plus rolling latest.
 | C | 4,5 | decoded path <= 0.10 m | disabled | 4 steps, same stillness reward | action-head STOP with practical 10 cm threshold |
 | D | 6,7 | decoded path <= 0.01 m | disabled | 4 steps, same stillness reward | stricter action-head STOP control |
 
-## Preflight and monitoring
+## Four no-update diagnostics before the study
 
-Before updates, cycle-0 fixed eval is the threshold calibration.  The saved per-episode
-rows include termination reason, stop mode, and mean decoded action-path length.  C/D's
-actual stop rate is the decisive calibration; a mean alone is not enough.
+No 360-cycle arm starts until these four readings have completed on the frozen c339
+checkpoint.  They use four isolated two-GPU Ray heads (eight GPUs total) and write under
+`diagnostics/`.  They are deliberately short: their job is to reject a bad intervention,
+not to substitute for the actual RL experiments.
+
+1. **Gradient interference.** Four real exploration rollouts are packed as their complete
+   history and forwarded without an optimizer step.  BCE, first-pass, and shadow-RL are
+   differentiated separately.  We record loss, norm and pairwise cosine for the STOP head,
+   LoRA parameters and the shared readout hidden state.  Frozen backbone parameters are
+   reported as structurally frozen rather than pretending they received a gradient.
+2. **Full-history calibration.** A shadow rollout over the fixed `calibration16` half of
+   eval32 retains every KV-history decision: probability, pre-action distance, stop label,
+   action-path length and history length.  We compute AP/AUROC/Brier/ECE plus first-stop
+   precision, recall and lag; one threshold is selected there only.
+3. **Termination semantics.** On disjoint `test16`, run the same checkpoint/UID/ODE seed
+   under shadow, deterministic-seeded sampled hazard, and the calibration-selected hard
+   threshold.  This distinguishes calibration error from the absorbing-stop exposure gap.
+4. **Minimal loss ablation reading.** On the exact full-history gradient batches, compare
+   the combined gradient implied by BCE+first-pass+shadow, BCE+first-pass, BCE only, and
+   BCE+first-pass with the backbone gradient gate set to zero.  This is an objective-surface
+   screen, not a claim of learned performance; the four 360-cycle arms are the learned
+   performance test.
+
+The calibration/test partition is fixed before looking at STOP scores; neither per-test
+result nor the main 32-episode monitoring series is used to change the threshold.
+
+## Monitoring after the four arms start
 
 Hourly checks inspect process liveness, GPU placement, fixed-eval coverage, newest
 checkpoint, train/eval trend, stop precision/recall, path-stop rate, gradient diagnostics,
@@ -106,4 +130,7 @@ of progress.
 - GPU 0–7 were idle at preflight; 433 GB remains on `/mnt/nvme_scratch` and 666 GB on
   `/home/ubuntu/Projects`.
 - Existing Ray heads on 26380/26381 are idle but retained; study heads use 26410–26413.
-- Source/config unit gate after the changes: pending final config composition and launch.
+- Source/config gate for the initial A–D implementation: 26 passed, 2 skipped.
+- The actual diagnostic implementation now adds full-history trace export and a seeded
+  sampled-hazard actuator; its targeted gate is pending before Ray launch.
+- Diagnostics are pending; no A–D 360-cycle training process has started.

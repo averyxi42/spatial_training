@@ -257,9 +257,11 @@ class RolloutConfig:
     stop_prob_threshold: Optional[float] = None
     stop_head_radius_m: float = 1.0
     # ``shadow`` never interrupts control, ``physical`` applies the binary stop head,
-    # and ``trajectory_length`` turns a near-zero decoded action chunk into STOP.
+    # ``sampled`` applies its Bernoulli hazard, and ``trajectory_length`` turns a
+    # near-zero decoded action chunk into STOP.
     stop_execution_mode: str = "physical"
     trajectory_stop_threshold_m: Optional[float] = None
+    stop_sample_temperature: float = 1.0
     stop_shadow_correct_reward: float = 1.0
     stop_shadow_false_penalty: float = 1.0
     stop_shadow_miss_penalty: float = 1.0
