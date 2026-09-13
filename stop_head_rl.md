@@ -218,8 +218,8 @@ test of real absorbing binary STOP.  They do not establish a formal C/D outcome.
 particular, C/D's untrained action-path behavior is an expected cold-start distribution
 mismatch, not evidence that RL cannot teach the requested termination signal.  Live episode
 outcomes—not frame AP—remain the authority.  Each formal SFT run retains both metric-best
-checkpoints and rolling `latest`; B's threshold is saved with the SFT calibration artifact
-rather than assumed to be 0.47 or 0.95.
+checkpoints and rolling `latest`.  The historical c339 B reading used its diagnostic 0.47
+threshold; the formal SFT-started B configuration below uses the benchmark's fixed 0.95 rule.
 
 #### Launch isolation correction
 
@@ -359,10 +359,18 @@ case; the focused state-probe/trajectory suite passes 25 tests.  The clean rerun
 0.6250, OSPL 0.3950, 2 true and 1 false threshold crossings.  It validates the actual
 training/benchmark execution rule without changing that rule.
 
-The current external benchmark server supports this binary rule directly.  It does not
-yet expose the C/D decoded-action-path termination modes, so C/D cannot truthfully claim
-training-to-benchmark execution equivalence until that server interface supports those
-same two rules.  No fallback to binary STOP is permitted for C/D.
+The external LongNav benchmark interface now exposes all three formal actuators without
+changing the simulator: B starts the server with `--continuous_stop_inference threshold`,
+`--continuous_stop_head`, and threshold `0.95`; C/D use
+`--continuous_stop_inference trajectory_length` with `--continuous_trajectory_stop_threshold_m`
+of `0.10`/`0.01`.  The latter computes the same decoded cumulative XY length as training
+(origin to first waypoint plus every consecutive segment), returns a physical policy STOP,
+and rejects any simultaneous binary-head setting.  C/D therefore cannot silently fall back
+to a binary STOP rule.
+
+The focused interface tests cover the cumulative-path formula and malformed/non-finite
+chunks.  Benchmark command construction validates that a trajectory-length setting includes
+its non-negative threshold before a server is started.
 
 C/D receive no performance-based early termination.  Their early stop rate, first-stop
 precision, SR, SPL, OSR, and OSPL are logged from cycle 0 onward, but a low initial score
