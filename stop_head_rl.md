@@ -284,3 +284,19 @@ snapshots remain at its fixed-eval checkpoints and its rolling latest is
 emergency snapshot `checkpoint_40_crash`.  Both W&B runs are kept, tagged
 `early-stopped`, `negative-result`, and `action-path-stop`, with the reason attached;
 they are retained as meaningful negative evidence rather than deleted as failed garbage.
+
+### A/B first learned fixed evaluation
+
+The remaining two runs passed cycle 8 with nonzero exploration reward, valid PPO updates,
+fixed-eval coverage and both checkpoint classes.  One learned evaluation is only a health
+gate, not evidence of a trend:
+
+| experiment | cycle 0 SR / OSPL | cycle 8 SR / OSPL | cycle-8 stop precision / recall |
+| --- | ---: | ---: | ---: |
+| A, shadow + stillness | 0.6875 / 0.3865 | 0.6562 / 0.3849 | 0.8182 / 0.0968 (shadow diagnostic) |
+| B, real binary STOP at 0.47 | 0.5938 / 0.3508 | 0.5938 / 0.3505 | 0.7143 / 0.2381 |
+
+B is not suffering C/D-style mass premature stopping: its cycle-8 false stops are 4
+decisions, while 32 positive opportunities are missed.  The immediate stop-head question
+for B is therefore recall and sequential decision timing, not a lower global threshold;
+the fixed calibration split remains the only source for any threshold change.
