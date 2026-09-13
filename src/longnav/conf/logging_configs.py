@@ -11,6 +11,7 @@ cs = ConfigStore.instance()
 class WandbLoggerConfig:
     _target_: str = "longnav.utils.logging_workers.WandbLoggerActor"
     project: str = MISSING
+    compact_metrics: bool = False
 
 
 cs.store(name="wandb", group="logger", node=WandbLoggerConfig())

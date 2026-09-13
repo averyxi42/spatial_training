@@ -1,0 +1,19 @@
+# @package _global_
+# Smallest possible exercise of the host+proxy batching machinery itself (not just the
+# single-actor step/reward logic, which navverse_smoke.yaml already covers): 1 host running
+# slots_per_host=2 vectorized robots, 2 VLM workers. Run this BEFORE navverse_batched_8x8 --
+# it is the only way to see the reset/step barrier coordination actually exercised (two
+# siblings genuinely waiting on each other) without committing all 8 GPUs to find out it
+# hangs.
+resources:
+  ray_address: local
+  osm_gb: 64
+  num_vlms: 2
+  num_sims: 2 # must equal sim.num_hosts * sim.slots_per_host
+  sim_gpu_fraction: 0.0 # proxies are near-zero resource; hosts claim GPU via sim.host_num_gpus
+  sim_cpus: 0
+  # Whole GPUs keep the two DDP ranks on distinct devices. Fractional requests let Ray
+  # pack both ranks onto one GPU, which NCCL rejects as a duplicate device.
+  vlm_gpu_fraction: 1.0
+  vlm_conda_env: null  # driver runs via `pixi run`, not a named conda env; VLM actors inherit that env directly
+  habitat_conda_env: navverse  # the real named conda env IsaacLab/NavVerse is installed in

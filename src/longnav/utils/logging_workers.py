@@ -1,13 +1,12 @@
 from typing import Any, Dict
-import ray
 import wandb
 import numpy as np
 import os
-import sys
 import subprocess
 
 class WandbLoggerActor:
-    def __init__(self, wandb_init_kwargs, run_config=None, log_raw=False, commit_interval=5):
+    def __init__(self, wandb_init_kwargs, run_config=None, log_raw=False,
+                 commit_interval=5, compact_metrics=False):
         """
         Args:
             wandb_init_kwargs: Dict for wandb.init (project, entity, name).
@@ -33,13 +32,26 @@ class WandbLoggerActor:
         
         self.log_raw = log_raw
         self.commit_interval = commit_interval
+        self.compact_metrics = compact_metrics
         
         # Table State
         self.table = None
         self.columns = None
         self.rows_since_last_commit = 0
+        self.eval_videos = []
+        self.context_cycle = None
+        self.context_phase = None
 
         self.defined_metrics = set()
+        if self.compact_metrics:
+            self.run.define_metric("cycle")
+            for namespace in ("rollout", "train", "policy", "eval", "runtime"):
+                self.run.define_metric(f"{namespace}/*", step_metric="cycle")
+
+    def set_context(self, cycle: int, phase: str):
+        """Attach a stable cycle and phase to subsequently logged episode rows."""
+        self.context_cycle = int(cycle)
+        self.context_phase = str(phase)
 
     def log_global_metrics(self, metrics: dict, step=None):
         """
@@ -71,29 +83,49 @@ class WandbLoggerActor:
                     self.defined_metrics.add(k)
         self.run.log(log_payload)
 
-    def log_row(self, row:Dict[str,Any]):
-        """
-        Processes a single episode row with namespace-based media detection.
-        """
+    def _process_episode_row(self, row: Dict[str, Any]) -> dict:
         processed_row = {}
-        # --- 1. Process & Filter ---
         for k, v in row.items():
-            # A. Raw Data Toggle
             if k.startswith('raw/') and not self.log_raw:
                 continue
-            
-            # B. Dynamic Media Namespaces
             if k.startswith('img/') and v is not None:
-                # Wraps numpy arrays or paths into WandB Images
                 processed_row[k] = wandb.Image(v)
             elif k.startswith('vid/') and v is not None:
-                # Wraps paths into WandB Videos (expects shared filesystem)
                 processed_row[k] = wandb.Video(v, format="mp4")
             else:
-                # C. Pass-through (Scalars, Strings, Lists, or None values)
                 processed_row[k] = v
-                 # --- New: Accumulate Summary Stats ---
-                # Check if the value is a scalar (int, float, or numpy number)
+        return processed_row
+
+    def log_row(self, row:Dict[str,Any]):
+        """Processes a single episode row with namespace-based media detection."""
+        if self.compact_metrics:
+            if self.context_phase == "eval":
+                video_path = row.get("vid/episode_video")
+                if video_path is not None:
+                    episode_id = str(
+                        row.get("episode_label")
+                        or row.get("eval_env/episode_label")
+                        or ""
+                    )
+                    if not episode_id:
+                        raise ValueError("eval video is missing its global episode ID")
+                    self.eval_videos.append(
+                        (
+                            episode_id,
+                            wandb.Video(
+                                video_path,
+                                caption=(
+                                    f"step={self.context_cycle} "
+                                    f"episode={episode_id}"
+                                ),
+                                format="mp4",
+                            ),
+                        )
+                    )
+            return
+
+        processed_row = self._process_episode_row(row)
+
         # --- 2. Lazy Table Init ---
         if self.table is None:
             self.columns = sorted(list(processed_row.keys()))
@@ -129,6 +161,27 @@ class WandbLoggerActor:
             self.rows_since_last_commit = 0 
         self.run.log(log_payload)
 
+    def _pop_eval_videos(self):
+        videos, self.eval_videos = self.eval_videos, []
+        return [video for _, video in sorted(videos, key=lambda item: item[0])]
+
+    def log_cycle_metrics(self, metrics: dict, cycle: int, phase: str = "train"):
+        """Write one compact history row for a completed phase."""
+        payload = {"cycle": int(cycle), **metrics}
+        self.run.log(payload)
+        self.context_cycle = int(cycle)
+        self.context_phase = str(phase)
+
+    def log_eval_metrics(self, metrics: dict, cycle: int):
+        payload = {"cycle": int(cycle), **metrics}
+        if self.compact_metrics:
+            videos = self._pop_eval_videos()
+            if videos:
+                payload["eval/video"] = videos
+        self.run.log(payload)
+        self.context_cycle = int(cycle)
+        self.context_phase = "eval"
+
     def _capture_system_metadata(self):
         """
         Internal helper to grab SLURM and Git info.
@@ -153,7 +206,7 @@ class WandbLoggerActor:
                 stderr=subprocess.DEVNULL
             ).strip().decode('utf-8')
             meta["system/git_commit"] = commit_hash
-        except:
+        except (OSError, subprocess.SubprocessError):
             pass
 
         return meta
@@ -176,7 +229,12 @@ class WandbLoggerActor:
         )  
         
     def flush(self):
-        """Forces a commit of the current table buffer to WandB."""
+        """Forces pending media or table buffers to WandB."""
+        if self.compact_metrics:
+            videos = self._pop_eval_videos()
+            if videos:
+                self.run.log({"cycle": self.context_cycle, "eval/video": videos})
+            return
         if self.rows_since_last_commit > 0 and self.table is not None:
             # Create a payload with just the table
             payload = {"episode_details": self.table}
@@ -186,6 +244,8 @@ class WandbLoggerActor:
             self.rows_since_last_commit = 0
     def close(self):
         # Flush the table one last time
-        if self.table and self.rows_since_last_commit > 0:
+        if self.compact_metrics:
+            self.flush()
+        elif self.table and self.rows_since_last_commit > 0:
             self.run.log({"episode_details": self.table})
         self.run.finish()

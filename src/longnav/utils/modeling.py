@@ -2,6 +2,7 @@ import torch
 from transformers import Cache, Qwen3VLForConditionalGeneration, Qwen3VLTextModel,Qwen3VLModel, Qwen3VLVisionModel
 from typing import Any, Callable, Optional, TypedDict, Union
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModelOutputWithPast
 import torch.nn as nn
 from transformers import AutoConfig
 def load_sparse_model(model_path, **kwargs):
@@ -193,6 +194,7 @@ class TextMixin:
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
         past_image_embeds = None,
         save_image_db = False,
+        offload_image_cache = True,
         save_embeds = False,
         seq_keep_mask = None,
         vis_keep_mask = None,
@@ -248,7 +250,10 @@ class TextMixin:
                         # Get indices of embeddings to KEEP (relative to the visual segments)
                         embeds_to_keep_rel_idx,filtered_embeds = filter_embeds(image_embeds,past_image_embeds[b] if past_image_embeds is not None else None,max_global_keep=27000,threshold=0.95) #TODO: eliminate magic numbers, previously 0.95
                         if save_image_db:
-                            self.kept_visual_embeds.append(filtered_embeds.cpu().clone())
+                            filtered_embeds = filtered_embeds.detach().clone()
+                            if offload_image_cache:
+                                filtered_embeds = filtered_embeds.cpu()
+                            self.kept_visual_embeds.append(filtered_embeds)
                         # MAP RELATIVE INDICES -> GLOBAL INDICES
                         # Get global indices where this batch has visual tokens
                         global_visual_indices = torch.nonzero(visual_pos_masks[b]).squeeze()
@@ -274,7 +279,8 @@ class TextMixin:
             # 3. Apply Mask to Inputs
             # Helper to slice only if tensor is not None
             def apply_mask(t):
-                if t is None: return None
+                if t is None:
+                    return None
                 # Handle tensors that might be (B, S, ...) or (B, 1, S, S)
                 if t.shape[1] == S:
                     return t[:, seq_keep_mask]
@@ -339,6 +345,50 @@ class Qwen3VLSparseModel(Qwen3VLModel):
         # though usually we load pretrained immediately after.
         self.post_init()
 
+    def forward_with_image_features(
+        self,
+        *,
+        input_ids,
+        image_embeds,
+        deepstack_image_embeds,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        if position_ids is None:
+            raise ValueError("Precomputed image features require explicit position_ids")
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+        image_embeds = torch.cat(image_embeds, dim=0).to(
+            inputs_embeds.device, inputs_embeds.dtype
+        )
+        image_mask, _ = self.get_placeholder_mask(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            image_features=image_embeds,
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        visual_pos_masks = image_mask[..., 0]
+        outputs = self.language_model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_image_embeds,
+            **kwargs,
+        )
+        return Qwen3VLModelOutputWithPast(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
+            rope_deltas=self.rope_deltas,
+        )
+
 # --- 3. The Top-Level Conditional Generation Model ---
 class Qwen3VLSparseForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """
@@ -376,6 +426,8 @@ class Qwen3VLSparseForConditionalGeneration(Qwen3VLForConditionalGeneration):
         video_grid_thw: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        skip_lm_head: bool = False,
+        precomputed_image_features = None,
         **kwargs
     ) :
         r"""
@@ -391,25 +443,41 @@ class Qwen3VLSparseForConditionalGeneration(Qwen3VLForConditionalGeneration):
         Example:
             TODO: Add example
         """
-        outputs = self.model(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
-            **kwargs,
-        )
+        if precomputed_image_features is None:
+            outputs = self.model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                **kwargs,
+            )
+        else:
+            image_embeds, deepstack_image_embeds = precomputed_image_features
+            outputs = self.model.forward_with_image_features(
+                input_ids=input_ids,
+                image_embeds=image_embeds,
+                deepstack_image_embeds=deepstack_image_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                **kwargs,
+            )
 
         hidden_states = outputs[0]
 
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        if skip_lm_head and labels is not None:
+            raise ValueError("skip_lm_head cannot be used when labels require an LM loss")
+        logits = None if skip_lm_head else self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None and self.model.language_model.seq_keep_mask is not None:
@@ -430,4 +498,3 @@ class Qwen3VLSparseForConditionalGeneration(Qwen3VLForConditionalGeneration):
             "visual_pos_masks": self.model.language_model.visual_pos_masks,
             "position_ids": self.model.language_model.position_ids,
         })
-

@@ -85,6 +85,8 @@ class ContinuousObjectNavEnvConfig:
     # Terminal bonus added to the reached step's reward (discrete-standard success term).
     # 0 keeps the progress-only shape every run before 2026-08-21 used.
     success_reward: float = 0.0
+    # Extra decisions after first success are supervised only by the stop head.
+    post_goal_steps: int = 0
     # Subtracted from the escaped terminal step's reward. Unpenalized escapes end the
     # episode keeping all accumulated progress -- a free exit the policy drifts toward
     # (measured: escape rate doubled over the sd04_noterm run). 0 keeps the old shape.
@@ -143,6 +145,146 @@ class ContinuousObjectNavEnvConfig:
     # Playback speed relative to sim time: written fps = factor / (dt * stride), so the
     # default 1.0 plays exactly realtime at ANY stride; 2.0 twice realtime, 0.5 half.
     video_realtime_factor: float = 1.0
+    # Environment-only RGB-D BEV reward. The VLM receives RGB exactly as before.
+    exploration_enabled: bool = False
+    exploration_reward_weight: float = 0.0
+    exploration_reward_sigma_m2: float = 1.0
+    exploration_resolution_m: float = 0.1
+    exploration_local_window_m: float = 24.0
+    exploration_ray_range_m: float = 12.0
+    exploration_n_rays: int = 31
+    exploration_path_samples: int = 4
+    exploration_max_depth_m: float = 12.0
+    exploration_depth_sensor_uuid: str = "exploration_depth"
+
+
+@dataclass
+class NavVerseEnvConfig:
+    """NavVerse (Isaac Lab) continuous ObjectNav/PlaceNav, driven by SE(2) chunks through
+    NavVerse's own velocity waypoint follower. See `longnav/env/navverse.py`.
+
+    One env step is one chunk of `gap` cumulative body-frame SE(2) setpoints, executed as a
+    single TIMED_TRAJECTORY -- the same mechanism and convention (relative_se2_to_world) the
+    continuous_flow benchmark backend drives over the wire, so training and eval execute
+    chunks identically.
+    """
+
+    _target_: str = "longnav.env.navverse.NavVerseEnvActor"
+    # NavVerse resolves its own config/episode/scene paths relative to CWD; a Ray actor
+    # inherits this trainer's CWD, not the main NavVerse-Benchmark repo's, so the actor
+    # chdir()s here first.
+    navverse_repo_root: str = "/home/ubuntu/Projects/NavVerse-Benchmark"
+    config_path: str = "configs/default.yaml"
+    episode_folder: str = "/home/ubuntu/Projects/navverse_data/episodes/"
+    scene_folder: str = "/home/ubuntu/Projects/navverse_data/"
+    # One episode label per line -- `episodes/train_set.txt` / `test_set.txt` / etc in the
+    # main NavVerse-Benchmark repo. Required whenever `assign_shard(None)` can happen (the
+    # framework's trivial-shard / shard_size=0 training default): the env owns its dataset
+    # scope, so "everything" means everything in THIS file, not everything VLNSim happens
+    # to have loaded from `episode_folder` -- otherwise train/test separation would depend
+    # on episode_folder's contents rather than being asserted here.
+    episodes_path: Optional[str] = None
+    train_uids: Optional[Any] = None
+    excluded_episode_labels: Optional[List[str]] = None
+    task_type: str = "placenav"
+    robot_name: str = "spot"
+    tidybot_embodiment: str = "full"
+    hide_robot_visuals: bool = False
+    on_demand_render: bool = False
+    camera_rgb_only: bool = False
+    policy_camera_only: bool = False
+    disable_camera: bool = False
+    trajectory_planner: Optional[str] = None
+    profile_step_timing: bool = False
+    profile_step_interval: int = 100
+    gap: int = 10
+    dt: float = 0.04
+    max_steps: int = 175
+    # NavVerse's own benchmark convention (navverse_tools/statistics/analysis_legacy_vln_success16.py),
+    # not habitat's 1.0/0.2 -- keeps train and the project's own eval protocol consistent.
+    success_distance: float = 1.6
+    slack_penalty: float = 0.0
+    collision_penalty: float = 0.0
+    failure_penalty: float = 0.0
+    progress_reward_clip: float = 0.75
+    success_reward: float = 0.0
+    timeout_margin_s: float = 1.0
+    minimal_logging: bool = False
+    video_fps: int = 2
+    # Diagnostic capture for NavVerse: store one frame every N low-level physics ticks.
+    # Zero preserves the ordinary policy-step-only logging path.
+    video_tick_stride: int = 0
+    video_realtime_factor: float = 1.0
+
+
+@dataclass
+class NavVerseProxyBatchedEnvConfig:
+    """Batched variant of `navverse`: `num_hosts` Isaac Lab processes, each running
+    `slots_per_host` vectorized robots, presented to `rollout_core` as
+    `num_hosts * slots_per_host` ordinary-looking single-episode actors
+    (`longnav.env.navverse.NavVerseSlotProxyActor`). Recovers the pre-flowsde vectorized
+    env's amortization of Isaac Lab's ~60GB/process fixed cost, at the price of lockstep
+    coupling between the `slots_per_host` siblings of one host -- see the module docstring
+    in `longnav/env/navverse.py` before changing `slots_per_host`.
+
+    `resources.num_sims` MUST equal `num_hosts * slots_per_host`, since `SimWorkerFactory`
+    constructs exactly that many proxy actors and each one claims the next sequential slot.
+    `episodes_path` must group into scenes of >= `slots_per_host` episodes each (a host's
+    whole batch shares one scene per round) -- this repo's smoke sample (16 scenes x 8
+    episodes) is sized for the default `slots_per_host=8`.
+    """
+
+    _target_: str = "longnav.env.navverse.NavVerseSlotProxyActor"
+    num_hosts: int = 8
+    slots_per_host: int = 8
+    # Fractional GPU request for each HOST actor (the proxies themselves request ~0 GPU
+    # through `resources.sim_gpu_fraction`, set separately in the resources/*.yaml). Ray's
+    # fractional-GPU scheduling bin-packs by request order but does not hard-pin a host and
+    # its paired VLM worker to one physical device -- verify actual placement (e.g.
+    # `ray.get_gpu_ids()` inside the host, or `nvidia-smi` during the smoke run) before
+    # trusting colocation at full scale.
+    host_num_gpus: float = 0.5
+    host_num_cpus: int = 4
+    host_conda_env: Optional[str] = None
+    navverse_repo_root: str = "/home/ubuntu/Projects/NavVerse-Benchmark"
+    config_path: str = "configs/default.yaml"
+    episode_folder: str = "/home/ubuntu/Projects/navverse_data/episodes/"
+    scene_folder: str = "/home/ubuntu/Projects/navverse_data/"
+    episodes_path: Optional[str] = None
+    train_uids: Optional[Any] = None
+    excluded_episode_labels: Optional[List[str]] = None
+    task_type: str = "placenav"
+    robot_name: str = "spot"
+    tidybot_embodiment: str = "full"
+    hide_robot_visuals: bool = False
+    on_demand_render: bool = False
+    camera_rgb_only: bool = False
+    policy_camera_only: bool = False
+    disable_camera: bool = False
+    trajectory_planner: Optional[str] = None
+    profile_step_timing: bool = False
+    profile_step_interval: int = 100
+    gap: int = 10
+    dt: float = 0.04
+    max_steps: int = 175
+    success_distance: float = 1.6
+    slack_penalty: float = 0.0
+    collision_penalty: float = 0.0
+    failure_penalty: float = 0.0
+    progress_reward_clip: float = 0.75
+    success_reward: float = 0.0
+    timeout_margin_s: float = 1.0
+    minimal_logging: bool = False
+    video_tick_stride: int = 0
+    video_realtime_factor: float = 1.0
+
+
+@dataclass
+class NavVerseBatchedEnvConfig(NavVerseEnvConfig):
+    """One Ray simulator actor owning a fixed batch of NavVerse robot environments."""
+
+    _target_: str = "longnav.env.navverse.NavVerseHostActor"
+    slots_per_host: int = 8
 
 
 @dataclass
@@ -177,5 +319,12 @@ cs.store(name="voxel", group="sim", node=HabitatEnvConfig(
 cs.store(name="dummy_discrete", group="sim", node=DummyDiscreteEnvConfig())
 cs.store(name="dummy_continuous", group="sim", node=DummyContinuousEnvConfig())
 cs.store(name="objectnav_continuous", group="sim", node=ContinuousObjectNavEnvConfig())
+cs.store(name="navverse", group="sim", node=NavVerseEnvConfig())
+cs.store(name="navverse_batched", group="sim", node=NavVerseBatchedEnvConfig())
+cs.store(
+    name="navverse_proxy_batched",
+    group="sim",
+    node=NavVerseProxyBatchedEnvConfig(),
+)
 cs.store(name="color_bandit", group="sim", node=ColorBanditEnvConfig())
 cs.store(name="replay", group="sim", node=ReplayEnvConfig())

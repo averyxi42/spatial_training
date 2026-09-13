@@ -16,7 +16,11 @@ classifiers = [
 license = "MIT"
 license-files = ["LICEN[CS]E*"]
 dependencies = [
-    "ray[default]==2.53.0",
+    # Pinned to match the pre-existing `navverse` conda env's ray (the NavVerse sim actors
+    # run there via Ray's runtime_env conda dispatch) rather than upstream's 2.53.0 -- a
+    # local Ray cluster needs matching ray versions across every conda env it spans, and
+    # `navverse` is a shared env other NavVerse-Benchmark tooling depends on.
+    "ray[default]==2.52.1",
     "hydra-core",
     "regex"
 ]

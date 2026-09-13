@@ -1,0 +1,16 @@
+# @package _global_
+# Spot indoor ObjectNav warm start from the published ck791 adapter.
+defaults:
+  - navverse_flow_sde_tidybot_ck791
+  - _self_
+
+sim:
+  robot_name: spot
+  tidybot_embodiment: full
+  hide_robot_visuals: true
+  success_reward: 2.5
+  episodes_path: /home/ubuntu/Projects/NavVerse-Benchmark/episodes/rl_navverse_indoor_pool192_21scene_no27_seed42.txt
+  train_uids: /home/ubuntu/Projects/NavVerse-Benchmark/episodes/rl_navverse_indoor_train128_15scene_no27_seed42.txt
+
+task:
+  run_name: "navverse_spot_ck791_indoor128_success2p5"

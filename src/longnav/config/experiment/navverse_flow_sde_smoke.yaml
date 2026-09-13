@@ -1,0 +1,88 @@
+# @package _global_
+# Smoke test for the NavVerse flow-SDE RL wiring: one sim actor, one VLM worker, a small
+# deterministic 128-episode/16-scene sample (episodes/rl_navverse_smoke128_16x8.txt in the
+# main repo), minimal logging. Run this BEFORE navverse_flow_sde.yaml -- it is the only way
+# to find out whether the (gap,3) chunk -> TIMED_TRAJECTORY -> reward plumbing in
+# longnav/env/navverse.py actually works end to end without burning a real training budget.
+#
+# LAUNCH (from baselines/longnav/longnav_continuous_rl -- uses the `pixi` env there, not a
+# named conda env; vlm_conda_env=null/habitat_conda_env=navverse are already baked into
+# navverse_smoke.yaml):
+#   pixi run ray stop --force  # stale workers reuse old module code
+#   pixi run python -m longnav.scripts.train_rl +training=hapo +resources=navverse_smoke \
+#       +experiment=navverse_flow_sde_smoke
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: navverse
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  policy_head:
+    checkpoint_dir: /home/ubuntu/.cache/navverse_huggingface/hub/models--Aasdfip--longnav-objectnav-flow-nopose-cotrain-2p5hz/snapshots/5090ef4c9eeddec1230a5118303fafbdd4353155
+    gap: 10
+    sde_n: 1
+    sde_noise_a: 0.15
+    sde_position_weight: sigma
+
+sim:
+  episode_folder: /home/ubuntu/Projects/navverse_data/episodes/
+  scene_folder: /home/ubuntu/Projects/navverse_data/
+  episodes_path: /home/ubuntu/Projects/NavVerse-Benchmark/episodes/rl_navverse_smoke128_16x8.txt
+  task_type: placenav
+  gap: 10
+  dt: 0.04
+  max_steps: 30 # short on purpose, this is a wiring check, not a training signal
+  success_distance: 1.6
+  minimal_logging: true
+
+rollout:
+  max_steps: 30
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  checkpoint: /home/ubuntu/.cache/navverse_huggingface/hub/models--Aasdfip--longnav-objectnav-flow-nopose-cotrain-2p5hz/snapshots/5090ef4c9eeddec1230a5118303fafbdd4353155/adapter
+  load_optim: false
+  load_sched: false
+  action_head_learning_rate: 1e-6
+  grad_accum_steps: 1
+  rl_config:
+    entropy_bonus: 0.0
+    n_epoch: 1
+    n_rollout: 1
+    n_adv: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "navverse_rl_smoke"
+  run_name: "navverse_flow_sde_smoke"
+  output_dir: /home/ubuntu/Projects/NavVerse-Benchmark/dump/navverse_flow_rl_smoke
+  subset_label: "everything"
+  shard_size: 0

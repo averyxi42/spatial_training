@@ -1,5 +1,6 @@
 import ray
 import os
+import time
 from omegaconf import OmegaConf
 from hydra.utils import get_class
 from longnav.config_schema import *
@@ -14,7 +15,7 @@ def strip_reserved_keys(config_dict: dict) -> dict:
     return {k: v for k, v in config_dict.items() if k not in RESERVED_CONFIG_KEYS}
 
 # Use these imports for type hinting
-from typing import List, Dict, Any, Iterator, Optional,Union
+from typing import List, Iterator, Optional, Union
 import logging
 import json
 thread_cap_env = {
@@ -32,6 +33,22 @@ thread_cap_env = {
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
     }
 }
+
+
+def _actor_runtime_env(conda_env, extra_pythonpath=None):
+    """Build a Ray runtime env without dropping a configured simulator package path."""
+    env = {"conda": conda_env} if conda_env else {}
+    env |= thread_cap_env
+    if extra_pythonpath:
+        inherited = os.environ.get("PYTHONPATH", "")
+        env["env_vars"] = dict(env["env_vars"])
+        env["env_vars"]["PYTHONPATH"] = os.pathsep.join(
+            value for value in (extra_pythonpath, inherited) if value)
+    return env
+
+
+def _join_pythonpaths(*paths):
+    return os.pathsep.join(path for path in paths if path)
 
 def save_hydra_config(config, save_dir: str, filename: str = "config.yaml"):
     """
@@ -74,7 +91,7 @@ def resolve_checkpoint_path(path_or_id):
     If local path, returns as-is.
     """
     import os
-    from huggingface_hub import snapshot_download, hf_hub_download
+    from huggingface_hub import snapshot_download
     from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 
     # 1. If it exists locally, trust it.
@@ -117,7 +134,8 @@ class InferenceWorkerFactory:
             resources={res_cfg.vlm_resource_tag: 1},
             num_cpus=res_cfg.vlm_cpus,
             num_gpus=res_cfg.vlm_gpu_fraction,
-            runtime_env={"conda": res_cfg.vlm_conda_env} | thread_cap_env,
+            runtime_env=_actor_runtime_env(res_cfg.vlm_conda_env,
+                                           res_cfg.worker_pythonpath),
             max_restarts=0,        # <--- CRITICAL: Do not restart on crash.
             max_task_retries=-1,
         )
@@ -131,26 +149,35 @@ class InferenceWorkerFactory:
 
 class RLWorkerFactory:
     @staticmethod
-    def create(vlm_dict: dict, rollout_dict: dict, res_cfg: ResourceConfig):
+    def create(
+        vlm_dict: dict,
+        rollout_dict: dict,
+        res_cfg: ResourceConfig,
+        scheduling_strategies=None,
+    ):
         # res_cfg is fine to keep as object for resource logic
         from longnav.utils.rollout_core import RLActor
-        env_dict = {}
-        if res_cfg.vlm_conda_env is not None:
-            env_dict = {"conda": res_cfg.vlm_conda_env}
         # We use the dicts directly to avoid pickling issues
-        RemoteRLWorker = ray.remote(RLActor).options(
+        actor_options = dict(
             resources={res_cfg.vlm_resource_tag: 1},
             num_cpus=res_cfg.vlm_cpus,
             num_gpus=res_cfg.vlm_gpu_fraction,
-            runtime_env=env_dict | thread_cap_env,
+            runtime_env=_actor_runtime_env(res_cfg.vlm_conda_env,
+                                           res_cfg.worker_pythonpath),
             max_restarts=0,        # <--- CRITICAL: Do not restart on crash.
             max_task_retries=-1,
         )
+        strategies = scheduling_strategies or [None] * res_cfg.num_vlms
+        if len(strategies) != res_cfg.num_vlms:
+            raise ValueError("Need one scheduling strategy per VLM worker")
         workers =  [
-            RemoteRLWorker.remote(
+            ray.remote(RLActor).options(
+                **actor_options,
+                **({"scheduling_strategy": strategy} if strategy is not None else {}),
+            ).remote(
                 rollout_config=rollout_dict, 
                 **vlm_dict
-            ) for _ in range(res_cfg.num_vlms)
+            ) for strategy in strategies
         ]
         
         return workers
@@ -186,42 +213,91 @@ class RLWorkerFactory:
 
 class SimWorkerFactory:
     @staticmethod
-    def create(sim_dict: dict, res_cfg: ResourceConfig, task_cfg: RunConfig, logger_actor=None):
+    def create_one(
+        sim_dict: dict,
+        res_cfg: ResourceConfig,
+        task_cfg: RunConfig,
+        worker_index: int,
+        logger_actor=None,
+        scheduling_strategy=None,
+    ):
         sim_dict = dict(sim_dict)
         target = sim_dict.pop("_target_")
         config_overrides = sim_dict.pop("per_worker_config_overrides", None)
         env_actor_cls = get_class(target)
 
-        env_dict = {}
-        if res_cfg.habitat_conda_env is not None:
-            env_dict = {"conda": res_cfg.habitat_conda_env}
-        RemoteSim = ray.remote(env_actor_cls).options(
+        actor_options = dict(
             resources={res_cfg.sim_resource_tag: 1},
             num_cpus=res_cfg.sim_cpus,
             num_gpus=res_cfg.sim_gpu_fraction,
-            runtime_env=env_dict |thread_cap_env,
-            max_restarts=0,        # <--- CRITICAL: Do not restart on crash.
-            max_task_retries=-1,
+            runtime_env=_actor_runtime_env(
+                res_cfg.habitat_conda_env,
+                _join_pythonpaths(res_cfg.worker_pythonpath,
+                                  res_cfg.habitat_pythonpath),
+            ),
+            # Actor replacement is supervised explicitly by the rollout driver so the
+            # exact episode shard can be retried and the replacement placement verified.
+            max_restarts=0,
+            max_task_retries=0,
         )
 
         ctor_kwargs = strip_reserved_keys(sim_dict)
-        handles = []
-        for i in range(res_cfg.num_sims):
-            if config_overrides is not None:
-                print(f"overriding sim {i} config with: {config_overrides[i]}")
-                ctor_kwargs['config_path'] = config_overrides[i]
-            # Calculate dynamic per-worker arguments
-            log_dir = os.path.join(task_cfg.output_dir, task_cfg.run_name,"rollout")# f'worker_{i}')
-
-            # We merge the static ctor_kwargs with our dynamic arguments
-            h = RemoteSim.remote(
-                **ctor_kwargs,
-                logging_output_dir=log_dir,
-                logger_actor=logger_actor,
-                # Ensure these match your HabitatRayWorker __init__
+        if config_overrides is not None:
+            if worker_index >= len(config_overrides):
+                raise ValueError(
+                    f"Missing per-worker simulator override for index {worker_index}"
+                )
+            print(
+                f"overriding sim {worker_index} config with: "
+                f"{config_overrides[worker_index]}"
             )
-            handles.append(h)
-        return handles
+            ctor_kwargs["config_path"] = config_overrides[worker_index]
+        log_dir = os.path.join(task_cfg.output_dir, task_cfg.run_name, "rollout")
+        return ray.remote(env_actor_cls).options(
+            **actor_options,
+            **(
+                {"scheduling_strategy": scheduling_strategy}
+                if scheduling_strategy is not None
+                else {}
+            ),
+        ).remote(
+            **ctor_kwargs,
+            logging_output_dir=log_dir,
+            logger_actor=logger_actor,
+        )
+
+    @staticmethod
+    def create(
+        sim_dict: dict,
+        res_cfg: ResourceConfig,
+        task_cfg: RunConfig,
+        logger_actor=None,
+        scheduling_strategies=None,
+    ):
+        strategies = scheduling_strategies or [None] * res_cfg.num_sims
+        if len(strategies) != res_cfg.num_sims:
+            raise ValueError("Need one scheduling strategy per simulator worker")
+        stagger_seconds = float(res_cfg.sim_startup_stagger_s)
+        if stagger_seconds < 0:
+            raise ValueError("resources.sim_startup_stagger_s must be non-negative")
+        workers = []
+        for index in range(res_cfg.num_sims):
+            worker = SimWorkerFactory.create_one(
+                sim_dict=sim_dict,
+                res_cfg=res_cfg,
+                task_cfg=task_cfg,
+                worker_index=index,
+                logger_actor=logger_actor,
+                scheduling_strategy=strategies[index],
+            )
+            workers.append(worker)
+            if stagger_seconds:
+                # Constructor completion is the safety gate: Isaac startup is not safe
+                # when all GPU processes initialize concurrently on this host.
+                ray.get(worker.worker_placement.remote())
+                if index + 1 < res_cfg.num_sims:
+                    time.sleep(stagger_seconds)
+        return workers
 
 class LoggerFactory:
     @staticmethod
@@ -238,7 +314,8 @@ class LoggerFactory:
 
         RemoteLogger = ray.remote(logger_actor_cls).options(
             num_cpus=0,
-            runtime_env={"conda": res_cfg.vlm_conda_env}
+            runtime_env=_actor_runtime_env(res_cfg.vlm_conda_env,
+                                           res_cfg.worker_pythonpath)
         )
         import wandb
         api = wandb.Api()
@@ -270,7 +347,8 @@ class LoggerFactory:
                 "id": id,
                 "resume": "allow",
             },
-            run_config=full_dict_cfg
+            run_config=full_dict_cfg,
+            compact_metrics=bool(getattr(run_cfg.logger, "compact_metrics", False)),
         ),episodes_to_skip
 
 
@@ -322,7 +400,7 @@ class ExpBootstrapper:
             res_cfg=self.typed_cfg.resources
         )
     
-    def bootstrap_vlms_rl(self,training=True):
+    def bootstrap_vlms_rl(self,training=True, scheduling_strategies=None):
         if self.typed_cfg.training.checkpoint is not None:
             checkpoint_path = self.typed_cfg.training.checkpoint
             checkpoint_path = resolve_checkpoint_path(checkpoint_path)
@@ -350,6 +428,7 @@ class ExpBootstrapper:
             vlm_dict=self.resolved_dict['vlm'], 
             rollout_dict=self.resolved_dict['rollout'], 
             res_cfg=self.typed_cfg.resources,
+            scheduling_strategies=scheduling_strategies,
         )
         if training:
             futures = RLWorkerFactory._enable_training(workers,self.typed_cfg.resources,self.typed_cfg.training)
@@ -360,16 +439,89 @@ class ExpBootstrapper:
                 print("loading checkpoint for eval")
                 for worker in workers:
                     ray.get(worker._setup_peft.remote(self.typed_cfg.training))
+                    ray.get(worker.setup_state_probe_for_eval.remote(
+                        self.typed_cfg.training))
                     ray.get(worker.load_checkpoint.remote(self.typed_cfg.training.checkpoint,False,False))
         return workers
     
-    def bootstrap_sims(self,logger=None):
+    def bootstrap_sims(self,logger=None, scheduling_strategies=None):
         return SimWorkerFactory.create(
             sim_dict=self.resolved_dict['sim'],
             res_cfg=self.typed_cfg.resources,
             task_cfg=self.typed_cfg.task,
             logger_actor=logger,
+            scheduling_strategies=scheduling_strategies,
         )
+
+    def bootstrap_sim(self, worker_index, logger=None, scheduling_strategy=None):
+        """Create one simulator actor with the same resolved production config."""
+        return SimWorkerFactory.create_one(
+            sim_dict=self.resolved_dict['sim'],
+            res_cfg=self.typed_cfg.resources,
+            task_cfg=self.typed_cfg.task,
+            worker_index=worker_index,
+            logger_actor=logger,
+            scheduling_strategy=scheduling_strategy,
+        )
+
+    def create_paired_gpu_placement_groups(self):
+        res = self.typed_cfg.resources
+        if res.num_vlms != res.num_sims:
+            raise ValueError(
+                "paired_gpu_workers requires resources.num_vlms == resources.num_sims"
+            )
+        if res.vlm_gpu_fraction + res.sim_gpu_fraction > 1.0 + 1e-9:
+            raise ValueError(
+                "Paired VLM/sim GPU fractions must sum to at most one; got "
+                f"{res.vlm_gpu_fraction} + {res.sim_gpu_fraction}"
+            )
+        from ray.util.placement_group import placement_group
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+        groups = []
+        strategies = []
+        for _ in range(res.num_vlms):
+            group = placement_group(
+                [
+                    {
+                        "CPU": res.vlm_cpus + res.sim_cpus,
+                        "GPU": 1,
+                        res.vlm_resource_tag: 1,
+                        res.sim_resource_tag: 1,
+                    }
+                ],
+                strategy="STRICT_PACK",
+            )
+            groups.append(group)
+            strategies.append(
+                PlacementGroupSchedulingStrategy(
+                    placement_group=group,
+                    placement_group_bundle_index=0,
+                    placement_group_capture_child_tasks=True,
+                )
+            )
+        ray.get([group.ready() for group in groups])
+        return groups, strategies
+
+    @staticmethod
+    def verify_paired_gpu_placement(trainers, sims):
+        trainer_info = ray.get([worker.worker_placement.remote() for worker in trainers])
+        sim_info = ray.get([worker.worker_placement.remote() for worker in sims])
+        trainer_gpus = []
+        for index, (vlm, sim) in enumerate(zip(trainer_info, sim_info)):
+            vlm_ids = tuple(vlm["ray_gpu_ids"])
+            sim_ids = tuple(sim["ray_gpu_ids"])
+            if len(vlm_ids) != 1 or vlm_ids != sim_ids:
+                raise RuntimeError(
+                    f"GPU pair {index} is not co-located: vlm={vlm}, sim={sim}"
+                )
+            trainer_gpus.append(vlm_ids[0])
+        if len(set(trainer_gpus)) != len(trainer_gpus):
+            raise RuntimeError(
+                f"Paired workers do not cover distinct GPUs: {trainer_gpus}"
+            )
+        print(f"Verified paired GPU placement: {trainer_gpus}")
+        return trainer_info, sim_info
     
     def bootstrap_eval(self):
         self.setup_cluster()
@@ -420,7 +572,8 @@ def get_shard_iterator(
     """
     # Case A: Trivial Shard (Let Habitat handle loading via its own config)
     if shard_size <= 0:
-        if logger is not None: logger.info("Using trivial shard (full dataset via Habitat config).")
+        if logger is not None:
+            logger.info("Using trivial shard (full dataset via Habitat config).")
         return trivial_shard_iterator()
 
     # Case B: Explicit Sharding (We must load the list first)
@@ -431,14 +584,18 @@ def get_shard_iterator(
         from longnav.constants import episode_labels_table
         if subset_label in episode_labels_table:
             all_episodes = episode_labels_table[subset_label]
-            if logger is not None: logger.info(f"Loaded {len(all_episodes)} episodes from subset: {subset_label}")
+            if logger is not None:
+                logger.info(
+                    f"Loaded {len(all_episodes)} episodes from subset: {subset_label}"
+                )
         else:
             raise ValueError(f"Subset label '{subset_label}' not found in constants.")
 
     elif episode_json:
         with open(episode_json, 'r') as f:
             all_episodes = json.load(f)
-        if logger is not None: logger.info(f"Loaded {len(all_episodes)} episodes from JSON: {episode_json}")
+        if logger is not None:
+            logger.info(f"Loaded {len(all_episodes)} episodes from JSON: {episode_json}")
 
     else:
         raise ValueError("Shard size > 0 but no episode source (subset_label or episode_json) provided.")
@@ -448,6 +605,9 @@ def get_shard_iterator(
     if excluded_episodes is not None:
         excluded_episodes = set(excluded_episodes)
         all_episodes = [episode for episode in all_episodes if episode not in excluded_episodes]
-        if logger is not None: logger.info(f"After exclusion, {len(all_episodes)} episodes remain for sharding.")
+        if logger is not None:
+            logger.info(
+                f"After exclusion, {len(all_episodes)} episodes remain for sharding."
+            )
         
     return chunk_list(all_episodes, shard_size)

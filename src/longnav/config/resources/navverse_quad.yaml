@@ -1,0 +1,13 @@
+# @package _global_
+# Starting point for NavVerse RL: one Isaac Lab sim actor is ~60 GB VRAM (see
+# baselines/presets/benchmark_longnav_continuous.yaml's sim_vram_gb), unlike habitat-sim's
+# few-GB footprint, so the num_vlms/num_sims balance from octo.yaml/quad.yaml (tuned for
+# cheap habitat sims) does not transfer. On 8x97GB GPUs, 4 sims + 4 VLM workers gives each
+# its own GPU with headroom; validate with the smoke experiment before scaling toward 8+8.
+resources:
+  ray_address: local
+  osm_gb: 128
+  num_vlms: 4
+  num_sims: 4
+  vlm_conda_env: null  # driver runs via `pixi run`, not a named conda env; VLM actors inherit that env directly
+  habitat_conda_env: navverse  # the real named conda env IsaacLab/NavVerse is installed in

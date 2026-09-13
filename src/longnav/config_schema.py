@@ -16,10 +16,14 @@ class ResourceConfig:
     num_sims: int = 1
     vlm_conda_env: Optional[str] = "longnav"
     habitat_conda_env: Optional[str] = "vln"
+    worker_pythonpath: Optional[str] = None
+    habitat_pythonpath: Optional[str] = None
     vlm_gpu_fraction: float = 0.7
     sim_gpu_fraction: float = 0.14
     vlm_cpus: int = 4
     sim_cpus: int = 4
+    paired_gpu_workers: bool = False
+    sim_startup_stagger_s: float = 0.0
 
 # --- 3. Model & Worker Configs ---
 @dataclass
@@ -39,6 +43,14 @@ class VLMConfig:
     # disable_adapter() an exact reference to the SFT policy. Mutually exclusive with
     # pointing training.checkpoint at the SAME adapter (that would apply the delta twice).
     merge_adapter_dir: Optional[str] = None
+    # Explicitly assert that model_id is already the frozen reference policy. This is
+    # needed for published RL adapters whose PEFT base is a merged SFT repository:
+    # disable_adapter() then exposes that SFT policy without another merge.
+    base_model_is_reference: bool = False
+    # Cache inference-mode setup, skip unused continuous-policy LM logits, and retain the
+    # sparse visual-history database on GPU between rollout turns.
+    rollout_inference_optimizations: bool = False
+    batch_vision_inference: bool = False
 
 @dataclass 
 class PolicyLossConfig:
@@ -53,9 +65,23 @@ class RLAlgoConfig:
     value_head: Optional[Any] = None
     # Frozen SFT-cotrained state probe (value + distance heads over one readout
     # hidden). "auto" loads state_probe.pt from the policy head's checkpoint_dir when
-    # present; a path loads that dir; None disables. Mutually exclusive with
-    # value_head (both claim the worker's value readout slot).
+    # present; a path loads that dir; None disables. A trainable stop-only probe may
+    # share the readout with a separate RL critic in ``value_head``.
     state_probe: Optional[str] = None
+    # Train the checkpoint's episode-stop probe with online distance labels. This is
+    # separate from the legacy frozen state-probe value adapter.
+    state_probe_trainable: bool = False
+    state_probe_stop_threshold: Optional[float] = None
+    # Training-time Bernoulli temperature for shadow STOP. Deployment calibration keeps
+    # its own threshold; this value only shapes stochastic stop exploration.
+    state_probe_stop_temperature: float = 1.0
+    state_probe_shadow_rl_weight: float = 1.0
+    # Fail before the first optimizer step if the rollout and PPO chain scorers do
+    # not agree.  None keeps compatibility with earlier continuous experiments.
+    initial_chain_seam_limit: Optional[float] = None
+    # Stop a run before density drift from the frozen SFT reference becomes destructive.
+    # This is the cycle mean of per-minibatch 95th-percentile absolute log ratios.
+    max_ref_log_ratio_p95: Optional[float] = None
     advantage_estimator: str = "reinforce_plus_plus"
     n_rollout: int = 12 # note: must be divisible by num vlms times gradient accumulation
     n_adv: int = 256 # number of trajectories for advantage estimation, must > n_rollout
@@ -91,9 +117,9 @@ class RLAlgoConfig:
     # Off = the historical episode-weighted objective every run to date used (measured
     # bias: quick successes get ~4x per-token influence; mean pg_loss offset -0.26).
     token_weighted_loss: bool = False
-    # Bootstrap gamma*V(s_T) onto the last reward of TRUNCATED (budget-capped) episodes.
+    # Bootstrap gamma*V(s_T) onto the last reward of genuine budget-capped episodes.
     # Off treats the cap as absorbing, under-crediting long episodes' tails. Requires a
-    # value head and the env's `truncated` flag; silently inert without both.
+    # value head and the environment's `bootstrap_eligible` flag; silently inert without both.
     bootstrap_truncated: bool = False
 
     # Ref KL Control
@@ -110,8 +136,8 @@ class RLAlgoConfig:
     # every step. MEASURE, NOT CONSTRAIN, by default:
     ref_kl: bool = False
     # 0.0 = measure only (the default, deliberately -- read the gauge before trusting it
-    # as a leash). >0 adds ref_kl_coeff * k3 to the policy loss (k3 = the non-negative
-    # low-variance KL(pi||pi_ref) estimator, verl's low_var_kl convention).
+    # as a leash). >0 adds ref_kl_coeff times the quadratic k2 estimator to the policy
+    # loss. k2 is non-negative and remains well-conditioned for continuous chains.
     ref_kl_coeff: float = 0.0
 
     # # Compatibility for verl's agg_loss
@@ -198,6 +224,14 @@ class VLMTrainingConfig:
 @dataclass
 class RolloutConfig:
     max_steps: int = 350
+    # Episode wall-clock watchdog. The soft deadline requests an environment-level
+    # terminal transition; the hard deadline replaces the simulator actor if the
+    # single-threaded Isaac process cannot service that request. A replacement gets one
+    # retry of the same episode shard, then the driver fails closed instead of looping.
+    episode_soft_timeout_seconds: float = 600.0
+    episode_hard_timeout_seconds: float = 900.0
+    sim_restart_limit: int = 1
+    sim_recycle_every_cycles: int = 0
     temperature: float = 1.0
     action_space_str: str = "[stop, forward, left, right]"
     system_prompt: str = "${read_text:src/longnav/conf/prompts/objectnav_prompt.txt}"
@@ -215,6 +249,11 @@ class RolloutConfig:
         {"role": "assistant", "content": [{"type": "text", "text": "**forward**"}]}
     ])
     stop_prob_threshold: Optional[float] = None
+    stop_head_radius_m: float = 1.0
+    stop_execution_mode: str = "physical"
+    stop_shadow_correct_reward: float = 1.0
+    stop_shadow_false_penalty: float = 1.0
+    stop_shadow_miss_penalty: float = 1.0
     # Deterministic-rollout mode: act on the env-provided state_dict['info']['oracle_action']
     # instead of sampling from the policy's own output distribution. The policy still runs a
     # real forward pass; only which action is taken (and fed back into the next turn's prompt)
@@ -248,6 +287,8 @@ class RunConfig:
     #: which is what lets an eval set stay FIXED across runs whose pools differ, and what
     #: lets it be held out of training via the env's `train_uids`.
     eval_uids_file: Optional[str] = None
+    # Keep immutable snapshots when the pinned eval improves OSPL, SPL, or SR.
+    save_eval_bests: bool = True
     eval_ode: bool = True
 
 # --- ROOT CONFIGs ---

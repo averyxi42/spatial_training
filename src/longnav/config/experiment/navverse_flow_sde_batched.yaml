@@ -1,0 +1,129 @@
+# @package _global_
+# Flow-SDE chain-head RL on NavVerse: eight fixed GPU pairs. Each GPU runs one VLM actor
+# and one Isaac Lab host; every host owns eight vectorized robot environments. Rollouts are
+# dispatched as eight host-sized batches, matching the previous LongNav RL NavVerse path.
+#
+# Starting from the same continuous SFT checkpoint the upstream flow_sde_objectnav_v*.yaml
+# configs continued RL on habitat/objectnav_continuous
+# (Aasdfip/longnav-objectnav-flow-nopose-cotrain-2p5hz). New run, not a resume.
+#
+# The canonical NavVerse train split is sampled like the previous LongNav RL NavVerse
+# pipeline: every wave draws eight distinct scenes, then eight episodes from each scene,
+# deterministically keyed by wave index and seed.
+#   * sim.max_steps/success_distance/slack_penalty and training.rl_config mirror the
+#     upstream flow_sde_objectnav_v4 defaults, NOT anything tuned for NavVerse's own scene
+#     geometry or PlaceNav/ObjNav goal mix.
+#   * resources/navverse_batched_8x8.yaml uses strict one-GPU placement groups; startup
+#     verifies all eight VLM/sim pairs are co-located on eight distinct physical GPUs.
+#
+# LAUNCH (from baselines/longnav/longnav_continuous_rl -- uses the `pixi` env there, after
+# BOTH smoke experiments have passed and `pixi run ray stop --force`):
+#   pixi run python -m longnav.scripts.train_eval_rl +training=hapo +resources=navverse_batched_8x8 \
+#       +experiment=navverse_flow_sde_batched task.run_name=<change_me>
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: navverse_batched
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  # Merge the SFT LoRA into the base so disable_adapter() is an exact frozen SFT
+  # reference for the continuous policy's ref-KL path.
+  merge_adapter_dir: /home/ubuntu/.cache/navverse_huggingface/hub/models--Aasdfip--longnav-objectnav-flow-nopose-cotrain-2p5hz/snapshots/5090ef4c9eeddec1230a5118303fafbdd4353155/adapter
+  policy_head:
+    checkpoint_dir: /home/ubuntu/.cache/navverse_huggingface/hub/models--Aasdfip--longnav-objectnav-flow-nopose-cotrain-2p5hz/snapshots/5090ef4c9eeddec1230a5118303fafbdd4353155
+    gap: 10
+    sde_n: 1
+    sde_noise_a: 0.15
+    sde_position_weight: sigma
+
+sim:
+  slots_per_host: 8
+  episode_folder: /home/ubuntu/Projects/navverse_data/episodes/
+  scene_folder: /home/ubuntu/Projects/navverse_data/
+  episodes_path: /home/ubuntu/Projects/NavVerse-Benchmark/episodes/train_set.txt
+  # Zero-action controls reproduce simulator instability on these two spawn poses.
+  excluded_episode_labels:
+  - grCommercial_scene6_6
+  - grCommercial_scene6_15
+  task_type: placenav
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 1.6 # NavVerse's own benchmark convention, not habitat's 1.0/0.2/0.4
+  success_reward: 0.0
+  slack_penalty: 0.01
+  collision_penalty: 0.0
+  # Native absorbing failures must not be a free early exit from the per-step slack cost.
+  # Contact-force collision stays off: the 8-env production probe could not detect an
+  # injected Spot body collision, so that signal is not valid for reward shaping yet.
+  failure_penalty: 2.5
+  progress_reward_clip: 0.75
+  minimal_logging: false
+
+rollout:
+  max_steps: 175 # must match sim.max_steps
+  episode_soft_timeout_seconds: 600.0
+  episode_hard_timeout_seconds: 900.0
+  sim_restart_limit: 1 # fail closed if the replacement also wedges on the same shard
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  checkpoint: null
+  load_optim: false
+  load_sched: false
+  action_head_learning_rate: 1e-6 # see hapo.yaml's default (5e-4) footgun note upstream
+  grad_accum_steps: 8 # n_rollout / num_vlms = 64 / 8
+  max_grad_norm: 20.0
+  rl_config:
+    n_rollout: 64 # one complete 8 hosts x 8 env wave
+    n_adv: 256
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    # The legacy use_ref/kl_coeff path is discrete-only. This scores continuous chains
+    # against the merged frozen SFT policy and applies a conservative quadratic tether.
+    use_ref: false
+    kl_coeff: 0.0
+    ref_kl: true
+    ref_kl_coeff: 0.001
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "navverse_rl"
+    compact_metrics: true
+  run_name: "navverse_flow_sde_batched_v1" # change per run to avoid local/wandb collisions
+  output_dir: /home/ubuntu/Projects/NavVerse-Benchmark/dump/navverse_flow_rl
+  subset_label: "everything"
+  shard_size: 0
+  eval_every: 20
+  eval_set_size: 64
+  eval_seed: 0
+  eval_uids_file: /home/ubuntu/Projects/NavVerse-Benchmark/episodes/rl_navverse_eval64_seed0_8x8.txt
+  eval_ode: true

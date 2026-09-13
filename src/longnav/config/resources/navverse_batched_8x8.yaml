@@ -1,0 +1,16 @@
+# @package _global_
+# Eight strict one-GPU placement groups. Each group contains one VLM actor and one
+# NavVerse host actor; every host owns eight vectorized robot environments.
+resources:
+  ray_address: local
+  object_spilling_directory: /tmp/navverse_longnav_ray_object_spilling
+  osm_gb: 256
+  num_vlms: 8
+  num_sims: 8
+  sim_gpu_fraction: 0.2
+  sim_cpus: 4
+  vlm_gpu_fraction: 0.8
+  paired_gpu_workers: true
+  sim_startup_stagger_s: 30.0
+  vlm_conda_env: null  # driver runs via `pixi run`, not a named conda env; VLM actors inherit that env directly
+  habitat_conda_env: navverse  # the real named conda env IsaacLab/NavVerse is installed in

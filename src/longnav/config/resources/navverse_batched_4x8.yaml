@@ -1,0 +1,15 @@
+# @package _global_
+# Four paired GPU workers; each Isaac host owns eight vectorized environments.
+resources:
+  ray_address: local
+  object_spilling_directory: /tmp/navverse_longnav_ray_object_spilling
+  osm_gb: 128
+  num_vlms: 4
+  num_sims: 4
+  sim_gpu_fraction: 0.2
+  sim_cpus: 4
+  vlm_gpu_fraction: 0.8
+  paired_gpu_workers: true
+  sim_startup_stagger_s: 30.0
+  vlm_conda_env: null
+  habitat_conda_env: navverse

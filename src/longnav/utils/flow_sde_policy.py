@@ -366,6 +366,16 @@ class FlowSDEHead(nn.Module):
         with different positions batch together.
         """
         B, S = chains.shape[0], chains.shape[1]
+        if h.shape[:2] != (B, S):
+            raise ValueError(
+                f"Flow-SDE readout/action length mismatch: h={tuple(h.shape[:2])}, "
+                f"chains={(B, S)}"
+            )
+        if positions.shape[:2] != (B, S):
+            raise ValueError(
+                "Flow-SDE position/action length mismatch: "
+                f"positions={tuple(positions.shape[:2])}, chains={(B, S)}"
+            )
         n, dt = self.sde.n, -1.0 / self.K
         rows = B * S
         ctx = h.reshape(rows, -1).float()

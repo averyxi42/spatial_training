@@ -1,0 +1,106 @@
+# @package _global_
+# Flow-SDE chain-head RL on NavVerse (Isaac Lab), starting from the same continuous SFT
+# checkpoint the upstream flow_sde_objectnav_v*.yaml configs continued RL on habitat/
+# objectnav_continuous (Aasdfip/longnav-objectnav-flow-nopose-cotrain-2p5hz). This is a NEW
+# run, not a resume: NavVerse's own simulator, episodes, and reward geometry replace
+# habitat's, so wandb/checkpoint history starts fresh under run_name below.
+#
+# SINGLE-ACTOR (vector_envs=1) variant -- one rollout per Isaac Lab process, no batching.
+# See navverse_flow_sde_batched.yaml for the 8-hosts-x-8-slots variant that recovers the
+# pre-flowsde vectorized env's GPU amortization; use THIS one if you want the simpler,
+# less-coupled path first (no reset/step barrier across siblings to debug).
+#
+# DRAFT -- values below are a starting proposal, not a validated config. In particular:
+#   * resources: navverse_quad (4 sims + 4 VLM workers) is a guess pending the smoke test's
+#     measured per-actor VRAM (baselines/presets/benchmark_longnav_continuous.yaml quotes
+#     ~60 GB for one Isaac Lab sim actor at 1 vector env -- confirm before scaling up).
+#   * sim.episodes_path points at the 128-episode/16-scene smoke sample
+#     (episodes/rl_navverse_smoke128_16x8.txt), NOT the full train_set.txt -- swap this once
+#     the smoke test and a short real run both look right; scale scene/episode counts with
+#     however many parallel sim actors the resource config ends up using.
+#   * sim.max_steps/success_distance/slack_penalty and training.rl_config mirror the
+#     upstream flow_sde_objectnav_v4 defaults, NOT anything tuned for NavVerse's own scene
+#     geometry or PlaceNav/ObjNav goal mix -- see the training plan for what to confirm.
+#
+# LAUNCH (from baselines/longnav/longnav_continuous_rl -- uses the `pixi` env there, after
+# the smoke experiment has passed and `pixi run ray stop --force`):
+#   pixi run python -m longnav.scripts.train_rl +training=hapo +resources=navverse_quad \
+#       +experiment=navverse_flow_sde task.run_name=<change_me>
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: navverse
+
+vlm:
+  attn_impl: flash_attention_2
+  save_outputs: true
+  policy_head:
+    checkpoint_dir: /home/ubuntu/.cache/navverse_huggingface/hub/models--Aasdfip--longnav-objectnav-flow-nopose-cotrain-2p5hz/snapshots/5090ef4c9eeddec1230a5118303fafbdd4353155
+    gap: 10
+    sde_n: 1
+    sde_noise_a: 0.15
+    sde_position_weight: sigma
+
+sim:
+  episode_folder: /home/ubuntu/Projects/navverse_data/episodes/
+  scene_folder: /home/ubuntu/Projects/navverse_data/
+  episodes_path: /home/ubuntu/Projects/NavVerse-Benchmark/episodes/rl_navverse_smoke128_16x8.txt
+  task_type: placenav
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 1.6 # NavVerse's own benchmark convention, not habitat's 1.0/0.2/0.4
+  success_reward: 0.0
+  slack_penalty: 0.01
+  collision_penalty: 0.0
+  progress_reward_clip: 0.75
+  minimal_logging: false
+
+rollout:
+  max_steps: 175 # must match sim.max_steps
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  checkpoint: /home/ubuntu/.cache/navverse_huggingface/hub/models--Aasdfip--longnav-objectnav-flow-nopose-cotrain-2p5hz/snapshots/5090ef4c9eeddec1230a5118303fafbdd4353155/adapter
+  load_optim: false
+  load_sched: false
+  action_head_learning_rate: 1e-6 # see hapo.yaml's default (5e-4) footgun note upstream
+  grad_accum_steps: 2 # must equal n_rollout / num_vlms (16 / 4 with navverse_quad)
+  max_grad_norm: 20.0
+  rl_config:
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "navverse_rl"
+  run_name: "navverse_flow_sde_v1" # change per run to avoid local/wandb collisions
+  output_dir: /home/ubuntu/Projects/NavVerse-Benchmark/dump/navverse_flow_rl
+  subset_label: "everything"
+  shard_size: 0

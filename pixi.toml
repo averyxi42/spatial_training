@@ -1,0 +1,38 @@
+[workspace]
+channels = ["conda-forge"]
+name = "longnav_continuous_rl"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[dependencies]
+# Pinned to match the pre-existing `navverse` conda env's Python (3.11.15) exactly, not
+# upstream's 3.10.16 -- Ray requires the SAME Python version (not just the same Ray
+# version) across every conda env one local cluster spans, or worker actors fail to
+# unpickle with `TypeError: code() argument 13 must be str, not int` (a 3.10-vs-3.11
+# `types.CodeType` layout mismatch), confirmed by the first smoke-test attempt.
+python = "3.11.*"
+pip = "*"
+
+[pypi-options]
+extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
+
+[pypi-dependencies]
+# ray's version comes from longnav's own pyproject.toml pin (==2.52.1, matching the
+# pre-existing `navverse` conda env's ray -- see the comment there for why).
+longnav = { path = ".", editable = true, extras = ["vlm"] }
+torch = "==2.8.0"
+torchvision = "*"
+# Pinned to match the `navverse` conda env's numpy (setup.py there pins ==1.26.0) --
+# numpy>=2.0 renamed its internal `numpy.core` module to `numpy._core`, so a numpy array
+# pickled by one version and unpickled by the other fails with
+# `ModuleNotFoundError: No module named 'numpy._core'` the moment a sim actor result
+# crosses the Ray boundary back to this env. Same class of cross-env mismatch as the
+# ray/python pins above.
+numpy = "==1.26.0"
+
+[feature.dev.pypi-dependencies]
+pytest = "*"
+
+[environments]
+default = { features = [], solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }

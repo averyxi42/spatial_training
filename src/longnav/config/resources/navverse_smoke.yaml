@@ -1,0 +1,9 @@
+# @package _global_
+# Single-GPU-pair smoke test: one sim, one VLM worker, before committing a multi-GPU fleet.
+resources:
+  ray_address: local
+  osm_gb: 64
+  num_vlms: 1
+  num_sims: 1
+  vlm_conda_env: null  # driver runs via `pixi run`, not a named conda env; VLM actors inherit that env directly
+  habitat_conda_env: navverse  # the real named conda env IsaacLab/NavVerse is installed in

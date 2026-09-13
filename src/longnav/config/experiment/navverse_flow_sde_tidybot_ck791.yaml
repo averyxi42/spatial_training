@@ -1,0 +1,118 @@
+# @package _global_
+# TidyBot indoor ObjectNav warm start from the published RL checkpoint 791.
+# The adapter's PEFT base is already the merged SFT policy, so do not merge the
+# SFT adapter again. This checkpoint has no optimizer/scheduler/driver state.
+defaults:
+  - override /policy_head@vlm.policy_head: flow_sde_head
+  - override /sim: navverse_batched
+
+vlm:
+  model_id: Aasdfip/longnav-objectnav-flow-nopose-cotrain-2p5hz-merged
+  attn_impl: flash_attention_2
+  save_outputs: true
+  merge_adapter_dir: null
+  base_model_is_reference: true
+  rollout_inference_optimizations: true
+  batch_vision_inference: true
+  policy_head:
+    checkpoint_dir: /home/ubuntu/.cache/navverse_huggingface/hub/models--Aasdfip--longnav-objectnav-flow-nopose-cotrain-2p5hz-rl-a09-held128-ck791/snapshots/cc8c12e47aa033269290c76b9942bd72bc789067
+    gap: 10
+    sde_n: 3
+    sde_noise_a: 0.9
+    sde_position_weight: sigma
+
+sim:
+  slots_per_host: 8
+  episode_folder: /home/ubuntu/Projects/navverse_data/episodes/
+  scene_folder: /home/ubuntu/Projects/navverse_data/
+  episodes_path: /home/ubuntu/Projects/NavVerse-Benchmark/episodes/rl_navverse_indoor_pool192_seed42.txt
+  train_uids: /home/ubuntu/Projects/NavVerse-Benchmark/episodes/rl_navverse_indoor_train128_16x8_seed42.txt
+  excluded_episode_labels: []
+  task_type: objnav
+  robot_name: tidybot
+  tidybot_embodiment: habitat_pe
+  hide_robot_visuals: true
+  on_demand_render: true
+  camera_rgb_only: true
+  policy_camera_only: true
+  gap: 10
+  dt: 0.04
+  max_steps: 175
+  success_distance: 1.6
+  success_reward: 0.0
+  slack_penalty: 0.01
+  collision_penalty: 0.0
+  failure_penalty: 2.5
+  progress_reward_clip: 0.75
+  minimal_logging: false
+  video_tick_stride: 2
+  video_realtime_factor: 1.0
+
+rollout:
+  max_steps: 175
+  episode_soft_timeout_seconds: 600.0
+  episode_hard_timeout_seconds: 900.0
+  sim_restart_limit: 1
+  sim_recycle_every_cycles: 20
+  convo_start_template:
+    - role: user
+      content:
+        - type: text
+          text: "You are a robot navigating an indoor environment toward a goal object.\nGoal: $instr_or_goal\nAt each step you receive the current RGB observation. Produce the next short trajectory of poses to follow, relative to your current pose."
+    - role: user
+      content:
+        - { type: text, text: "Observation 0:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+  convo_turn_template:
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+    - role: user
+      content:
+        - { type: text, text: "Observation $step:" }
+        - { type: image }
+        - { type: text, text: "Action:" }
+    - role: assistant
+      content:
+        - { type: text, text: "**____**" }
+
+training:
+  checkpoint: /home/ubuntu/.cache/navverse_huggingface/hub/models--Aasdfip--longnav-objectnav-flow-nopose-cotrain-2p5hz-rl-a09-held128-ck791/snapshots/cc8c12e47aa033269290c76b9942bd72bc789067/adapter
+  load_optim: false
+  load_sched: false
+  learning_rate: 2.0e-6
+  action_head_learning_rate: 0.0
+  grad_accum_steps: 8
+  max_grad_norm: 20.0
+  peft_config:
+    lora_dropout: 0.05
+  rl_config:
+    n_rollout: 32
+    n_adv: 256
+    entropy_bonus: 0.0
+    n_epoch: 1
+    token_weighted_loss: true
+    bootstrap_truncated: false
+    use_ref: false
+    kl_coeff: 0.0
+    ref_kl: true
+    ref_kl_coeff: 0.001
+
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "navverse_rl"
+    compact_metrics: true
+  run_name: "navverse_tidybot_ck791_indoor128"
+  output_dir: /home/ubuntu/Projects/NavVerse-Benchmark/dump/navverse_flow_rl
+  subset_label: "everything"
+  shard_size: 0
+  eval_every: 20
+  eval_set_size: 64
+  eval_seed: 42
+  eval_uids_file: /home/ubuntu/Projects/NavVerse-Benchmark/episodes/rl_navverse_indoor_eval64_6scene_seed42.txt
+  eval_ode: true
