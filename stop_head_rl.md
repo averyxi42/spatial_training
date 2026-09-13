@@ -300,3 +300,21 @@ B is not suffering C/D-style mass premature stopping: its cycle-8 false stops ar
 decisions, while 32 positive opportunities are missed.  The immediate stop-head question
 for B is therefore recall and sequential decision timing, not a lower global threshold;
 the fixed calibration split remains the only source for any threshold change.
+
+### Action-path semantic diagnostic after C/D
+
+The released C/D GPU pairs ran two no-update, no-W&B full-history shadow traces from c339:
+calibration16 selects a rule and test16 is used once for validation.  Every action recorded
+its decoded path length and online stop target, so this measures the user-proposed signal
+without the confound that an early physical STOP removes its later history.
+
+Small action-path length is not a STOP signal: its AUROC for stop opportunities is 0.4935
+on calibration16 and 0.4588 on test16.  The median first-action path is only 0.00320 m on
+calibration16 and 0.00278 m on test16, which explains why both 0.10 m and 0.01 m actuate
+near the start of an episode.  A calibration-only grid over 9 thresholds, 4 consecutive
+action counts and 4 minimum-history values (144 rules) chose the degenerate 0.0005 m rule
+that never stops (TP-FP = 0); no candidate had positive TP-FP utility, and its one-time
+test16 result also has zero recall.  Do not relaunch C/D as another absolute threshold or
+a simple consecutive-small-action rule.  A viable action-only method would need a learned
+history-conditioned stopping utility, which is functionally a replacement STOP model;
+the current actionable learning comparison remains A versus B.
