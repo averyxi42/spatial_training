@@ -262,3 +262,25 @@ and D reached 0.0938/0.0598.  Thus the current action-path distribution already 
 substantial mass below even 0.01 m, producing premature physical STOP.  This is an
 important negative result for the proposed direct thresholds, but it is not yet an
 early-stop decision: the predeclared gate requires two fixed evaluations beyond cycle 16.
+
+### C/D early-stop conclusion
+
+The two post-cycle-16 fixed evaluations met the early-stop rule for both action-path
+variants, so C and D were deliberately stopped and their GPU pairs released.  This is not
+an infrastructure failure: each run completed forward/backward updates, fixed-eval UID
+coverage, checkpoint writes and W&B synchronization before the decision.
+
+| experiment | eval 24: SR / OSPL | eval 32: SR / OSPL | eval-32 stop rate | eval-32 stop precision |
+| --- | ---: | ---: | ---: | ---: |
+| C, path <= 0.10 m | 0.0625 / 0.0400 | 0.0312 / 0.0250 | 0.9688 | 0.0000 |
+| D, path <= 0.01 m | 0.0625 / 0.0400 | 0.0938 / 0.0623 | 0.9062 | 0.0345 |
+
+The two absolute thresholds therefore fail for the same structural reason: a single
+decoded action can be nearly stationary far from the object, and the absorbing endpoint
+turns that transient into an irreversible false stop.  The post-goal stillness reward
+cannot repair it while most rollouts end in one or two decisions.  C's per-metric best
+snapshots remain at its fixed-eval checkpoints and its rolling latest is
+`.latest_cycle_38`; D's current numbered latest is `checkpoint_39`, with the final
+emergency snapshot `checkpoint_40_crash`.  Both W&B runs are kept, tagged
+`early-stopped`, `negative-result`, and `action-path-stop`, with the reason attached;
+they are retained as meaningful negative evidence rather than deleted as failed garbage.
