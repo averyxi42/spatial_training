@@ -4,9 +4,9 @@
 
 This study uses the fixed HM3D `eval32.txt` split and the existing exploration
 reward.  It runs four independent two-GPU jobs, not one eight-GPU job with four
-interacting policies.  All arms write to `rl_stop_experiments/stop_head_rl_20260913`.
+interacting policies.  All four experiments write to `rl_stop_experiments/stop_head_rl_20260913`.
 The old Ray heads on ports 26380 and 26381 are deliberately left untouched.  The study
-uses one dedicated Ray head on 26410 with custom per-arm resources, so the four two-GPU
+uses one dedicated Ray head on 26410 with custom per-experiment resources, so the four two-GPU
 jobs remain isolated without attempting four incompatible heads on one host.
 
 The common initialization is `hm3d_stop_rl_exploration_v12_shadow_r6/checkpoints/checkpoint_339`.
@@ -42,7 +42,7 @@ sum as `probe/stop_loss`; the generic train loop added all returned values.  Eac
 component was therefore counted twice.  This was corrected so only `probe/stop_loss`
 is optimized; BCE, first-pass and shadow values are logging-only component metrics.
 
-For arms A/B, every 16 train forwards now also log the norm and pairwise cosine of each
+For experiments A/B, every 16 train forwards now also log the norm and pairwise cosine of each
 component's gradient with respect to the shared readout hidden state.  This is a cheap
 conflict diagnostic at the actual history representation.  It is not a claim about
 full-parameter gradient cosine, but a negative cosine here is direct evidence that the
@@ -56,7 +56,7 @@ the decoded controller command, not on the latent SDE chain or a raw tensor norm
 
 During a post-goal tail the environment can award
 `post_goal_stillness_reward * max(0, 1 - path_length / scale)`.  The action transition
-is unmasked only in arms intended to learn that signal.  A trajectory-length STOP calls
+is unmasked only in experiments intended to learn that signal.  A trajectory-length STOP calls
 the same environment `policy_stop` endpoint as the binary head, but its sampled action
 is kept in PPO's response mask: otherwise the action head would have no gradient for
 the stopping decision it made.  Explicit STOP receives +1 inside the success radius and
@@ -65,12 +65,12 @@ ending future progress.
 
 ## Experiment matrix
 
-Each arm: 2 VLM workers + 2 simulators on its own GPU pair, 360 driver cycles
+Each experiment: 2 VLM workers + 2 simulators on its own GPU pair, 360 driver cycles
 (`total_optimization_steps=180`, `grad_accum_steps=4`, `n_rollout=2`), exploration
 reward enabled, reset optimizer, fixed eval32 every eight cycles, checkpoint every 20
 cycles plus rolling latest.
 
-| arm | GPUs | execution | state probe | post-goal action training | purpose |
+| experiment | GPUs | execution | state probe | post-goal action training | purpose |
 | --- | --- | --- | --- | --- | --- |
 | A | 0,1 | oracle-success + shadow | BCE + first-pass + shadow RL | 4 steps, stillness reward | historical control with a direct stationary-chunk reward |
 | B | 2,3 | binary head hard-stop at calibrated 0.47 | BCE + first-pass; no shadow RL | masked | test true deployment semantics for the existing head |
@@ -79,7 +79,7 @@ cycles plus rolling latest.
 
 ## Four no-update diagnostics before the study
 
-No 360-cycle arm starts until these four readings have completed on the frozen c339
+No 360-cycle experiment starts until these four readings have completed on the frozen c339
 checkpoint.  They use one eight-GPU Ray head with four isolated two-GPU custom-resource
 pairs and write under `diagnostics/`.  They are deliberately short: their job is to reject
 a bad intervention, not to substitute for the actual RL experiments.
@@ -99,13 +99,13 @@ a bad intervention, not to substitute for the actual RL experiments.
 4. **Minimal loss ablation reading.** On the exact full-history gradient batches, compare
    the combined gradient implied by BCE+first-pass+shadow, BCE+first-pass, BCE only, and
    BCE+first-pass with the backbone gradient gate set to zero.  This is an objective-surface
-   screen, not a claim of learned performance; the four 360-cycle arms are the learned
+   screen, not a claim of learned performance; the four 360-cycle experiments are the learned
    performance test.
 
 The calibration/test partition is fixed before looking at STOP scores; neither per-test
 result nor the main 32-episode monitoring series is used to change the threshold.
 
-## Monitoring after the four arms start
+## Monitoring after the four experiments start
 
 Hourly checks inspect process liveness, GPU placement, fixed-eval coverage, newest
 checkpoint, train/eval trend, stop precision/recall, path-stop rate, gradient diagnostics,
@@ -132,7 +132,7 @@ of progress.
 - GPU 0–7 were idle at preflight; 433 GB remains on `/mnt/nvme_scratch` and 666 GB on
   `/home/ubuntu/Projects`.
 - Existing Ray heads on 26380/26381 are idle but retained.  The new 26410 head exposes
-  four named VLM/simulator resource pairs, one pair per arm.
+  four named VLM/simulator resource pairs, one pair per experiment.
 - Targeted source/config gate: 27 passed, 2 skipped.  No A–D 360-cycle training process
   has started.
 - The diagnostic trace path now disables MP4 capture explicitly.  It also repaired two
@@ -212,7 +212,7 @@ The diagnostics support the requested matrix without a long preliminary ablation
 as the shadow/stillness control; use B as the direct test of real absorbing binary STOP;
 and keep C/D as action-head STOP alternatives.  Do not interpret the head's good
 full-history AUROC as deployment success: four of 16 held-out episodes still stop early,
-and live episode outcomes—not frame AP—are the authority.  Each arm will retain both its
+and live episode outcomes—not frame AP—are the authority.  Each experiment will retain both its
 metric-best checkpoints and rolling `latest`, with calibration thresholds recorded beside
 future selected checkpoints rather than assumed universally equal to 0.95.
 
@@ -222,7 +222,7 @@ The first four drivers were stopped during bootstrap before any rollout or optim
 although their optimizer/scheduler reset flags were false, the generic launcher also read
 `rl_state.pt` and inherited cycle 340 plus a 256-episode advantage buffer.  That is a
 valid resume behavior but invalid for this independent study.  `resume_driver_state` now
-defaults to true for ordinary resumes and is explicitly false for all stop-study arms;
+defaults to true for ordinary resumes and is explicitly false for all stop-study experiments;
 the relaunch starts at cycle 0 with c339 model/STOP-head weights only.  The relaunch gate
 again passed 27 tests (2 skipped).
 

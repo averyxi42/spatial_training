@@ -1,5 +1,5 @@
 # @package _global_
-# All stop-study arms start from the closest available checkpoint to the fixed-eval
+# All stop-study experiments start from the closest available checkpoint to the fixed-eval
 # exploration peak (cycle 336; checkpoint_339 is three later training cycles).
 defaults:
   - hm3d_stop_rl_exploration

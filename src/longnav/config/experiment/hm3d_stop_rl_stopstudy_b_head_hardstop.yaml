@@ -1,6 +1,6 @@
 # @package _global_
 # B: the binary stop head uses the c339 calibration-only threshold to terminate the real
-# episode.  Shadow REINFORCE is disabled because no shadow action exists in this arm.
+# episode.  Shadow REINFORCE is disabled because no shadow action exists in this experiment.
 defaults:
   - hm3d_stop_rl_stopstudy_common
 
