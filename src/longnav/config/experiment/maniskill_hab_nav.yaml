@@ -1,0 +1,24 @@
+# @package _global_
+# First-pass MS-HAB (Navigate subtask) integration: head-camera-only observation,
+# MS-HAB's native continuous Fetch action space passed through unchanged (see
+# longnav.env.maniskill_hab.ManiskillHabEnvActor). Uses gaussian_head for now;
+# swap to the flowsde head once available -- the action space does not change.
+defaults:
+  - override /policy_head@vlm.policy_head: gaussian_head
+  - override /sim: maniskill_hab
+vlm:
+  policy_head:
+    action_space_dim: 13  # 7 arm + 1 gripper + 3 body[head_pan, head_tilt, torso_lift] + 2 base[fwd_vel, ang_vel]
+sim:
+  mshab_root: /workspace/Projects/Codex_Project/Maniskill_baseline/third_party/maniskill-hab
+resources:
+  osm_gb: 16
+  vlm_conda_env: "longnav_vlm"
+  habitat_conda_env: "mshab"  # reused generically as "sim actor's conda env" by SimWorkerFactory
+  num_sims: 1
+  num_vlms: 1
+task:
+  logger:
+    _target_: longnav.utils.logging_workers.WandbLoggerActor
+    project: "maniskill_hab_dev"
+  run_name: "maniskill_hab_nav_head_only_smoke"

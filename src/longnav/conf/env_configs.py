@@ -52,6 +52,21 @@ class ColorBanditEnvConfig:
 
 
 @dataclass
+class ManiskillHabEnvConfig:
+    _target_: str = "longnav.env.maniskill_hab.ManiskillHabEnvActor"
+    mshab_root: Optional[str] = None  # falls back to env var MSHAB_ROOT
+    ms_asset_dir: Optional[str] = None  # falls back to <mshab_root>/maniskill_data
+    env_id: str = "NavigateSubtaskTrain-v0"
+    task_plan_fp: Optional[str] = None  # falls back to the set_table/navigate/train split
+    spawn_data_fp: Optional[str] = None
+    max_episode_steps: int = 1000
+    sim_backend: str = "gpu"
+    camera: str = "fetch_head"  # head camera only for now; fetch_hand (wrist) is dropped
+    instruction: str = "navigate to the goal"
+    env_kwargs: Optional[Dict[str, Any]] = None
+
+
+@dataclass
 class ReplayEnvConfig:
     _target_: str = "longnav.env.replay.ReplayEnvActor"
     # A scripted sequence of {"rgb": ndarray, "obs": {...}, "reward": float,
@@ -75,6 +90,7 @@ cs.store(name="voxel", group="sim", node=HabitatEnvConfig(
         "done": True,
     }
 ))
+cs.store(name="maniskill_hab", group="sim", node=ManiskillHabEnvConfig())
 cs.store(name="dummy_discrete", group="sim", node=DummyDiscreteEnvConfig())
 cs.store(name="dummy_continuous", group="sim", node=DummyContinuousEnvConfig())
 cs.store(name="color_bandit", group="sim", node=ColorBanditEnvConfig())
