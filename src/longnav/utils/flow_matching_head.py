@@ -992,6 +992,7 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         attention_mask: Optional[torch.Tensor] = None,
         num_turns: Optional[torch.Tensor] = None,
         num_items_in_batch: Optional[Union[int, torch.Tensor]] = None,
+        terminal_zero_mask: Optional[torch.Tensor] = None,
         **backbone_inputs,
     ) -> Dict[str, torch.Tensor]:
         """The flow-matching objective, wrapped in the same modality-injection wiring
@@ -1092,7 +1093,8 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         v_t = self.decoder(ctx_k, x_t, time)                          # (N*K, T, 3)
 
         per_draw = F.mse_loss(v_t, u_t, reduction="none").flatten(1).mean(dim=1)
-        per_turn = per_draw.view(N, K).mean(dim=1)                    # average over K
+        flow_per_turn = per_draw.view(N, K).mean(dim=1)               # average over K
+        per_turn = flow_per_turn
         # ---- the mode-seeking ratio. Two draws from the PRIOR (not the posterior -- the
         # prior is what RL samples from), decoded under the SAME base noise so the numerator
         # isolates dA/dc rather than picking up the flow's own stochasticity. Pinning here is
@@ -1185,7 +1187,9 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
             loss = loss + touch
 
         with torch.no_grad():
-            metrics = self._generation_metrics(metrics_ctx, gt_diffs, targets)
+            metrics = self._generation_metrics(
+                metrics_ctx, gt_diffs, targets, terminal_zero_mask, flow_per_turn
+            )
             if kl is not None:
                 metrics.update({k: v.detach() for k, v in latent_metrics.items()})
                 if aux is not None:
@@ -1210,7 +1214,14 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         return {"loss": loss, **metrics}
 
     @torch.no_grad()
-    def _generation_metrics(self, context, gt_diffs, targets) -> Dict[str, torch.Tensor]:
+    def _generation_metrics(
+        self,
+        context,
+        gt_diffs,
+        targets,
+        terminal_zero_mask: Optional[torch.Tensor] = None,
+        flow_per_turn: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """Everything the trainer logs, computed from ONE actual ODE integration.
 
         Unlike the AR head there is no cheap teacher-forced table to report every step and an
@@ -1270,7 +1281,7 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
         both = active[:, :-1] & active[:, 1:]
         flips = ((torch.sign(dth[:, :-1]) * torch.sign(dth[:, 1:])) < 0) & both
 
-        return {
+        metrics = {
             "sum_sq_err": err.pow(2).sum(0).float(),
             "sum_abs_err": err.abs().sum(0).float(),
             "n_rows": torch.tensor(diffs.shape[0] * diffs.shape[1], device=dev),
@@ -1283,6 +1294,28 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
             "sum_flips": flips.double().sum().float(),
             "n_flip_pairs": both.double().sum().float(),
         }
+        if terminal_zero_mask is not None:
+            mask = terminal_zero_mask.reshape(-1).to(device=dev, dtype=torch.bool)
+            if mask.shape[0] != diffs.shape[0]:
+                raise RuntimeError(
+                    f"terminal-zero mask has {mask.shape[0]} turns, expected {diffs.shape[0]}"
+                )
+            zero_diffs = diffs[mask]
+            metrics["terminal_zero_turns"] = torch.tensor(
+                float(zero_diffs.shape[0]), device=dev
+            )
+            metrics["terminal_zero_action_mse_sum"] = (
+                zero_diffs.pow(2).flatten(1).mean(dim=1).sum().float()
+            )
+            metrics["terminal_zero_xy_path_sum"] = (
+                zero_diffs[..., :2].norm(dim=-1).sum(dim=1).sum().float()
+            )
+            metrics["terminal_zero_yaw_path_sum"] = (
+                zero_diffs[..., 2].abs().sum(dim=1).sum().float()
+            )
+            if flow_per_turn is not None:
+                metrics["terminal_zero_flow_loss_sum"] = flow_per_turn[mask].sum().float()
+        return metrics
 
     # -- warm starting the encoders, and nothing else ------------------------------------
     def init_modality_from(self, checkpoint_dir: Union[str, Path]) -> List[str]:
@@ -1394,6 +1427,17 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
             latent_cfg=latent_cfg,
         )
         model.train_content_len = meta.get("train_content_len")
+        if device:
+            # RL evaluation merges the SFT adapter after moving the bf16 base to its GPU.
+            # Preserve that arithmetic before attaching the unmerged RL adapter.
+            model.to(device)
+        sft_adapter_dir = checkpoint_dir / "sft_adapter"
+        if sft_adapter_dir.exists():
+            from peft import PeftModel
+
+            model.backbone = PeftModel.from_pretrained(
+                model.backbone, str(sft_adapter_dir)
+            ).merge_and_unload()
         adapter_dir = checkpoint_dir / ADAPTER_SUBDIR
         if adapter_dir.exists():
             from peft import PeftModel
@@ -1404,8 +1448,6 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
             # no specs declared.
             model.attach_modality_hooks()
         model.load_trainable(checkpoint_dir, adapter=False)
-        if device:
-            model.to(device)
         return model.eval()
 
 
@@ -1413,7 +1455,10 @@ class TurnFlowActionRegressor(TurnVectorRegressor):
 # Trainer: the same band-statistic bookkeeping pattern, minus the free-running family
 # ======================================================================================
 FLOW_METRIC_KEYS = ("sum_stop_pred", "sum_stop_gt", "sum_creep_pred", "sum_creep_gt",
-                    "sum_pose_sq_err", "sum_pose_abs_err", "sum_flips", "n_flip_pairs")
+                    "sum_pose_sq_err", "sum_pose_abs_err", "sum_flips", "n_flip_pairs",
+                    "terminal_zero_turns", "terminal_zero_action_mse_sum",
+                    "terminal_zero_xy_path_sum", "terminal_zero_yaw_path_sum",
+                    "terminal_zero_flow_loss_sum")
 
 #: The CVAE diagnostics, drained the same way and absent unless a latent is installed. Named
 #: separately so a reader can see at a glance which keys exist only in a latent run.
@@ -1502,4 +1547,16 @@ class FlowMatchingSFTTrainer(TurnVectorSFTTrainer):
 
         if "n_flip_pairs" in sums and float(sums["n_flip_pairs"]) > 0:
             out[f"{prefix}rotation_flip"] = float(sums["sum_flips"] / sums["n_flip_pairs"])
+        zero_turns = sums.get("terminal_zero_turns")
+        if zero_turns is not None and float(zero_turns) > 0:
+            denom = zero_turns.clamp(min=1)
+            for key, name in (
+                ("terminal_zero_flow_loss_sum", "terminal_zero_flow_loss"),
+                ("terminal_zero_action_mse_sum", "terminal_zero_action_mse"),
+                ("terminal_zero_xy_path_sum", "terminal_zero_xy_path_m"),
+                ("terminal_zero_yaw_path_sum", "terminal_zero_yaw_path_rad"),
+            ):
+                if key in sums:
+                    out[f"{prefix}{name}"] = float(sums[key] / denom)
+            out[f"{prefix}terminal_zero_turns"] = float(zero_turns)
         return out

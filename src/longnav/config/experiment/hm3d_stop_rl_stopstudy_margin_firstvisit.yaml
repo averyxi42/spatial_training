@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - hm3d_stop_rl_stopstudy_margin_all
+
+training:
+  rl_config:
+    state_probe_threshold_margin_mode: first_visit
+
+task:
+  run_name: hm3d_stopstudy_margin_firstvisit
+  logger:
+    group: hm3dpe_stopmargin_50gate_r1

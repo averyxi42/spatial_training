@@ -57,6 +57,9 @@ class ContinuousObjectNavEnvConfig:
 
     _target_: str = "longnav.env.objectnav_continuous.ContinuousObjectNavEnvActor"
     episodes: str = "/Projects/spatial_training/data/datasets/objectnav/hm3d/v1/val"
+    # Optional source used only for explicitly assigned eval shards.  This keeps the
+    # training split fixed while allowing a benchmark-derived validation set.
+    eval_episodes: Optional[str] = None
     scene_root: Optional[str] = "/Projects/spatial_training/data/scene_datasets"
     episode_source: str = "objectnav"
     gap: int = 10
@@ -76,25 +79,30 @@ class ContinuousObjectNavEnvConfig:
     # count -- the robot is always touching the floor.
     slack_penalty: float = 0.0
     collision_penalty: float = 0.0
+    # Cost per metre actually travelled by the physical controller.  This is
+    # independent of the predicted action chunk and is disabled by default.
+    path_length_penalty: float = 0.0
     # Clip on the per-step progress REWARD (never the metrics): navmesh snap of a physical
     # robot occasionally relocates across a wall/floor, injecting multi-metre single-step
     # geodesic jumps (measured 0.16% of steps, max 6.7 m). No physical step moves the
     # geodesic more than the path driven in gap*dt (~0.6 m), so beyond this is artifact.
     # 0 disables.
     progress_reward_clip: float = 0.75
-    # Terminal bonus added to the reached step's reward (discrete-standard success term).
-    # 0 keeps the progress-only shape every run before 2026-08-21 used.
+    # Bonus attached only to a correct explicit policy STOP.
     success_reward: float = 0.0
-    # Extra decisions after first success are normally supervised only by the stop head.
-    post_goal_steps: int = 0
-    # Optional smooth reward for a stationary decoded chunk while in the post-goal tail.
-    # It is disabled by default and paired with rollout.learn_post_goal_actions.
-    post_goal_stillness_reward: float = 0.0
-    post_goal_stillness_scale_m: float = 0.1
     # Rewards attached to an explicit policy STOP.  They are disabled by default so
     # legacy binary-head rollouts preserve their return exactly.
     policy_stop_correct_reward: float = 0.0
     policy_stop_false_penalty: float = 0.0
+    timeout_penalty: float = 0.0
+    # One-time bonus when a rollout first enters the success region.  This is
+    # diagnostic/reward shaping only; entering never stops the episode.
+    first_reach_reward: float = 0.0
+    # Zero samples at chunk boundaries; one matches PE evaluation at every physics tick.
+    metric_evaluate_every: int = 0
+    credit_state_telemetry: bool = False
+    success_continue_penalty: float = 0.0
+    exploration_reward_cap: float = 0.0
     # Subtracted from the escaped terminal step's reward. Unpenalized escapes end the
     # episode keeping all accumulated progress -- a free exit the policy drifts toward
     # (measured: escape rate doubled over the sd04_noterm run). 0 keeps the old shape.

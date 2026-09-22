@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - hm3d_stop_rl_stopstudy_b1_v2
+
+training:
+  freeze_backbone: true
+  rl_config:
+    n_rollout: 4
+
+task:
+  run_name: hm3d_stopstudy_b3_freeze
+  logger:
+    group: hm3dpe_b3b4_300_r1

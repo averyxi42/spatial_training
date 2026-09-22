@@ -4,14 +4,9 @@
 defaults:
   - hm3d_stop_rl_stopstudy_common
 
-sim:
-  post_goal_stillness_reward: 0.5
-  post_goal_stillness_scale_m: 0.15
-
 rollout:
   stop_execution_mode: shadow
   stop_prob_threshold: null
-  learn_post_goal_actions: true
 
 training:
   rl_config:

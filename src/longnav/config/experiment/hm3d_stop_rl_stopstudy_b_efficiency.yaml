@@ -1,0 +1,17 @@
+# @package _global_
+defaults:
+  - hm3d_stop_rl_stopstudy_b_head_hardstop
+
+# A simple, dense efficiency objective: clipped geodesic progress and exploration
+# remain positive, while every policy chunk and collision carry a direct cost.
+sim:
+  slack_penalty: 0.01
+  collision_penalty: 0.05
+
+rollout:
+  categorical_stop_action_consistency_penalty: 0.25
+  categorical_stop_action_consistency_translation_m: 0.1
+  categorical_stop_action_consistency_yaw_rad: 0.1
+
+task:
+  run_name: hm3d_stopstudy_b_efficiency_sft_r1

@@ -49,6 +49,7 @@ def main(cfg: RLConfig):
         run_training_epochs,
         stream_results_and_log,
         maybe_checkpoint,
+        load_rl_state,
     )
     from verl.trainer.ppo.core_algos import get_adv_estimator_fn
 
@@ -88,7 +89,22 @@ def main(cfg: RLConfig):
     logger = ctx.logger
     num_rollouts = ctx.num_rollouts
 
-    trajectory_list = []
+    if bootstrapper.typed_cfg.training.resume_driver_state:
+        start_cycle, trajectory_list = load_rl_state(
+            bootstrapper.typed_cfg.training.checkpoint
+        )
+    else:
+        start_cycle, trajectory_list = 0, []
+        logger.info("starting fresh driver state from checkpoint weights")
+    resume_cycle = bootstrapper.typed_cfg.training.resume_cycle
+    if resume_cycle is not None:
+        if resume_cycle < 0:
+            raise ValueError("training.resume_cycle must be non-negative")
+        start_cycle = int(resume_cycle)
+        if not trajectory_list:
+            logger.info(
+                "resuming global cycle from explicit override without an advantage buffer"
+            )
 
     def cleanup():
         for trainer in trainers:
@@ -123,7 +139,7 @@ def main(cfg: RLConfig):
             pickle.dump(obj,f)
 
     try:
-        for global_cycle in range(num_rollouts):
+        for global_cycle in range(start_cycle, num_rollouts):
             if FREEZE_DATA:
                 # reset the dataset
                 shard_iter = get_shard_iterator(
@@ -196,6 +212,7 @@ def main(cfg: RLConfig):
                 bootstrapper.typed_cfg.training.save_step,
                 bootstrapper.typed_cfg.task.output_dir,
                 bootstrapper.typed_cfg.task.run_name,
+                trajectory_list=trajectory_list,
             )
 
             del model_inputs

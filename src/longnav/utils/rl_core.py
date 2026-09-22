@@ -393,6 +393,90 @@ def compute_gae_config_advantage(
     return advantages, returns
 
 
+def compute_navigation_metric_advantages(batch, mode):
+    """Assign physical outcome credit with an episode-weighted leave-one-out baseline."""
+    if mode in {"separate_future", "shared_future",
+                "separate_stop_baseline", "shared_stop_baseline"}:
+        return compute_navigation_future_advantages(batch, mode)
+    if mode not in {"shared_metrics", "separate_metrics"}:
+        raise ValueError(f"Unknown navigation credit mode: {mode}")
+    mask = batch["response_mask"].bool()
+    lengths = mask.sum(-1).long()
+    if len(lengths) < 2 or bool((lengths == 0).any()):
+        raise ValueError("Metric credit requires at least two nonempty episodes")
+    indexes = torch.arange(len(lengths), device=mask.device)
+
+    def terminal(key):
+        return batch[key][indexes, lengths - 1].float()
+
+    success = terminal("success")
+    sampled_stop = terminal("categorical_stop_action") == 1
+    strict_success = success * sampled_stop
+    spl = terminal("spl_fix") * strict_success
+    reached = terminal("oracle_reached")
+    ospl = terminal("oracle_spl") * reached
+    for value in (success, spl, reached, ospl):
+        if not bool(torch.isfinite(value).all()) or bool(((value < 0) | (value > 1)).any()):
+            raise ValueError("Physical success/SPL metrics must be finite in [0,1]")
+    stop_score = 3.0 * strict_success + spl
+    motion_score = 3.0 * reached + ospl
+    scale = 4.0
+    if mode == "shared_metrics":
+        motion_score = stop_score = motion_score + stop_score
+        scale = 8.0
+
+    def credit(score):
+        baseline = (score.sum() - score) / (len(score) - 1)
+        advantage = (score - baseline) / scale
+        return advantage[:, None] * mask, score[:, None] * mask, baseline[:, None] * mask
+
+    motion_advantage, motion_return, motion_baseline = credit(motion_score)
+    stop_advantage, stop_return, _ = credit(stop_score)
+    return motion_advantage, stop_advantage, motion_return, stop_return, motion_baseline
+
+
+def compute_navigation_future_advantages(batch, mode):
+    """Exclude navigation utility already earned before the current action."""
+    shared = mode.startswith("shared_")
+    mask = batch["response_mask"].bool()
+    terminal_mode = "shared_metrics" if shared else "separate_metrics"
+    motion_adv, stop_adv, motion_return, stop_return, baseline = (
+        compute_navigation_metric_advantages(batch, terminal_mode)
+    )
+    before_reach = batch["oracle_reached_before"].float()
+    before_ospl = batch["oracle_spl_before"].float()
+    for values in (before_reach, before_ospl):
+        valid = values[mask]
+        if not bool(torch.isfinite(valid).all()) or bool(((valid < 0) | (valid > 1)).any()):
+            raise ValueError("Pre-action navigation metrics must be finite in [0,1]")
+    past_navigation = (3.0 * before_reach + before_ospl) * mask
+    lengths = mask.sum(-1).long()
+    indexes = torch.arange(len(lengths), device=mask.device)
+    final_navigation = (3.0 * batch["oracle_reached"][indexes, lengths - 1].float()
+                        + batch["oracle_spl"][indexes, lengths - 1].float())
+    if bool(((final_navigation[:, None] - past_navigation)[mask] < -1e-6).any()):
+        raise ValueError("Navigation utility decreased after its first-reach latch")
+    scale = 8.0 if shared else 4.0
+    motion_return = motion_return - past_navigation
+    motion_adv = motion_adv - past_navigation / scale
+    # Once the goal was already reached, future movement cannot improve navigation.
+    motion_adv = motion_adv * (before_reach == 0)
+
+    # STOP compares this rollout's physical terminal score with executing STOP now.
+    strict = (batch["success"][indexes, lengths - 1].float()
+              * (batch["categorical_stop_action"][indexes, lengths - 1] == 1))
+    terminal_stop = 3.0 * strict + batch["spl_fix"][indexes, lengths - 1].float() * strict
+    stop_return = terminal_stop[:, None] * mask
+    stop_now = 3.0 * batch["stop_now_success"].float() + batch["stop_now_spl"].float()
+    valid = stop_now[mask]
+    if not bool(torch.isfinite(valid).all()) or bool(((valid < 0) | (valid > 4)).any()):
+        raise ValueError("Immediate STOP score must be finite in [0,4]")
+    if bool(((stop_now - batch["stop_now_utility"].float()).abs()[mask] > 1e-6).any()):
+        raise ValueError("Immediate STOP score disagrees with its physical metrics")
+    stop_adv = (stop_return - stop_now) * mask / scale
+    return motion_adv, stop_adv, motion_return, stop_return, baseline
+
+
 @register_adv_est("reinforce_plus_plus_time_kernel")
 def compute_reinforce_plus_plus_time_kernel_advantage(
     token_level_rewards: torch.Tensor, 

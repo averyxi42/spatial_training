@@ -8,7 +8,6 @@ defaults:
 rollout:
   stop_execution_mode: physical
   stop_prob_threshold: 0.95
-  learn_post_goal_actions: false
 
 training:
   rl_config:

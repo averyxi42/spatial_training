@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - hm3d_stop_rl_stopstudy_c1_v2
+
+sim:
+  success_continue_penalty: 0.05
+
+task:
+  run_name: hm3d_stopstudy_c2_v2

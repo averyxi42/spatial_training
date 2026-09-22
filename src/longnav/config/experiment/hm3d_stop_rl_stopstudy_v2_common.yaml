@@ -1,0 +1,58 @@
+# @package _global_
+# Formal B/C stop study: all terminal rewards correspond to explicit policy STOP only.
+defaults:
+  - hm3d_stop_rl_exploration
+
+sim:
+  max_steps: 500
+  minimal_logging: true
+  slack_penalty: 0.02
+  collision_penalty: 0.05
+  progress_reward_clip: 0.75
+  policy_stop_correct_reward: 3.0
+  policy_stop_false_penalty: 3.0
+  timeout_penalty: 3.0
+  success_continue_penalty: 0.0
+  exploration_reward_cap: 0.5
+
+rollout:
+  max_steps: ${sim.max_steps}
+  ode_episode_seed: 42
+  stop_shadow_correct_reward: 0.0
+  stop_shadow_false_penalty: 0.0
+  stop_shadow_miss_penalty: 0.0
+
+training:
+  checkpoint: null
+  load_optim: false
+  load_sched: false
+  resume_driver_state: false
+  learning_rate: 5.0e-7
+  max_grad_norm: 10.0
+  total_optimization_steps: 500
+  warmup_steps: 20
+  save_step: 20
+  rl_config:
+    advantage_estimator: reinforce_plus_plus_time_kernel
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.28
+    policy_loss:
+      name: clip_cov
+      clip_cov_ratio: 0.0002
+      clip_cov_ub: 5.0
+      clip_cov_lb: 1.0
+    time_kernel_sigma: 40.0
+    ref_kl_coeff: 0.001
+    max_ref_log_ratio_p95: 8.0
+    n_rollout: 2
+    n_adv: 32
+    n_epoch: 1
+    bootstrap_truncated: false
+    state_probe_shadow_rl_weight: 0.0
+    state_probe_firstpass_weight: 0.0
+
+task:
+  output_dir: /home/ubuntu/storage-migrations/20260906-longnav/v12-regeneration/production/rl_stop_experiments/stop_head_rl_20260913
+  eval_every: 0
+  eval_set_size: 32
+  save_eval_bests: false

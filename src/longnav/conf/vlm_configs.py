@@ -102,6 +102,7 @@ class FlowSDEHeadConfig:
     type: str = "continuous"
     # The SFT checkpoint carrying the readout MLP and the velocity field. No default.
     checkpoint_dir: Optional[str] = None
+    readout_dtype: Optional[str] = None
     # Ticks executed per policy step; the chunk tail is discarded as everywhere else.
     gap: int = 10
     # Stochastic denoising steps per chunk, of the checkpoint's K (=num_inference_steps).

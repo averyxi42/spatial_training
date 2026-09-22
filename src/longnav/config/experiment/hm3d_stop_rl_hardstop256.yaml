@@ -1,0 +1,67 @@
+# @package _global_
+defaults:
+  - hm3d_stop_rl_stopstudy_v2_common
+
+vlm:
+  merge_adapter_dir: ${oc.env:LONGNAV_SFT_CHECKPOINT}/adapter
+  policy_head:
+    checkpoint_dir: ${oc.env:LONGNAV_SFT_CHECKPOINT}
+    readout_dtype: float32
+    sde_seed: 42
+
+sim:
+  episodes: ${oc.env:LONGNAV_TRAIN_EPISODES}
+  eval_episodes: ${oc.env:LONGNAV_TRAIN_EPISODES}
+  scene_root: ${oc.env:LONGNAV_SCENE_ROOT}
+  train_uids: ${oc.env:LONGNAV_SPLITS}/train256.txt
+  exclude_categories: []
+  seed: 42
+  slack_penalty: 0.01
+  path_length_penalty: 0.025
+  first_reach_reward: 1.0
+
+rollout:
+  stop_execution_mode: physical
+  stop_prob_threshold: 0.95
+
+training:
+  freeze_backbone: true
+  learning_rate: 0.0
+  action_head_learning_rate: 0.0
+  action_readout_only: true
+  state_probe_learning_rate: 1.0e-4
+  state_probe_weight_decay: 0.0
+  weight_decay: 0.0
+  separate_gradient_clipping: true
+  diagnostic_history_dir: ${oc.env:LONGNAV_RUN}/diagnostics/${task.run_name}
+  max_grad_norm: 1.0
+  grad_accum_steps: 4
+  total_optimization_steps: 1000
+  warmup_steps: 10
+  save_step: 50
+  rl_config:
+    value_head: null
+    state_probe_trainable: true
+    state_probe_stop_threshold: ${rollout.stop_prob_threshold}
+    state_probe_bce_threshold: ${rollout.stop_prob_threshold}
+    state_probe_balanced_bce: true
+    state_probe_firstpass_weight: 0.0
+    state_probe_shadow_rl_weight: 0.0
+    state_probe_threshold_margin_weight: 0.0
+    gamma: 0.995
+    ref_kl_coeff: 0.01
+    max_ref_log_ratio_p95: null
+    n_rollout: 8
+    n_adv: 128
+    n_epoch: 1
+
+task:
+  output_dir: ${oc.env:LONGNAV_RUN}/training
+  run_name: hardstop256
+  eval_uids_file: ${oc.env:LONGNAV_SPLITS}/dev128.txt
+  eval_every: 0
+  eval_set_size: 128
+  save_eval_bests: false
+  max_train_cycles: 100
+  logger:
+    group: hm3dpe_hardstop_256_r1

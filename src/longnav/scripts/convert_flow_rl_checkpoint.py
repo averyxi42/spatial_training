@@ -1,4 +1,4 @@
-"""Convert an RL flow-SDE checkpoint back to the SFT/harness layout.
+"""Export an RL flow-SDE checkpoint as a canonical fresh-reload bundle.
 
 The RL trainer saves one peft adapter dir (``save_checkpoint_unsafe``): 392 backbone LoRA
 tensors plus the whole ``FlowSDEHead`` flattened under
@@ -20,9 +20,12 @@ Usage:
         --sft-checkpoint dump/pose_injection/run_cotrain_v3_nopose_mix/checkpoint-12000 \
         --out dump/flow_rl/<run>/checkpoints/checkpoint_15_harness
 
-Verify with tests/parity_rollout_paths.py-style h parity before trusting an eval number.
+The bundle deliberately keeps the frozen SFT adapter separate.  The rollout loader
+moves the bf16 base model to its target GPU before merging that adapter, matching
+the RL evaluator's arithmetic.  Do not pre-merge it during export.
 """
 import argparse
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -59,7 +62,7 @@ def convert(rl_checkpoint: Path, sft_checkpoint: Path, out: Path) -> None:
         blob[blob_key] = state
     torch.save(blob, out / "turn_vector_head.pt")
 
-    # --- adapter dir: SFT config (no modules_to_save), RL LoRA tensors, names as-is ----
+    # --- adapter dirs: native eval merges SFT before applying the RL LoRA --------------
     sft_lora = load_file(str(sft_checkpoint / "adapter" / "adapter_model.safetensors"))
     lora = {k: v for k, v in rl_weights.items() if ".lora_" in k}
     if set(lora) != set(sft_lora):
@@ -70,6 +73,7 @@ def convert(rl_checkpoint: Path, sft_checkpoint: Path, out: Path) -> None:
     save_file(lora, str(out / "adapter" / "adapter_model.safetensors"))
     shutil.copy2(sft_checkpoint / "adapter" / "adapter_config.json",
                  out / "adapter" / "adapter_config.json")
+    shutil.copytree(sft_checkpoint / "adapter", out / "sft_adapter")
 
     # --- config + processor files ------------------------------------------------------
     shutil.copy2(sft_checkpoint / "turn_vector_head_config.json",
@@ -79,12 +83,32 @@ def convert(rl_checkpoint: Path, sft_checkpoint: Path, out: Path) -> None:
         if src.exists():
             shutil.copy2(src, out / name)
 
+    # RL checkpoints train this head under a distinct resume-only filename;
+    # the external rollout harness expects the SFT layout filename.
+    state_probe = rl_checkpoint / "state_probe_rl.pt"
+    if not state_probe.exists():
+        state_probe = sft_checkpoint / "state_probe.pt"
+    if state_probe.exists():
+        shutil.copy2(state_probe, out / "state_probe.pt")
+        shutil.copy2(sft_checkpoint / "state_probe_config.json",
+                     out / "state_probe_config.json")
+
     manifest = {
+        "bundle_format": "longnav.flow_rl.fresh_reload.v1",
         "converted_from": str(rl_checkpoint),
         "sft_layout_source": str(sft_checkpoint),
         "lora_tensors": len(lora),
         "head_tensors": len(blob["head"]),
         "normalizer_tensors": len(blob["normalizer"]),
+        "state_probe_source": str(state_probe) if state_probe.exists() else None,
+        "sft_adapter_source": str(sft_checkpoint / "adapter"),
+        "sft_adapter_sha256": hashlib.sha256(
+            (out / "sft_adapter" / "adapter_model.safetensors").read_bytes()
+        ).hexdigest(),
+        "rl_adapter_sha256": hashlib.sha256(
+            (out / "adapter" / "adapter_model.safetensors").read_bytes()
+        ).hexdigest(),
+        "sft_adapter_merge": "target_gpu_at_load",
     }
     (out / "conversion_manifest.json").write_text(json.dumps(manifest, indent=2))
     print(json.dumps(manifest, indent=2))

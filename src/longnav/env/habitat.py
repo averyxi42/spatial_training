@@ -1296,4 +1296,3 @@ class HabitatEnvActor(LoggingHabitatWorker):
         else:
             patch_coords = state_dict['obs'].pop('patch_coords')
             return rgb, patch_coords,state_dict
-

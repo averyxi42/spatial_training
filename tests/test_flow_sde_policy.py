@@ -56,6 +56,17 @@ def _sample(head):
     return h, chain, pos, lp, chunk
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device move")
+def test_seeded_cpu_head_can_move_to_cuda_before_sampling():
+    head = _head(seed=42).to("cuda")
+    context = np.zeros(DIM, dtype=np.float32)
+    first = head.sample_chain_np(context)
+    head.seed(42)
+    second = head.sample_chain_np(context)
+    assert head._gen.device.type == "cuda"
+    assert all(np.array_equal(left, right) for left, right in zip(first, second))
+
+
 # --------------------------------------------------------------------------------------
 # 1. The ratio
 # --------------------------------------------------------------------------------------

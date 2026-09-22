@@ -43,9 +43,19 @@ class ContinuousObjectNavEnvActor:
     `is_exhausted` / `info` keys `rollout_core` consumes.
     """
 
+    def worker_placement(self) -> Dict[str, Any]:
+        import ray
+
+        return {
+            "pid": os.getpid(),
+            "ray_gpu_ids": ray.get_gpu_ids(),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        }
+
     def __init__(
         self,
         episodes: str,
+        eval_episodes: Optional[str] = None,
         scene_root: Optional[str] = None,
         gap: int = 10,
         dt: float = 0.04,
@@ -61,13 +71,15 @@ class ContinuousObjectNavEnvActor:
         source_kwargs: Optional[Dict[str, Any]] = None,
         slack_penalty: float = 0.0,
         collision_penalty: float = 0.0,
+        path_length_penalty: float = 0.0,
         progress_reward_clip: float = 0.75,
         success_reward: float = 0.0,
-        post_goal_steps: int = 0,
-        post_goal_stillness_reward: float = 0.0,
-        post_goal_stillness_scale_m: float = 0.1,
         policy_stop_correct_reward: float = 0.0,
         policy_stop_false_penalty: float = 0.0,
+        timeout_penalty: float = 0.0,
+        first_reach_reward: float = 0.0,
+        success_continue_penalty: float = 0.0,
+        exploration_reward_cap: float = 0.0,
         escape_penalty: float = 0.0,
         reward_lost_steps: int = 25,
         exclude_categories: Optional[Sequence[str]] = None,
@@ -90,6 +102,9 @@ class ContinuousObjectNavEnvActor:
         **kwargs: Any,
     ):
         self.episodes_path = episodes
+        # Training keeps its own source; fixed external-validation UIDs may belong to a
+        # different split with a different occurrence numbering.
+        self.eval_episodes_path = eval_episodes
         self.scene_root = scene_root
         self.gap, self.dt = int(gap), float(dt)
         self.max_steps = int(max_steps)
@@ -101,6 +116,7 @@ class ContinuousObjectNavEnvActor:
         self.source_kwargs = dict(source_kwargs or {})
         self.slack_penalty = float(slack_penalty)
         self.collision_penalty = float(collision_penalty)
+        self.path_length_penalty = float(path_length_penalty)
         # Physical-consistency bound on the progress REWARD (metrics are untouched). The
         # geodesic is queried from a navmesh snap of a physically simulated robot, and the
         # snap occasionally relocates across a wall or floor: measured over 506 episodes
@@ -110,18 +126,19 @@ class ContinuousObjectNavEnvActor:
         # driven in gap*dt seconds (~<=0.6 m), so anything beyond the clip is a
         # measurement artifact, not motion. 0 disables.
         self.progress_reward_clip = float(progress_reward_clip)
-        # Terminal bonus on the reached step (the discrete standard's success term). At a
-        # tight success_distance the progress reward alone barely distinguishes "arrived"
-        # from "hovered nearby" -- the last 0.2 m pays ~0.2 -- so precision termination
-        # needs its own signal. 0 (default) is the pre-existing progress-only shape.
+        # Reward an explicit policy STOP inside the success region.  Reaching that region
+        # never terminates an episode or awards success by itself.
         self.success_reward = float(success_reward)
-        self.post_goal_steps = max(0, int(post_goal_steps))
-        self.post_goal_stillness_reward = float(post_goal_stillness_reward)
-        self.post_goal_stillness_scale_m = float(post_goal_stillness_scale_m)
-        if self.post_goal_stillness_reward and self.post_goal_stillness_scale_m <= 0.0:
-            raise ValueError("post_goal_stillness_scale_m must be positive when rewarded")
         self.policy_stop_correct_reward = float(policy_stop_correct_reward)
         self.policy_stop_false_penalty = float(policy_stop_false_penalty)
+        self.timeout_penalty = float(timeout_penalty)
+        self.first_reach_reward = float(first_reach_reward)
+        self.metric_evaluate_every = int(kwargs.get("metric_evaluate_every", 0))
+        self.credit_state_telemetry = bool(kwargs.get("credit_state_telemetry", False))
+        if self.metric_evaluate_every < 0:
+            raise ValueError("metric_evaluate_every must be nonnegative")
+        self.success_continue_penalty = float(success_continue_penalty)
+        self.exploration_reward_cap = float(exploration_reward_cap)
         # Penalty on the escaped terminal step. "Escaped" is the PHYSICAL fall detector
         # from SFT data collection (continuous_demos.drive_failure: joint_z free-fall
         # sustained fall_duration_s), never the geodesic -- under the earlier
@@ -268,21 +285,6 @@ class ContinuousObjectNavEnvActor:
         """Enable MP4 capture only for the caller's current evaluation pass."""
         self.minimal_logging = not bool(enabled)
 
-    def _advance_post_goal(self, reached: bool) -> tuple[bool, bool, bool]:
-        """Advance the post-arrival collection window without changing success state."""
-        was_active = bool(self._goal_reached_once and self._post_goal_remaining > 0)
-        just_reached = bool(reached and not self._goal_reached_once)
-        if just_reached:
-            self._goal_reached_once = True
-            self._post_goal_remaining = self.post_goal_steps
-        elif was_active:
-            self._post_goal_remaining -= 1
-        complete = bool(
-            self._goal_reached_once and not just_reached and was_active
-            and self._post_goal_remaining == 0
-        )
-        return just_reached, was_active, complete
-
     @staticmethod
     def _chunk_path_length_m(chunk: np.ndarray) -> float:
         """Length of the decoded cumulative SE(2) chunk, anchored at the robot."""
@@ -318,7 +320,6 @@ class ContinuousObjectNavEnvActor:
                                 f"{ep_label}.{os.getpid()}@{_time.time():.0f}")
         os.makedirs(save_dir, exist_ok=True)
 
-        n = max(len(rewards), 1)
         episode_logs: Dict[str, Any] = {
             "episode_label": ep_label, "scene_id": first.get("scene_id"),
             "goal": self._episode.object_category if self._episode else None,
@@ -331,6 +332,8 @@ class ContinuousObjectNavEnvActor:
             "min_m": last.get("min_m"), "start_m": last.get("start_m"),
             "path_length_m": last.get("path_length_m"),
             "escaped": int(bool(last.get("escaped", False))),
+            "termination_reason": last.get("termination_reason"),
+            "truncated": int(bool(last.get("truncated", False))),
             "mean_reward": float(np.mean(rewards)) if rewards else 0.0,
             "collision_rate": float(np.mean([bool(i.get("collided")) for i in infos])),
             "worker_pid": os.getpid(), "timestamp": _time.time(),
@@ -346,9 +349,12 @@ class ContinuousObjectNavEnvActor:
             "reward": rewards,
         }
         def _ser(o):
-            if isinstance(o, np.integer): return int(o)
-            if isinstance(o, np.floating): return float(o)
-            if isinstance(o, np.ndarray): return o.tolist()
+            if isinstance(o, np.integer):
+                return int(o)
+            if isinstance(o, np.floating):
+                return float(o)
+            if isinstance(o, np.ndarray):
+                return o.tolist()
             return str(o)
         with open(os.path.join(save_dir, "sequence.json"), "w") as f:
             _json.dump(seq, f, default=_ser)
@@ -385,13 +391,13 @@ class ContinuousObjectNavEnvActor:
         return buf.getvalue()
 
     def _video_on_tick(self, record) -> None:
-        """Executor tick hook: capture every `video_tick_stride`-th physics tick.
+        """Track physical path/metrics and capture configured video frames."""
+        # PathTracker is O(1); sampling each executed tick keeps reward and SPL
+        # telemetry tied to the physical trajectory rather than the action chunk.
+        self._task.observe_pose(record.pose)
+        if self.metric_evaluate_every and (self._video_tick + 1) % self.metric_evaluate_every == 0:
+            self._task.evaluate()
 
-        The counter is per-episode and global across chunks, so the stride's phase never
-        resets at a chunk boundary and frame spacing stays exactly uniform. Overlay data is
-        resolved at WRITE time (metrics are per policy step by design -- a geodesic query
-        per tick is precisely what the task layer avoids), so the meta stores only which
-        policy step the tick belongs to and its sim time."""
         # Physical fall tracking, EVERY tick regardless of video: the SFT rejection
         # mechanism (continuous_demos.drive_failure), verbatim thresholds -- falling is
         # joint_z velocity <= -fall_speed_mps (2.0, free fall past habitat's 0.2 m
@@ -450,9 +456,24 @@ class ContinuousObjectNavEnvActor:
         return {"vid/episode_video": os.path.join(save_dir, "video.mp4"),
                 "img/thumbnail": thumb}
 
-    def list_episode_uids(self):
+    def list_episode_uids(self, eval_pool: bool = False):
         """All uids this actor can currently serve (loads the pool if needed). Used by
         interleaved eval to draw the fixed eval set without a second parse."""
+        if eval_pool and self.eval_episodes_path is not None:
+            from objectnav_eval.episodes import build_episode_source
+
+            source = build_episode_source(
+                self.episode_source_kind, path=self.eval_episodes_path,
+                **self.source_kwargs,
+            )
+            episodes = list(source.load())
+            if self._exclude_categories:
+                episodes = [
+                    episode for episode in episodes
+                    if (getattr(episode, "object_category", None) or "").strip().lower()
+                    not in self._exclude_categories
+                ]
+            return [episode.uid for episode in episodes]
         self._load_episodes()
         return [e.uid for e in self._episodes]
 
@@ -489,18 +510,16 @@ class ContinuousObjectNavEnvActor:
                 self._skipped.get("reward_mesh_disconnected", 0) + 1)
         self._executor.reset()
         self._steps = 0
+        self._prev_path_length_m = float(self._task.path_tracker.length)
         self._prev_geodesic = float(start["distance_to_goal"])
-        # Oracle bookkeeping, so every episode emits the STOP-INDEPENDENT metrics the
-        # project actually reads (docs/SAMPLE101_EVALS.md): with no stop head, `success`
-        # measures the termination rule, while oracle_success / ospl_fix measure
-        # navigation. These are what make wandb growth curves comparable -- loosely --
-        # against the discrete runs' SR/SPL.
+        # Oracle bookkeeping is diagnostic only.  It never changes episode lifetime or
+        # the actual success metric, which is determined at explicit policy STOP.
         self._start_geodesic = self._prev_geodesic
         self._min_geodesic = self._prev_geodesic
         self._path_at_min = 0.0
-        self._path_at_success = None
-        self._goal_reached_once = False
-        self._post_goal_remaining = 0
+        self._ever_reached_success = bool(self._min_geodesic <= self.success_distance)
+        self._first_reach_reward_awarded = self._ever_reached_success
+        self._exploration_reward_total = 0.0
         # Seed the new episode map with the initial RGB-D observation.  Resetting after
         # rendering would silently discard that observation and under-credit its first move.
         self._exploration.reset()
@@ -529,6 +548,26 @@ class ContinuousObjectNavEnvActor:
             "info": info,
         }
 
+    def _credit_state(self):
+        """Score an immediate STOP without advancing physics or changing termination."""
+        if not getattr(self, "credit_state_telemetry", False):
+            return {}
+        metrics = self._task.evaluate()
+        was_stopped = self._task.is_stop_called
+        try:
+            self._task.call_stop()
+            stopped = self._task.evaluate()
+        finally:
+            self._task.is_stop_called = was_stopped
+            self._task.evaluate()
+        return {
+            "oracle_reached_before": float(metrics["oracle_success"]),
+            "oracle_spl_before": float(metrics["oracle_spl"]),
+            "stop_now_success": float(stopped["success"]),
+            "stop_now_spl": float(stopped["spl"]),
+            "stop_now_utility": 3.0 * float(stopped["success"]) + float(stopped["spl"]),
+        }
+
     def step(self, action, supplementary_logs: Optional[Dict[str, Any]] = None):
         """`action` is the `(gap, 3)` chunk prefix the policy head already truncated."""
         chunk = np.asarray(action, dtype=np.float64).reshape(-1, 3)
@@ -538,12 +577,23 @@ class ContinuousObjectNavEnvActor:
                 "env must agree on ticks-per-step, or sim time and policy steps quietly mean "
                 "different things and two runs stop being comparable."
             )
+        credit_state = self._credit_state()
         action_path_length_m = self._chunk_path_length_m(chunk)
         ray_started = time.perf_counter()
         exploration_raw, exploration_cells = self._exploration.predicted_gain(
             chunk, np.asarray(self._robot_sim.get_2d_pose(), dtype=np.float64))
         exploration_ray_seconds = time.perf_counter() - ray_started
         exploration_reward = self._exploration.reward(exploration_raw)
+        if self._ever_reached_success:
+            exploration_reward = 0.0
+        elif self.exploration_reward_cap > 0.0:
+            remaining = max(0.0, self.exploration_reward_cap - self._exploration_reward_total)
+            exploration_reward = min(exploration_reward, remaining)
+        self._exploration_reward_total += exploration_reward
+        was_in_success_region = bool(
+            np.isfinite(self._prev_geodesic)
+            and self._prev_geodesic <= self.success_distance
+        )
         execution = self._executor.execute(
             chunk, chunk_index=self._steps,
             # The on_tick hook carries BOTH per-tick concerns: physical fall tracking
@@ -552,10 +602,12 @@ class ContinuousObjectNavEnvActor:
         )
         self._steps += 1
 
-        # One geodesic query per policy step, not per tick: the task layer keeps path length
-        # on the cheap PathTracker precisely so stepping never triggers a navmesh query.
-        self._task.observe_pose(self._robot_sim.get_2d_pose())
-        geodesic = float(self._task.evaluate()["distance_to_goal"])
+        # Read the chunk boundary after PathTracker has observed every physical tick.
+        physical_metrics = self._task.evaluate()
+        geodesic = float(physical_metrics["distance_to_goal"])
+        path_length_m = float(self._task.path_tracker.length)
+        executed_path_delta_m = max(0.0, path_length_m - self._prev_path_length_m)
+        self._prev_path_length_m = path_length_m
 
         progress = (self._prev_geodesic - geodesic
                     if np.isfinite(geodesic) and np.isfinite(self._prev_geodesic) else 0.0)
@@ -566,6 +618,10 @@ class ContinuousObjectNavEnvActor:
         reward = float(progress) - self.slack_penalty + exploration_reward
         if collided:
             reward -= self.collision_penalty
+        path_length_reward_penalty = self.path_length_penalty * executed_path_delta_m
+        reward -= path_length_reward_penalty
+        if was_in_success_region:
+            reward -= self.success_continue_penalty
         # Hold the last FINITE distance across snap dropouts: updating with inf would
         # zero the progress on the resumption step too, silently unpaying (and
         # unpunishing) all motion during the blind window. With the hold, the resumption
@@ -579,13 +635,9 @@ class ContinuousObjectNavEnvActor:
         if np.isfinite(geodesic) and geodesic < self._min_geodesic:
             self._min_geodesic = float(geodesic)
             self._path_at_min = float(self._task.path_tracker.length)
+        first_reach_bonus = self._record_first_reach(geodesic)
+        reward += first_reach_bonus
 
-        reached = bool(np.isfinite(geodesic) and geodesic <= self.success_distance)
-        just_reached, was_post_goal_active, post_goal_complete = (
-            self._advance_post_goal(reached)
-        )
-        if just_reached:
-            self._path_at_success = float(self._task.path_tracker.length)
         # ESCAPE IS PHYSICAL, never a geodesic proxy: the SFT rejection rule (sustained
         # free-fall of joint_z, drive_failure.py thresholds), accumulated per tick in
         # _video_on_tick. A non-finite geodesic mid-episode is a navmesh-snap dropout --
@@ -603,29 +655,20 @@ class ContinuousObjectNavEnvActor:
         reward_lost = bool(self.reward_lost_steps
                            and self._blind_run >= self.reward_lost_steps)
         reached_budget_cap = bool(self._steps >= self.max_steps)
-        done = bool(
-            (reached and self.post_goal_steps == 0) or post_goal_complete
-            or escaped or reward_lost or reached_budget_cap
-        )
-        # Budget-cap ending is TRUNCATION, not termination: the MDP continues, the
-        # episode doesn't. Consumers (GAE truncation bootstrap) treat it differently
-        # from reached/escaped, which are genuinely absorbing.
-        truncated = bool(done and not self._goal_reached_once and not escaped)
+        done = bool(escaped or reward_lost or reached_budget_cap)
+        # Budget-cap ending is truncation: reaching the success region is only an oracle
+        # diagnostic, so it cannot make a transition terminal.
+        truncated = bool(done and not escaped)
         # A blind-metric exit is recorded as truncated for episode accounting, but it is
         # not an MDP time-limit state with a meaningful value to bootstrap.
         bootstrap_eligible = bool(
-            reached_budget_cap and not self._goal_reached_once and not escaped
+            reached_budget_cap
+            and not escaped
             and not reward_lost
+            and self.timeout_penalty <= 0.0
         )
-        if just_reached and self.success_reward:
-            reward += self.success_reward
-        stillness_reward = 0.0
-        if was_post_goal_active and self.post_goal_stillness_reward:
-            stillness_reward = self.post_goal_stillness_reward * max(
-                0.0,
-                1.0 - action_path_length_m / self.post_goal_stillness_scale_m,
-            )
-            reward += stillness_reward
+        if reached_budget_cap and self.timeout_penalty:
+            reward -= self.timeout_penalty
         if escaped and self.escape_penalty:
             reward -= self.escape_penalty
         # Emitted EVERY step, not only the terminal one: `_pack_trajectory` takes an
@@ -634,31 +677,27 @@ class ContinuousObjectNavEnvActor:
         # extra columns and `collate_trajectories` KeyErrors on the mixed batch (observed:
         # first v2 cycle). Values are running statistics; on the terminal step they equal
         # the old terminal-only emission exactly, so last-info-wins consumers are
-        # unchanged. `ospl_fix` is the RECOMPUTED oracle SPL -- the task layer's own
-        # OracleSPL is documented broken (docs/SAMPLE101_EVALS.md).
+        # unchanged. Legacy ospl_fix tracks closest approach; oracle_spl comes from PE
+        # and freezes its path denominator at the first successful reach.
         oracle = bool(self._min_geodesic <= self.success_distance)
         s0 = self._start_geodesic
         info_extra = {
+            **credit_state,
             "oracle_success": oracle,
-            "spl_fix": (s0 / max(s0, self._path_at_success))
-            if self._goal_reached_once and s0 > 0 and self._path_at_success is not None
-            else 0.0,
+            "oracle_reached": float(physical_metrics["oracle_success"]),
+            "oracle_spl": float(physical_metrics["oracle_spl"]),
+            "spl_fix": 0.0,
             "ospl_fix": (s0 / max(s0, self._path_at_min)) if oracle and s0 > 0 else 0.0,
             "min_m": self._finite(self._min_geodesic),
             "start_m": self._finite(s0),
-            "path_length_m": float(self._task.path_tracker.length),
+            "path_length_m": path_length_m,
         }
         rgb = self._render()
         info = {
             "episode_label": self._episode.uid,
             "scene_id": getattr(self._episode, "scene_id", None) or self._scene_id,
             "distance_to_goal": self._finite(geodesic),
-            "success": self._goal_reached_once,
-            "just_reached": just_reached,
-            "post_goal_active": bool(
-                self._goal_reached_once and self._post_goal_remaining > 0
-            ),
-            "post_goal_stillness_reward": float(stillness_reward),
+            "success": False,
             "escaped": escaped,
             "steps": self._steps,
             "collided": collided,
@@ -674,14 +713,24 @@ class ContinuousObjectNavEnvActor:
             "blind_run": int(self._blind_run),
             "reward_lost": reward_lost,
             "termination_reason": (
-                "reached" if self._goal_reached_once and done else "escaped" if escaped else
-                "reward_lost" if reward_lost else "max_steps" if done else None),
+                "escaped" if escaped else "reward_lost" if reward_lost else
+                "max_steps" if done else None),
             "exploration_gain_raw_m2": float(exploration_raw),
             "exploration_gain_cells": int(exploration_cells),
             "exploration_reward": float(exploration_reward),
+            "exploration_reward_total": float(self._exploration_reward_total),
+            "success_continue_penalty": float(
+                self.success_continue_penalty if was_in_success_region else 0.0
+            ),
+            "first_reach_reward": float(first_reach_bonus),
+            "timeout_penalty": float(
+                self.timeout_penalty if reached_budget_cap else 0.0
+            ),
             "exploration_ray_seconds": float(exploration_ray_seconds),
             "distance_progress": float(progress),
             "action_path_length_m": float(action_path_length_m),
+            "executed_path_delta_m": float(executed_path_delta_m),
+            "path_length_reward_penalty": float(path_length_reward_penalty),
             "policy_stop_mode": None,
             "pos_rots": self._pos_rots(),
             **info_extra,
@@ -702,23 +751,47 @@ class ContinuousObjectNavEnvActor:
             "info": info,
         }
 
+    def _record_first_reach(self, geodesic: float) -> float:
+        """Mark the first success-region entry and return its one-time bonus."""
+        if not np.isfinite(geodesic) or geodesic > self.success_distance:
+            return 0.0
+        if self._ever_reached_success or self._first_reach_reward_awarded:
+            self._ever_reached_success = True
+            return 0.0
+        self._ever_reached_success = True
+        self._first_reach_reward_awarded = True
+        return self.first_reach_reward
+
     def policy_stop(self, supplementary_logs: Optional[Dict[str, Any]] = None):
         """End an episode at the current observation without executing a motion chunk."""
         supplementary_logs = supplementary_logs or {}
-        geodesic = self._prev_geodesic
-        reached = bool(np.isfinite(geodesic) and geodesic <= self.success_distance)
+        credit_state = self._credit_state()
+        if credit_state:
+            self._task.call_stop()
+        physical_metrics = self._task.evaluate()
+        geodesic = (float(physical_metrics["distance_to_goal"])
+                    if credit_state else self._prev_geodesic)
+        reached = (bool(physical_metrics["success"]) if credit_state else
+                   bool(np.isfinite(geodesic) and geodesic <= self.success_distance))
         oracle = bool(self._min_geodesic <= self.success_distance)
         start = self._start_geodesic
         stop_reward = (
-            self.policy_stop_correct_reward if reached else -self.policy_stop_false_penalty
+            self.policy_stop_correct_reward + self.success_reward
+            if reached else -self.policy_stop_false_penalty
         )
+        consistency_penalty = max(
+            0.0,
+            float(supplementary_logs.get(
+                "categorical_stop_action_consistency_penalty", 0.0
+            )),
+        )
+        stop_reward -= consistency_penalty
         info = {
+            **credit_state,
             "episode_label": self._episode.uid,
             "scene_id": getattr(self._episode, "scene_id", None) or self._scene_id,
             "distance_to_goal": self._finite(geodesic),
             "success": reached,
-            "just_reached": False,
-            "post_goal_active": False,
             "escaped": False,
             "steps": self._steps,
             "collided": False,
@@ -732,19 +805,28 @@ class ContinuousObjectNavEnvActor:
             "exploration_gain_raw_m2": 0.0,
             "exploration_gain_cells": 0,
             "exploration_reward": 0.0,
+            "exploration_reward_total": float(self._exploration_reward_total),
+            "success_continue_penalty": 0.0,
+            "first_reach_reward": 0.0,
+            "timeout_penalty": 0.0,
             "exploration_ray_seconds": 0.0,
             "distance_progress": 0.0,
             "action_path_length_m": float(
                 supplementary_logs.get("action_path_length_m", 0.0)
             ),
-            "post_goal_stillness_reward": 0.0,
+            "executed_path_delta_m": 0.0,
+            "path_length_reward_penalty": 0.0,
+            "categorical_stop_action_consistency_penalty": consistency_penalty,
             "policy_stop_mode": str(
                 supplementary_logs.get("policy_stop_mode", "physical")
             ),
             "pos_rots": self._pos_rots(),
             "oracle_success": oracle,
-            "spl_fix": (start / max(start, float(self._task.path_tracker.length)))
-            if reached and start > 0 else 0.0,
+            "oracle_reached": float(physical_metrics["oracle_success"]),
+            "oracle_spl": float(physical_metrics["oracle_spl"]),
+            "spl_fix": (float(physical_metrics["spl"]) if credit_state else
+                        (start / max(start, float(self._task.path_tracker.length)))
+                        if reached and start > 0 else 0.0),
             "ospl_fix": (start / max(start, self._path_at_min))
             if oracle and start > 0 else 0.0,
             "min_m": self._finite(self._min_geodesic),
@@ -781,8 +863,13 @@ class ContinuousObjectNavEnvActor:
         kwargs = dict(self.source_kwargs)
         # ObjectNavFileSource deliberately owns only a split path.  It cannot accept a
         # scene filter, so explicit eval shards are resolved after the source loads.
+        source_path = (
+            self.eval_episodes_path
+            if self._shard is not None and self.eval_episodes_path is not None
+            else self.episodes_path
+        )
         source = build_episode_source(
-            self.episode_source_kind, path=self.episodes_path, **kwargs,
+            self.episode_source_kind, path=source_path, **kwargs,
         )
         episodes = list(source.load())
         if self._shard is not None:
@@ -802,7 +889,7 @@ class ContinuousObjectNavEnvActor:
             if not episodes:
                 raise ValueError(
                     f"exclude_categories={sorted(self._exclude_categories)} removed all "
-                    f"{before} episodes from this actor's pool ({self.episodes_path}). "
+                    f"{before} episodes from this actor's pool ({source_path}). "
                     "An empty pool would silently read as an exhausted shard."
                 )
             print(f"[env] exclude_categories={sorted(self._exclude_categories)}: "
@@ -877,7 +964,7 @@ class ContinuousObjectNavEnvActor:
                 )
             raise KeyError(
                 f"{len(missing)} of {len(wanted)} shard labels matched no episode in "
-                f"{self.episodes_path} (e.g. {missing[:3]}){hint}"
+                f"{self.eval_episodes_path if self._shard is not None and self.eval_episodes_path is not None else self.episodes_path} (e.g. {missing[:3]}){hint}"
             )
         return out
 

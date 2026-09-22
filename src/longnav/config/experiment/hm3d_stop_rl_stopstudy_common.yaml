@@ -5,7 +5,9 @@ defaults:
   - hm3d_stop_rl_exploration
 
 sim:
-  post_goal_steps: 4
+  # Scalar/JSON evaluation logs remain enabled; per-episode MP4s are generated only
+  # for selected checkpoints after training so fixed eval cannot exhaust storage.
+  minimal_logging: true
   policy_stop_correct_reward: 1.0
   policy_stop_false_penalty: 1.0
 
@@ -19,7 +21,8 @@ training:
   # With 2 rollout episodes and grad_accum=4, this is 360 driver cycles.
   total_optimization_steps: 180
   warmup_steps: 16
-  save_step: 20
+  # Rolling latest plus metric-best links are retained; avoid redundant full snapshots.
+  save_step: 1000
   rl_config:
     advantage_estimator: reinforce_plus_plus_time_kernel
     clip_ratio_low: 0.2

@@ -129,10 +129,16 @@ class EpisodeRolloutMixin:
         from hashlib import blake2b
         from longnav.utils.flow_sde_policy import FlowSDEHead
 
-        label = str(state_dict.get("info", {}).get("episode_label", ""))
-        if not label:
-            return
-        seed = int.from_bytes(blake2b(label.encode(), digest_size=8).digest(), "little")
+        fixed_seed = self.rollout_config.get("ode_episode_seed")
+        if fixed_seed is None:
+            label = str(state_dict.get("info", {}).get("episode_label", ""))
+            if not label:
+                return
+            seed = int.from_bytes(
+                blake2b(label.encode(), digest_size=8).digest(), "little"
+            )
+        else:
+            seed = int(fixed_seed)
         self._policy_stop_rng = np.random.default_rng(seed)
         model = getattr(self, "model", None)
         if model is None:
@@ -148,11 +154,35 @@ class EpisodeRolloutMixin:
         return float(distance <= self.rollout_config.get("stop_head_radius_m", 1.0))
 
     def _shadow_stop_decision(self, state_dict, probability=None):
-        """Sample an auxiliary STOP action without changing simulator control."""
+        """Return the sampled STOP action and its learning reward."""
         target = self._stop_target(state_dict)
         probability = getattr(self, "last_stop_probability", None) if probability is None else probability
-        if (self.rollout_config.get("stop_execution_mode") != "shadow"
-                or probability is None or target is None):
+        mode = self.rollout_config.get("stop_execution_mode")
+        if probability is None or target is None:
+            return {"stop_target": target, "shadow_stop_action": np.nan,
+                    "shadow_stop_reward": np.nan, "probe_p_stop": probability}
+        if mode == "sampled":
+            action = getattr(self, "last_sampled_stop_action", None)
+            if action is None:
+                raise RuntimeError("sampled STOP feedback requires a sampled action")
+            if action:
+                reward = (float(self.rollout_config.get("stop_shadow_correct_reward", 1.0))
+                          if target > 0.5 else
+                          -float(self.rollout_config.get("stop_shadow_false_penalty", 1.0)))
+            elif target > 0.5:
+                reward = -float(self.rollout_config.get("stop_shadow_miss_penalty", 0.0))
+            else:
+                reward = 0.0
+            if reward == 0.0:
+                action = np.nan
+                reward = np.nan
+            return {
+                "stop_target": target,
+                "shadow_stop_action": float(action),
+                "shadow_stop_reward": float(reward),
+                "probe_p_stop": probability,
+            }
+        if mode != "shadow":
             return {"stop_target": target, "shadow_stop_action": np.nan,
                     "shadow_stop_reward": np.nan, "probe_p_stop": probability}
         temperature = float(getattr(
@@ -179,74 +209,139 @@ class EpisodeRolloutMixin:
         }
 
     @staticmethod
+    def _trajectory_motion_magnitudes(action_to_env) -> tuple[float, float]:
+        """Measure cumulative translation and yaw from a decoded action chunk."""
+        from longnav.utils.trajectory_stop import trajectory_motion_magnitudes
+
+        return trajectory_motion_magnitudes(action_to_env)
+
+    @staticmethod
     def _trajectory_path_length_m(action_to_env) -> float:
         """Measure the decoded cumulative XY path that the controller would execute."""
-        action = np.asarray(action_to_env, dtype=np.float64)
-        if action.ndim == 1:
-            if action.size >= 3 and action.size % 3 == 0:
-                xy = action.reshape(-1, 3)[:, :2]
-            elif action.size >= 2:
-                xy = action[:2].reshape(1, 2)
-            else:
-                return float("nan")
-        elif action.shape[-1] >= 2:
-            xy = action.reshape(-1, action.shape[-1])[:, :2]
-        else:
-            return float("nan")
-        if not np.isfinite(xy).all():
-            return float("nan")
-        anchored = np.vstack((np.zeros((1, 2), dtype=np.float64), xy))
-        return float(np.linalg.norm(np.diff(anchored, axis=0), axis=1).sum())
+        return EpisodeRolloutMixin._trajectory_motion_magnitudes(action_to_env)[0]
 
-    def _policy_stop_decision(self, action_to_env, stop_probability, decision_index=None):
-        """Resolve the configured stop actuator from the same decoded action as control."""
-        mode = str(self.rollout_config.get("stop_execution_mode", "physical"))
-        if self.policy_head_config["type"] != "continuous":
-            return False, mode, float("nan")
-        path_length = self._trajectory_path_length_m(action_to_env)
-        if mode == "shadow":
-            return False, mode, path_length
+    def _trajectory_stop_decision(self, action_to_env, decision_index):
+        translation_threshold = self.rollout_config.get("trajectory_stop_threshold_m")
+        yaw_threshold = self.rollout_config.get("trajectory_stop_yaw_threshold_rad")
+        if translation_threshold is None or float(translation_threshold) < 0.0:
+            raise ValueError(
+                "trajectory_length stop requires a non-negative "
+                "trajectory_stop_threshold_m"
+            )
+        if yaw_threshold is None or float(yaw_threshold) < 0.0:
+            raise ValueError(
+                "trajectory_length stop requires a non-negative "
+                "trajectory_stop_yaw_threshold_rad"
+            )
+        min_steps = int(self.rollout_config.get("trajectory_stop_min_steps", 0))
+        if min_steps < 0:
+            raise ValueError("trajectory_stop_min_steps must be non-negative")
+        from longnav.utils.trajectory_stop import trajectory_stop_decision
+
+        stop, translation_m, _ = trajectory_stop_decision(
+            action_to_env,
+            translation_threshold_m=float(translation_threshold),
+            yaw_threshold_rad=float(yaw_threshold),
+            decision_index=0 if decision_index is None else int(decision_index),
+            min_steps=min_steps,
+            prefix_points=int(self.rollout_config.get("gap", 10)),
+        )
+        return stop, translation_m
+
+    def _sample_categorical_stop(self, probability):
+        probability = float(np.clip(probability, 1e-6, 1.0 - 1e-6))
+        rng = getattr(self, "_policy_stop_rng", None)
+        if rng is None:
+            rng = np.random.default_rng()
+            self._policy_stop_rng = rng
+        action = bool(rng.random() < probability)
+        self.last_categorical_stop_action = action
+        self.last_categorical_stop_logprob = float(
+            np.log(probability if action else 1.0 - probability)
+        )
+        return action
+
+    def _categorical_stop_action_consistency_penalty(self, action_to_env):
+        """Return a bounded learned-STOP penalty for a non-stationary action."""
+        weight = float(self.rollout_config.get(
+            "categorical_stop_action_consistency_penalty", 0.0
+        ))
+        if weight <= 0.0:
+            return 0.0
+        translation_limit = float(self.rollout_config.get(
+            "categorical_stop_action_consistency_translation_m", 0.1
+        ))
+        yaw_limit = float(self.rollout_config.get(
+            "categorical_stop_action_consistency_yaw_rad", 0.1
+        ))
+        if translation_limit <= 0.0 or yaw_limit <= 0.0:
+            raise ValueError(
+                "categorical STOP consistency limits must be positive"
+            )
+        translation_m, yaw_rad = self._trajectory_motion_magnitudes(action_to_env)
+        if not np.isfinite(translation_m) or not np.isfinite(yaw_rad):
+            return 0.0
+        excess = max(translation_m / translation_limit, yaw_rad / yaw_limit) - 1.0
+        return weight * float(np.clip(excess, 0.0, 1.0))
+
+    def _learned_stop_decision(self, mode, probability):
         if mode == "physical":
             threshold = self.rollout_config.get("stop_prob_threshold")
             return (
                 threshold is not None
-                and stop_probability is not None
-                and stop_probability >= float(threshold),
-                mode,
-                path_length,
+                and probability is not None
+                and probability >= float(threshold)
             )
         if mode == "sampled":
-            if stop_probability is None:
-                return False, mode, path_length
+            if probability is None:
+                return False
             temperature = float(self.rollout_config.get("stop_sample_temperature", 1.0))
             if temperature <= 0.0:
                 raise ValueError("stop_sample_temperature must be positive")
-            probability = float(np.clip(stop_probability, 1e-6, 1.0 - 1e-6))
+            probability = float(np.clip(probability, 1e-6, 1.0 - 1e-6))
             logit = np.log(probability / (1.0 - probability)) / temperature
             probability = 1.0 / (1.0 + np.exp(-logit))
             rng = getattr(self, "_policy_stop_rng", None)
             if rng is None:
                 rng = np.random.default_rng()
                 self._policy_stop_rng = rng
-            return bool(rng.random() < probability), mode, path_length
+            action = bool(rng.random() < probability)
+            self.last_sampled_stop_action = action
+            return action
+        if mode == "categorical":
+            return False if probability is None else self._sample_categorical_stop(probability)
+        return None
+
+    def _policy_stop_decision(self, action_to_env, stop_probability, decision_index=None):
+        """Resolve the configured stop actuator from the same decoded action as control."""
+        mode = str(self.rollout_config.get("stop_execution_mode", "physical"))
+        self.last_categorical_stop_action = None
+        self.last_categorical_stop_logprob = np.nan
+        self.last_sampled_stop_action = None
+        if self.policy_head_config["type"] != "continuous":
+            return False, mode, float("nan")
+        path_length = self._trajectory_path_length_m(action_to_env)
+        if mode == "shadow":
+            return False, mode, path_length
+        min_steps = int(self.rollout_config.get("stop_execution_min_steps", 0))
+        if decision_index is not None and int(decision_index) < min_steps:
+            return False, mode, path_length
         if mode == "trajectory_length":
-            threshold = self.rollout_config.get("trajectory_stop_threshold_m")
-            if threshold is None or float(threshold) < 0.0:
-                raise ValueError(
-                    "trajectory_length stop requires a non-negative "
-                    "trajectory_stop_threshold_m"
-                )
-            min_steps = int(self.rollout_config.get("trajectory_stop_min_steps", 0))
-            if min_steps < 0:
-                raise ValueError("trajectory_stop_min_steps must be non-negative")
-            if decision_index is not None and int(decision_index) < min_steps:
-                return False, mode, path_length
-            return path_length <= float(threshold), mode, path_length
+            stop, path_length = self._trajectory_stop_decision(
+                action_to_env, decision_index
+            )
+            return stop, mode, path_length
+        stop = self._learned_stop_decision(mode, stop_probability)
+        if stop is not None:
+            return stop, mode, path_length
         raise ValueError(
             "stop_execution_mode must be one of shadow, physical, sampled, "
-            "trajectory_length; "
+            "categorical, trajectory_length; "
             f"got {mode!r}"
         )
+
+    def _categorical_stop_ppo_enabled(self):
+        return bool(getattr(self, "state_probe_trainable", False))
 
     def _pack_trajectory(self, buffer: List[Dict]) -> Dict[str, np.ndarray]:
         """
@@ -377,7 +472,11 @@ class EpisodeRolloutMixin:
 
         if self.policy_head_config["type"] == "continuous":
             action_for_context = action_to_env if uses_chain_action else action_id
-            logs["action_path_length_m"] = self._trajectory_path_length_m(action_to_env)
+            action_path_length_m, action_yaw_path_rad = self._trajectory_motion_magnitudes(
+                action_to_env
+            )
+            logs["action_path_length_m"] = action_path_length_m
+            logs["action_yaw_path_rad"] = action_yaw_path_rad
             action_text = ",".join(
                 f"{value:.3f}" for value in np.asarray(action_for_context).reshape(-1)
             )
@@ -426,6 +525,19 @@ class EpisodeRolloutMixin:
             "action_path_length_m": float(
                 decision_logs.get("action_path_length_m", np.nan)
             ),
+            "action_yaw_path_rad": float(
+                decision_logs.get("action_yaw_path_rad", np.nan)
+            ),
+            "categorical_stop_action": float(
+                decision_logs.get("categorical_stop_action", np.nan)
+            ),
+            "categorical_stop_logprob": float(
+                decision_logs.get("categorical_stop_logprob", np.nan)
+            ),
+            "categorical_stop_behavior_logit": float(
+                decision_logs.get("categorical_stop_behavior_logit", np.nan)
+            ),
+            "stop_policy_mask": bool(decision_logs.get("stop_policy_mask", True)),
             "policy_stop_mode": decision_logs.get("policy_stop_mode"),
             "decision_distance_to_goal_m": float(
                 decision_logs.get("decision_distance_to_goal_m", np.nan)
@@ -518,19 +630,49 @@ class EpisodeRolloutMixin:
                 )
                 action_id, action_to_env, action_logprobs, sde_positions, action_text = sampled
                 decision_logs = vlm_logs
-                shadow_stop = self._shadow_stop_decision(state_dict)
-                stop_target = shadow_stop["stop_target"]
-                post_goal_action = bool(
-                    state_dict.get("info", {}).get("post_goal_active", False)
-                )
                 stop_probability = getattr(self, "last_stop_probability", None)
+                exact_prefix = int(self.rollout_config.get(
+                    "stop_fullscore_prefix_steps", 0
+                ))
+                if step_count < exact_prefix:
+                    full_score = self.rescore_stop_from_full_history()
+                    if full_score is None:
+                        raise RuntimeError(
+                            "full-history STOP scoring was requested without a STOP head"
+                        )
+                    stop_probability, self.last_stop_logit = full_score
+                    self.last_stop_probability = stop_probability
                 policy_stop, policy_stop_mode, action_path_length_m = (
                     self._policy_stop_decision(
                         action_to_env, stop_probability, decision_index=step_count
                     )
                 )
+                shadow_stop = self._shadow_stop_decision(state_dict, stop_probability)
+                stop_target = shadow_stop["stop_target"]
                 decision_logs["action_path_length_m"] = action_path_length_m
+                if self.policy_head_config["type"] == "continuous":
+                    decision_logs["action_yaw_path_rad"] = (
+                        self._trajectory_motion_magnitudes(action_to_env)[1]
+                    )
                 decision_logs["policy_stop_mode"] = policy_stop_mode
+                decision_logs["categorical_stop_action"] = (
+                    np.nan
+                    if self.last_categorical_stop_action is None
+                    else float(self.last_categorical_stop_action)
+                )
+                decision_logs["categorical_stop_logprob"] = (
+                    self.last_categorical_stop_logprob
+                )
+                decision_logs["categorical_stop_behavior_logit"] = (
+                    np.nan
+                    if getattr(self, "last_stop_logit", None) is None
+                    else float(self.last_stop_logit)
+                )
+                decision_logs["categorical_stop_action_consistency_penalty"] = (
+                    self._categorical_stop_action_consistency_penalty(action_to_env)
+                    if policy_stop else 0.0
+                )
+                decision_logs["stop_policy_mask"] = True
                 decision_distance = state_dict.get("info", {}).get("distance_to_goal")
                 decision_logs["decision_distance_to_goal_m"] = (
                     float(decision_distance)
@@ -566,26 +708,10 @@ class EpisodeRolloutMixin:
                             shadow_stop_action=shadow_stop["shadow_stop_action"],
                             shadow_stop_reward=shadow_stop["shadow_stop_reward"],
                             policy_action_mask=(
-                                (not post_goal_action
-                                 or bool(self.rollout_config.get(
-                                     "learn_post_goal_actions", False)))
-                                and (not policy_stop
-                                     or policy_stop_mode == "trajectory_length")
+                                not policy_stop
+                                or policy_stop_mode == "trajectory_length"
                             ),
-                            reward_override=(
-                                0.0 if post_goal_action and not bool(
-                                    self.rollout_config.get(
-                                        "learn_post_goal_actions", False))
-                                else None
-                            ),
-                            done_override=(
-                                bool(state_dict["done"])
-                                or (
-                                    bool(state_dict.get("info", {}).get("just_reached"))
-                                    and not bool(self.rollout_config.get(
-                                        "learn_post_goal_actions", False))
-                                )
-                            ),
+                            done_override=bool(state_dict["done"]),
                         )
                     )
                 # `step` is the index of the observation the appended turn introduces:
@@ -628,6 +754,13 @@ class EpisodeRolloutMixin:
                     final_info_action_length = float(finite_lengths.mean())
                 else:
                     final_info_action_length = float("nan")
+                action_yaws = np.asarray(
+                    final_trajectory.get("action_yaw_path_rad", []), dtype=np.float64
+                )
+                finite_yaws = action_yaws[np.isfinite(action_yaws)]
+                final_info_action_yaw = (
+                    float(finite_yaws.mean()) if len(finite_yaws) else float("nan")
+                )
                 probability = np.asarray(final_trajectory.get("probe_p_stop", []), dtype=np.float64)
                 target = np.asarray(final_trajectory.get("stop_target", []), dtype=np.float64)
                 valid = np.isfinite(probability) & np.isfinite(target)
@@ -656,6 +789,9 @@ class EpisodeRolloutMixin:
                 "instr_or_goal": instr_or_goal,
                 "mean_action_path_length_m": (
                     final_info_action_length if final_trajectory is not None else float("nan")
+                ),
+                "mean_action_yaw_path_rad": (
+                    final_info_action_yaw if final_trajectory is not None else float("nan")
                 ),
                 "policy_stop_probability": (
                     np.nan
@@ -686,7 +822,7 @@ class RolloutWorker(VLMWorker, EpisodeRolloutMixin):
         # We pass only the relevant VLM args to avoid 'unexpected keyword argument' errors.
         VLMWorker.__init__(self, **vlm_kwargs)
         import os
-        np.random.seed(os.getpid())
+        np.random.seed(int(os.environ.get("LONGNAV_TRAIN_SEED", os.getpid())))
         # 2. Initialize the Mixin State
         # Since the Mixin's __init__ was just setting this variable, we can do it here directly
         # effectively bypassing the need for cooperative inheritance in the parents.
@@ -753,9 +889,6 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
             policy_out, action_logprobs, state_dict, logs
         )
         logs.update(self._shadow_stop_decision(state_dict))
-        logs["post_goal_action"] = bool(
-            state_dict.get("info", {}).get("post_goal_active", False)
-        )
         self.rl_batch_sequence_states[index] = self.capture_sequence_state()
         return (*sampled, logs, latency)
 
@@ -814,9 +947,6 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
                 policy_out, None, state_dicts[index], logs
             )
             logs.update(self._shadow_stop_decision(state_dicts[index], stop_probability))
-            logs["post_goal_action"] = bool(
-                state_dicts[index].get("info", {}).get("post_goal_active", False)
-            )
             decisions[index] = (*sampled, logs, latency_per_slot)
         return decisions
 
@@ -825,16 +955,15 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
         action_id, _, action_logprobs, sde_positions, action_text, logs, _ = decision
         trajectory = {
             "rollout_logprobs": action_logprobs,
-            "rewards": (0.0 if virtual_stop or logs.get("post_goal_action")
-                        else next_state.get("reward", 0.0)),
-            "dones": bool(next_state["done"] or next_state.get("info", {}).get("just_reached")),
+            "rewards": (0.0 if virtual_stop else next_state.get("reward", 0.0)),
+            "dones": bool(next_state["done"]),
             **next_state["info"],
             **logs,
             "stop_target": logs.get("stop_target", np.nan),
             "shadow_stop_action": logs.get("shadow_stop_action", np.nan),
             "shadow_stop_reward": logs.get("shadow_stop_reward", np.nan),
             "probe_p_stop": logs.get("probe_p_stop", np.nan),
-            "policy_action_mask": not virtual_stop and not logs.get("post_goal_action"),
+            "policy_action_mask": not virtual_stop,
         }
         if self.policy_head_config["type"] == "continuous":
             trajectory["actions_continuous"] = np.asarray(action_id, dtype=np.float32)
@@ -1028,9 +1157,10 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
         model_inputs = None
 
         if not eval: # skip logprobs calculation during eval for speed.
-            # Score stored chains in the same unmerged adapter parameterization as PPO.
-            if self.is_merged():
-                self.unmerge_adapter()
+            # Score the old policy in the behavior parameterization.  Rollout uses
+            # the merged SFT adapter; unmerging before this full-sequence pass changes
+            # the policy whose STOP probability was sampled.  Training unmerges later,
+            # after the old behavior scores have been recorded.
             _align_readouts_to_executed_actions(
                 self.rl_trajectory,
                 self.logit_indices,
@@ -1042,9 +1172,7 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
             values = None
             import torch
             with torch.no_grad():
-                _want_values = (self.rl_algo_config.value_head is not None
-                                or (bool(getattr(self.rl_algo_config, "state_probe", None))
-                                    and not self.state_probe_trainable))
+                _want_values = getattr(self.model, "value_head", None) is not None
                 if self.rl_embeds_inputs is not None:
                     policy_stats,values = self._forward_embeds(self.rl_embeds_inputs,_want_values)
                     model_inputs = self.rl_embeds_inputs
@@ -1077,7 +1205,87 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
                             actions_continuous = actions_continuous.unsqueeze(0)
                         old_log_prob = self._continuous_log_prob(actions_continuous, policy_stats['mu'], policy_stats['log_std']).squeeze(0).float().cpu()
                     self.rl_trajectory['old_log_prob'] = old_log_prob.numpy()
-                    if getattr(self.rl_algo_config, 'ref_kl', False):
+                    categorical_actions = self.rl_trajectory.get(
+                        "categorical_stop_action"
+                    )
+                    if (
+                        self.rollout_config.get("stop_execution_mode") == "categorical"
+                        and categorical_actions is not None
+                        and self._categorical_stop_ppo_enabled()
+                    ):
+                        categorical_values = torch.as_tensor(
+                            categorical_actions, device=self.model.device
+                        )
+                        stop_logits = policy_stats.get("stop_logits")
+                        if stop_logits is None:
+                            raise RuntimeError(
+                                "categorical STOP rollout requires stop logits during PPO"
+                            )
+                        stop_logits = stop_logits.reshape(-1)
+                        categorical_values = categorical_values.to(
+                            dtype=stop_logits.dtype, device=stop_logits.device
+                        ).reshape(-1)
+                        finite_actions = torch.isfinite(categorical_values)
+                        # Pre-minimum-step categorical decisions are recorded as NaN.
+                        # They are masked from PPO, but gather still needs a valid index.
+                        stop_actions = torch.where(
+                            torch.isfinite(categorical_values),
+                            categorical_values,
+                            torch.zeros_like(categorical_values),
+                        ).long()
+                        from longnav.utils.state_probe import binary_stop_log_probs
+                        stop_log_probs = binary_stop_log_probs(stop_logits)
+                        old_stop_log_prob = stop_log_probs.gather(
+                            -1, stop_actions.unsqueeze(-1)
+                        ).squeeze(-1)
+                        behavior_log_prob = torch.as_tensor(
+                            self.rl_trajectory["categorical_stop_logprob"],
+                            device=stop_logits.device, dtype=torch.float32,
+                        ).reshape(-1)
+                        if not torch.isfinite(behavior_log_prob[finite_actions]).all():
+                            raise ValueError("categorical STOP has no finite behavior log-probability")
+                        gap = (old_stop_log_prob - behavior_log_prob)[finite_actions].abs()
+                        limit = getattr(self.rl_algo_config, "stop_behavior_seam_limit", None)
+                        if gap.numel() and limit is not None and gap.mean() > float(limit):
+                            probe = getattr(self, "state_probe", None)
+                            behavior_logits = np.asarray(
+                                self.rl_trajectory.get(
+                                    "categorical_stop_behavior_logit", []
+                                ), dtype=np.float32,
+                            ).reshape(-1)
+                            selected_logits = stop_logits.detach().float().cpu().numpy().reshape(-1)
+                            selected = finite_actions.detach().cpu().numpy()
+                            raise RuntimeError(
+                                "STOP behavior/postprocess log-prob gap "
+                                f"mean={gap.mean().item():.6f} max={gap.max().item():.6f} "
+                                f"n={gap.numel()} limit={limit} "
+                                f"model_training={self.model.training} "
+                                f"probe_training={getattr(probe, 'training', None)} "
+                                f"adapter_merged={self.is_merged()} "
+                                f"behavior_logits={behavior_logits[selected].tolist()} "
+                                f"postprocess_logits={selected_logits[selected].tolist()}"
+                            )
+                        self.rl_trajectory["categorical_stop_recompute_logprob"] = (
+                            old_stop_log_prob.masked_fill(~finite_actions, 0.0).float().cpu().numpy()
+                        )
+                        self.rl_trajectory["old_categorical_stop_logprob"] = (
+                            behavior_log_prob.masked_fill(~finite_actions, 0.0).cpu().numpy()
+                        )
+                    elif categorical_actions is not None:
+                        # Frozen STOP still executes categorical decisions for the
+                        # environment and credit audit, but is excluded from PPO.
+                        categorical_values = np.asarray(categorical_actions, dtype=np.float32)
+                        self.rl_trajectory["categorical_stop_recompute_logprob"] = np.zeros_like(
+                            categorical_values, dtype=np.float32
+                        )
+                        self.rl_trajectory["old_categorical_stop_logprob"] = np.zeros_like(
+                            categorical_values, dtype=np.float32
+                        )
+                        self.rl_trajectory["stop_policy_mask"] = np.zeros_like(
+                            categorical_values, dtype=bool
+                        )
+                    if (getattr(self.rl_algo_config, 'ref_kl', False)
+                            or getattr(self.rl_algo_config, "state_probe_ref_kl_coeff", 0.0) > 0.0):
                         # THE h-SPACE TETHER, measure-first: log pi_ref at the STORED
                         # actions, via the DEFAULT ref mechanism (the same
                         # disable_adapter the discrete path uses at the bottom of this
@@ -1105,6 +1313,10 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
                                     actions_continuous, ref_stats['mu'],
                                     ref_stats['log_std']).squeeze(0)
                         self.rl_trajectory['ref_logprobs'] = ref_lp.float().cpu().numpy()
+                        if "reference_stop_logits" in ref_stats:
+                            self.rl_trajectory["ref_categorical_stop_logits"] = (
+                                ref_stats["reference_stop_logits"].squeeze(0).float().cpu().numpy()
+                            )
                 else:
                     logits = policy_stats['logits']
                     logprobs = self._calculate_action_logprobs(logits).squeeze().float().cpu()
@@ -1247,6 +1459,7 @@ class RLActor(RLWorker):
         actions_continuous = traj_batch.get('actions_continuous', None)
         old_log_prob = traj_batch['old_log_prob']
         advantages = traj_batch['advantages']
+        stop_advantages = traj_batch.get('stop_advantages', None)
         returns = traj_batch['returns']
         old_values = traj_batch.get('values',None)
         rollout_log_probs = traj_batch.get('rollout_logprobs',None)
@@ -1256,6 +1469,12 @@ class RLActor(RLWorker):
         shadow_stop_action = traj_batch.get('shadow_stop_action', None)
         shadow_stop_reward = traj_batch.get('shadow_stop_reward', None)
         policy_action_mask = traj_batch.get('policy_action_mask', None)
+        categorical_stop_action = traj_batch.get('categorical_stop_action', None)
+        old_categorical_stop_logprob = traj_batch.get(
+            'old_categorical_stop_logprob', None
+        )
+        stop_policy_mask = traj_batch.get('stop_policy_mask', None)
+        ref_categorical_stop_logits = traj_batch.get('ref_categorical_stop_logits', None)
 
         # NOTE on the chain head's `old_log_prob`: the postprocess value is passed through
         # UNCHANGED -- there is no re-anchoring (an earlier anchor was removed; it papered
@@ -1265,7 +1484,7 @@ class RLActor(RLWorker):
         # sitting at seam level. If actor/ppo_kl is large on minibatches trained BEFORE any
         # optimizer step of the cycle, suspect attn_impl or a trajectory/model_inputs
         # misalignment (see the alignment invariant in train_rl.py), never the seam.
-        return super().train_rl_step(embeds_inputs, actions=actions, old_log_prob=old_log_prob, advantages=advantages, returns=returns, old_values=old_values, rollout_log_probs=rollout_log_probs, ref_log_probs=ref_logprobs, actions_continuous=actions_continuous, sde_positions=sde_positions, stop_targets=stop_targets, shadow_stop_action=shadow_stop_action, shadow_stop_reward=shadow_stop_reward, policy_action_mask=policy_action_mask, loss_scale=loss_scale)
+        return super().train_rl_step(embeds_inputs, actions=actions, old_log_prob=old_log_prob, advantages=advantages, returns=returns, old_values=old_values, rollout_log_probs=rollout_log_probs, ref_log_probs=ref_logprobs, actions_continuous=actions_continuous, sde_positions=sde_positions, stop_targets=stop_targets, shadow_stop_action=shadow_stop_action, shadow_stop_reward=shadow_stop_reward, policy_action_mask=policy_action_mask, categorical_stop_action=categorical_stop_action, old_categorical_stop_logprob=old_categorical_stop_logprob, stop_policy_mask=stop_policy_mask, ref_categorical_stop_logits=ref_categorical_stop_logits, stop_advantages=stop_advantages, loss_scale=loss_scale)
     
     def train_dagger_step(self, embeds_inputs_np, embeds_inputs_meta, traj_batch):
         """
@@ -1829,11 +2048,19 @@ def collect_rollouts(
                 dispatch_id, vlm, sim =  active_episodes.pop(ref)
                 # Unpack results
                 is_exhausted, result = ray.get(ref)
-                result_dict[dispatch_id] = result
+                if result is None:
+                    print(
+                        f"Discarding failed rollout dispatch_id={dispatch_id}; "
+                        "no trajectory will be postprocessed.",
+                        flush=True,
+                    )
+                    idle_vlms.append(vlm)
+                else:
+                    result_dict[dispatch_id] = result
 
-                # send vlm and sim to post episode processing
-                pp_ref = vlm.postprocess_episode.remote(**postprocess_kwargs)
-                pending_postproc[pp_ref] = vlm,dispatch_id
+                    # Send only a completed trajectory to postprocessing.
+                    pp_ref = vlm.postprocess_episode.remote(**postprocess_kwargs)
+                    pending_postproc[pp_ref] = vlm,dispatch_id
 
                 log_ref = sim.flush_logs_to_disk.remote()
                 pending_logs[log_ref] = sim,dispatch_id,is_exhausted
@@ -1866,7 +2093,7 @@ def collect_rollouts(
                     pass
     rollouts = [t for _, t in sorted(zip(trajectory_ids, trajectory_buffer))]
     log_dict |={v[1]:k for k,v in pending_logs.items()}
-    num_rollouts = len(rollouts)
-    result_list = [result_dict[i] for i in range(num_rollouts)]
-    log_list = [log_dict[i] for i in range(num_rollouts)]
+    ordered_ids = sorted(trajectory_ids)
+    result_list = [result_dict[i] for i in ordered_ids]
+    log_list = [log_dict[i] for i in ordered_ids]
     return ray.get(rollouts), result_list, log_list

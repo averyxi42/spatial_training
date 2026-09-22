@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 from hydra.core.config_store import ConfigStore
 from omegaconf import MISSING
@@ -11,6 +12,7 @@ cs = ConfigStore.instance()
 class WandbLoggerConfig:
     _target_: str = "longnav.utils.logging_workers.WandbLoggerActor"
     project: str = MISSING
+    group: Optional[str] = None
     compact_metrics: bool = False
 
 

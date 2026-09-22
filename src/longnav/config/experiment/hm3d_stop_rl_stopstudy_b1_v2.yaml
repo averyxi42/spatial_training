@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - hm3d_stop_rl_stopstudy_v2_common
+
+rollout:
+  stop_execution_mode: physical
+  stop_prob_threshold: 0.95
+
+training:
+  action_head_learning_rate: 0.0
+  rl_config:
+    state_probe: auto
+    state_probe_trainable: true
+    state_probe_stop_threshold: 0.95
+    state_probe_bce_threshold: 0.95
+
+task:
+  run_name: hm3d_stopstudy_b1_v2

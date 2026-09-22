@@ -1,17 +1,13 @@
 # @package _global_
-# D: same 30-chunk no-stop prefix as C, then a deliberately much tighter 1 cm threshold.
+# D: strict near-zero motion needs no initial guard on the measured SFT distribution.
 defaults:
   - hm3d_stop_rl_stopstudy_common
-
-sim:
-  post_goal_stillness_reward: 0.5
-  post_goal_stillness_scale_m: 0.15
 
 rollout:
   stop_execution_mode: trajectory_length
   trajectory_stop_threshold_m: 0.01
-  trajectory_stop_min_steps: 30
-  learn_post_goal_actions: true
+  trajectory_stop_yaw_threshold_rad: 0.01
+  trajectory_stop_min_steps: 0
 
 training:
   rl_config:

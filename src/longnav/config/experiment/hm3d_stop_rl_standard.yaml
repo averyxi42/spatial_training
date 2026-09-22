@@ -18,6 +18,7 @@ vlm:
 
 sim:
   episodes: /home/ubuntu/storage-migrations/20260906-longnav/received/ff1df307208465bfb3b9d310ef0a0cedabb9dff9/extracted/parts/simulator-rebuild-missing/Projects/data/datasets/objectnav/hm3d/v1_train100x80
+  eval_episodes: /home/ubuntu/storage-migrations/20260906-longnav/received/ff1df307208465bfb3b9d310ef0a0cedabb9dff9/extracted/parts/simulator-rebuild-missing/Projects/data/datasets/objectnav/hm3d/v1/val
   scene_root: /mnt/nvme_scratch/longnav_rl_runtime/data/scene_datasets
   exclude_categories: [plant]
   train_uids: /home/ubuntu/storage-migrations/20260906-longnav/v12-regeneration/production/rl_stop_experiments/splits/train128.txt
@@ -25,7 +26,6 @@ sim:
   dt: 0.04
   max_steps: 175
   success_distance: 1.0
-  post_goal_steps: 16
   success_reward: 0.0
   escape_penalty: 2.5
   navmesh: dataset

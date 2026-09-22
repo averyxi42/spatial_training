@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - hm3d_stop_rl_stopstudy_v2_common
+
+vlm:
+  merge_adapter_dir: /home/ubuntu/storage-migrations/20260906-longnav/v12-regeneration/production/rl_stop_experiments/stop_head_rl_20260913/action_based_stop_sft/training_r4/checkpoint-2400/adapter
+  policy_head:
+    checkpoint_dir: /home/ubuntu/storage-migrations/20260906-longnav/v12-regeneration/production/rl_stop_experiments/stop_head_rl_20260913/action_based_stop_sft/training_r4/checkpoint-2400
+
+rollout:
+  stop_execution_mode: trajectory_length
+  trajectory_stop_threshold_m: 0.05
+  trajectory_stop_yaw_threshold_rad: 0.05
+  trajectory_stop_min_steps: 30
+
+training:
+  action_head_learning_rate: 1.0e-6
+  rl_config:
+    state_probe: null
+    state_probe_trainable: false
+
+task:
+  run_name: hm3d_stopstudy_c1_v2

@@ -297,6 +297,8 @@ class FlowSDEHead(nn.Module):
         """
         dev = next(self.parameters()).device
         ctx = torch.as_tensor(np.asarray(h, np.float32), device=dev).reshape(1, -1)
+        if self._gen is not None and self._gen.device != dev:
+            self.seed(self._gen.initial_seed())
         cfg, K, dt = self.sde, self.K, -1.0 / self.K
         admissible = K - cfg.n_exclude_last
         perm = torch.randperm(admissible, generator=self._gen, device=dev)[: cfg.n]
@@ -411,7 +413,10 @@ class FlowSDEHead(nn.Module):
                 "flow_sde head requires `checkpoint_dir`: the readout and the velocity "
                 "field are trained modules, and a fresh one is not a policy."
             )
-        readout, codec, _ = load_flow_stack(ckpt, dtype=dtype)
+        readout_dtype = cfg.get("readout_dtype")
+        readout, codec, _ = load_flow_stack(
+            ckpt, dtype=getattr(torch, readout_dtype) if readout_dtype else dtype
+        )
         head = cls(
             readout=readout, codec=codec, gap=int(cfg["gap"]),
             sde=SDEConfig(

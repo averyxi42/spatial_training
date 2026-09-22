@@ -52,15 +52,24 @@ register_configs()
 @hydra.main(version_base=None, config_name="rl_config", config_path='../config')
 def main(cfg: RLConfig):
     cfg.vlm.save_outputs = True
+    if os.environ.get("LONGNAV_TRAIN_SEED") is not None:
+        import random
+        import numpy as np
+        import torch
+        seed = int(os.environ["LONGNAV_TRAIN_SEED"])
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
     import ray
 
     from longnav.utils.train_loop import (
         bootstrap_all,
+        _save_checkpoint_snapshot,
         build_eval_partition,
         build_vector_eval_groups,
         compute_advantages_and_returns,
         maybe_checkpoint,
-        maybe_save_eval_bests,
+        maybe_save_eval_candidates,
         recycle_vector_sims,
         run_eval_cycle,
         run_rollout_cycle,
@@ -81,43 +90,56 @@ def main(cfg: RLConfig):
     num_vlms = len(trainers)
 
     eval_every = int(getattr(tcfg.task, "eval_every", 4))
-    eval_set_size = int(getattr(tcfg.task, "eval_set_size", 0)) or n_rollout
-    eval_seed = int(getattr(tcfg.task, "eval_seed", 0))
-    eval_ode = bool(getattr(tcfg.task, "eval_ode", True))
+    eval_only_cycle = getattr(tcfg.task, "eval_only_cycle", None)
+    if eval_only_cycle is not None and int(eval_only_cycle) < 0:
+        raise ValueError("task.eval_only_cycle must be non-negative")
+    max_train_cycles = getattr(tcfg.task, "max_train_cycles", None)
+    if max_train_cycles is not None and int(max_train_cycles) <= 0:
+        raise ValueError("task.max_train_cycles must be positive when set")
+    eval_enabled = eval_only_cycle is not None or eval_every > 0
     run_dir = os.path.join(tcfg.task.output_dir, tcfg.task.run_name)
 
-    # Draw the fixed eval set up front (the sims have parsed the pool during bootstrap's
-    # first reset) and log its identity so any later analysis can reproduce it.
+    # Draw the fixed eval set only when an in-training episode eval is enabled.
     if getattr(tcfg.sim, "train_uids", None) and int(getattr(tcfg.task, "shard_size", 0)) > 0:
         raise ValueError(
             "sim.train_uids is set but task.shard_size > 0. The uid filter applies only to "
             "the trivial (None) shard, so an explicitly sharded run would train on the WHOLE "
             "pool while the config says otherwise -- and the eval set would no longer be "
             "held out. Set shard_size: 0.")
-    eval_uids_file = getattr(tcfg.task, "eval_uids_file", None)
-    pinned = None
-    if eval_uids_file:
-        with open(eval_uids_file) as f:
-            pinned = [u.strip() for u in f.read().replace("\n", ",").split(",") if u.strip()]
-    if ctx.vector_envs_per_sim > 1:
-        eval_uids, eval_parts = build_vector_eval_groups(
-            sims,
-            eval_set_size,
-            eval_seed,
-            ctx.vector_envs_per_sim,
-            uids=pinned,
-        )
+    if eval_enabled:
+        eval_set_size = int(getattr(tcfg.task, "eval_set_size", 0)) or n_rollout
+        eval_seed = int(getattr(tcfg.task, "eval_seed", 0))
+        eval_ode = bool(getattr(tcfg.task, "eval_ode", True))
+        eval_pool = bool(getattr(tcfg.sim, "eval_episodes", None))
+        eval_uids_file = getattr(tcfg.task, "eval_uids_file", None)
+        pinned = None
+        if eval_uids_file:
+            with open(eval_uids_file) as f:
+                pinned = [u.strip() for u in f.read().replace("\n", ",").split(",") if u.strip()]
+        if ctx.vector_envs_per_sim > 1:
+            eval_uids, eval_parts = build_vector_eval_groups(
+                sims,
+                eval_set_size,
+                eval_seed,
+                ctx.vector_envs_per_sim,
+                uids=pinned,
+                eval_pool=eval_pool,
+            )
+        else:
+            eval_uids, eval_parts = build_eval_partition(
+                sims, eval_set_size, eval_seed, uids=pinned, eval_pool=eval_pool
+            )
+        if pinned:
+            logger.info(f"eval set: PINNED from {eval_uids_file}")
+        logger.info(f"eval set: {len(eval_uids)} fixed episodes (seed {eval_seed}), "
+                    f"every {eval_every} cycles, ode={eval_ode}")
     else:
-        eval_uids, eval_parts = build_eval_partition(
-            sims, eval_set_size, eval_seed, uids=pinned
-        )
-    if pinned:
-        logger.info(f"eval set: PINNED from {eval_uids_file}")
-    logger.info(f"eval set: {len(eval_uids)} fixed episodes (seed {eval_seed}), "
-                f"every {eval_every} cycles, ode={eval_ode}")
+        eval_uids, eval_parts = [], []
+        logger.info("in-training episode eval disabled")
     os.makedirs(run_dir, exist_ok=True)
-    with open(os.path.join(run_dir, "eval_set_uids.txt"), "w") as f:
-        f.write("\n".join(eval_uids) + "\n")
+    if eval_enabled:
+        with open(os.path.join(run_dir, "eval_set_uids.txt"), "w") as f:
+            f.write("\n".join(eval_uids) + "\n")
 
     # RESUME. `training.checkpoint` always restores weights (and optimizer/scheduler
     # when load_optim/load_sched are set).  Driver state is separate so a checkpoint can
@@ -141,6 +163,16 @@ def main(cfg: RLConfig):
         )
     global_cycle = start_cycle          # defined before the loop so a fault during
                                         # setup still names a cycle in the crash dir
+    if eval_only_cycle is not None:
+        start_cycle = int(eval_only_cycle)
+        global_cycle = start_cycle
+        num_rollouts = start_cycle + 1
+    elif max_train_cycles is not None:
+        num_rollouts = min(num_rollouts, int(max_train_cycles))
+        logger.info(
+            f"checkpoint gate: stopping after {num_rollouts} driver cycles "
+            f"without changing scheduler horizon"
+        )
 
     def cleanup():
         for trainer in trainers:
@@ -161,9 +193,17 @@ def main(cfg: RLConfig):
         ray.shutdown()
 
     try:
+        if tcfg.task.save_initial_checkpoint and start_cycle == 0:
+            _save_checkpoint_snapshot(
+                trainers, os.path.join(run_dir, "checkpoints", "initial"), -1, [])
+        if tcfg.task.initialization_only:
+            return
         for global_cycle in range(start_cycle, num_rollouts):
             # ------------------------- interleaved eval pass -------------------------
-            if eval_every > 0 and global_cycle % eval_every == 0:
+            if (
+                eval_only_cycle is not None
+                or (eval_every > 0 and global_cycle % eval_every == 0)
+            ):
                 logger.info(f"Eval pass @ cycle {global_cycle}")
                 eval_row = run_eval_cycle(
                     sims, trainers, eval_parts, len(eval_uids), wandb_actor,
@@ -175,12 +215,15 @@ def main(cfg: RLConfig):
                     episode_hard_timeout_seconds=ctx.episode_hard_timeout_seconds,
                     sim_restart_limit=ctx.sim_restart_limit,
                     stop_success_radius=float(tcfg.sim.success_distance),
+                    record_media=not bool(tcfg.sim.minimal_logging),
                 )
                 if bool(getattr(tcfg.task, "save_eval_bests", True)):
-                    maybe_save_eval_bests(
+                    maybe_save_eval_candidates(
                         trainers, eval_row, global_cycle, tcfg.task.output_dir,
                         tcfg.task.run_name, trajectory_list,
                     )
+                if eval_only_cycle is not None:
+                    break
 
             # ------------------------------ rollouts ---------------------------------
             logger.info("Starting rollout collection!")
@@ -225,7 +268,12 @@ def main(cfg: RLConfig):
                 training_futures, future_metadata, traj_batch, wandb_actor,
                 global_cycle, global_return_mean, logger, log_list, runtime_metrics,
                 update_started, cycle_started,
+                stop_threshold=float(tcfg.training.rl_config.state_probe_stop_threshold or 0.95),
             )
+            with open(os.path.join(run_dir, "cycle_metrics.jsonl"), "a") as metrics_file:
+                import json
+                metrics_file.write(json.dumps({"completed_cycles": global_cycle + 1,
+                                               **cycle_metrics}) + "\n")
             max_ref_p95 = getattr(
                 tcfg.training.rl_config, "max_ref_log_ratio_p95", None
             )

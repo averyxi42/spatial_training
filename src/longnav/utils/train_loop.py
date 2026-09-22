@@ -71,6 +71,9 @@ def bootstrap_all(cfg: RLConfig, training: bool) -> BootstrapContext:
     paired = bool(bootstrapper.typed_cfg.resources.paired_gpu_workers)
     placement_groups = None
     scheduling_strategies = None
+    vector_paired = paired and bool(
+        getattr(bootstrapper.typed_cfg.sim, "episodes_path", None)
+    )
     if paired:
         placement_groups, scheduling_strategies = (
             bootstrapper.create_paired_gpu_placement_groups()
@@ -94,7 +97,7 @@ def bootstrap_all(cfg: RLConfig, training: bool) -> BootstrapContext:
         bootstrapper.verify_paired_gpu_placement(trainers, sims)
 
     vector_envs_per_sim = int(getattr(bootstrapper.typed_cfg.sim, "slots_per_host", 1))
-    if paired:
+    if vector_paired:
         wave_size = len(sims) * vector_envs_per_sim
         n_rollout = bootstrapper.typed_cfg.training.rl_config.n_rollout
         if n_rollout % wave_size:
@@ -139,7 +142,9 @@ def bootstrap_all(cfg: RLConfig, training: bool) -> BootstrapContext:
     num_rollouts = (
         bootstrapper.typed_cfg.training.total_optimization_steps
         * bootstrapper.typed_cfg.training.grad_accum_steps
+        * len(trainers)
         // bootstrapper.typed_cfg.training.rl_config.n_rollout
+        // max(bootstrapper.typed_cfg.training.rl_config.n_epoch, 1)
     )
 
     def sim_rebuilder(worker_index):
@@ -297,12 +302,18 @@ def run_rollout_cycle(
     return traj_batch, model_inputs, values, distances, log_list
 
 
-def build_eval_partition(sims, set_size: int, seed: int, uids: Optional[List[str]] = None):
+def build_eval_partition(
+    sims,
+    set_size: int,
+    seed: int,
+    uids: Optional[List[str]] = None,
+    eval_pool: bool = False,
+):
     """Draw the FIXED eval set once (seeded, from the pool the sims already parsed) and
     partition it round-robin across sims. Fixed set => consecutive eval points are PAIRED
     on identical episodes; a fresh random sample each cycle would bury real movement
     under episode variance (measured: block-50 sd 0.063 at p=0.71)."""
-    pool = sorted(ray.get(sims[0].list_episode_uids.remote()))
+    pool = sorted(ray.get(sims[0].list_episode_uids.remote(eval_pool=eval_pool)))
     if uids:
         # PINNED set: use it verbatim, in the given order. A redrawn set is a different
         # set -- change the pool, the filter, the size or the seed and every historical
@@ -331,9 +342,10 @@ def build_vector_eval_groups(
     seed: int,
     slots_per_sim: int,
     uids: Optional[List[str]] = None,
+    eval_pool: bool = False,
 ):
     """Build fixed same-scene groups for batched NavVerse evaluation."""
-    pool = sorted(ray.get(sims[0].list_episode_uids.remote()))
+    pool = sorted(ray.get(sims[0].list_episode_uids.remote(eval_pool=eval_pool)))
     pool_set = set(pool)
     wave_size = len(sims) * slots_per_sim
 
@@ -514,16 +526,24 @@ def run_eval_cycle(sims, trainers, eval_parts, total, wandb_actor, global_cycle,
             f.write(json.dumps({"cycle": global_cycle,
                                 "uid": r.get("episode_label"),
                                 "success": int(bool(r.get("success"))),
+                                "oracle_success": int(bool(r.get("oracle_success"))),
+                                "final_distance_to_goal_m": r.get("distance_to_goal"),
+                                "min_distance_to_goal_m": r.get("min_m"),
+                                "path_length_m": r.get("path_length_m"),
+                                "spl_fix": float(r.get("spl_fix") or 0.0),
                                 "ospl_fix": float(r.get("ospl_fix") or 0.0),
                                 "steps": r.get("steps"),
                                 "termination_reason": r.get("termination_reason"),
                                 "policy_stop_mode": r.get("policy_stop_mode"),
                                 "mean_action_path_length_m": r.get(
-                                    "mean_action_path_length_m")}) + "\n")
+                                    "mean_action_path_length_m"),
+                                "mean_action_yaw_path_rad": r.get(
+                                    "mean_action_yaw_path_rad")}) + "\n")
     if save_stop_traces:
         trace_path = os.path.join(out_dir, "eval_stop_traces.jsonl")
         trace_keys = (
             "probe_p_stop", "stop_target", "action_path_length_m",
+            "action_yaw_path_rad",
             "decision_distance_to_goal_m", "history_turns", "policy_stop_mode",
         )
         with open(trace_path, "a") as f:
@@ -586,12 +606,30 @@ def compute_advantages_and_returns(
             li = int(last_idx[i])
             if bool(traj_batch["bootstrap_eligible"][i, li]):
                 rewards[i, li] = rewards[i, li] + cfg.training.rl_config.gamma * values[i, li]
-    adv_tuple = advantage_estimator_fn(
-        token_level_rewards=rewards,
-        values=values,
-        response_mask=traj_batch["response_mask"],
-        config=cfg.training.rl_config,
-    )
+    credit_mode = getattr(cfg.training.rl_config, "navigation_credit", "dense")
+    if credit_mode == "dense":
+        adv_tuple = advantage_estimator_fn(
+            token_level_rewards=rewards,
+            values=values,
+            response_mask=traj_batch["response_mask"],
+            config=cfg.training.rl_config,
+        )
+    else:
+        from longnav.utils.rl_core import compute_navigation_metric_advantages
+
+        motion_adv, stop_adv, motion_return, stop_return, baseline = (
+            compute_navigation_metric_advantages(traj_batch, credit_mode)
+        )
+        requested_scale = getattr(cfg.training.rl_config, "navigation_advantage_scale", None)
+        if requested_scale is not None:
+            if not math.isfinite(requested_scale) or requested_scale <= 0:
+                raise ValueError("navigation_advantage_scale must be finite and positive")
+            legacy_scale = 8.0 if credit_mode.startswith("shared_") else 4.0
+            motion_adv = motion_adv * (legacy_scale / requested_scale)
+            stop_adv = stop_adv * (legacy_scale / requested_scale)
+        traj_batch["stop_advantages"] = stop_adv
+        traj_batch["stop_returns"] = stop_return
+        adv_tuple = motion_adv, motion_return, baseline
     advantages, returns = adv_tuple[0], adv_tuple[1]
     if len(adv_tuple) > 2:
         traj_batch["baseline"] = adv_tuple[2]
@@ -722,6 +760,7 @@ def stream_results_and_log(
     runtime_metrics: Optional[Dict[str, float]] = None,
     update_started: Optional[float] = None,
     cycle_started: Optional[float] = None,
+    stop_threshold: float = 0.95,
 ) -> dict:
     """Async ray.wait monitor loop. Matches train_rl.py L230-293.
 
@@ -763,6 +802,36 @@ def stream_results_and_log(
                     **({"rollout/oracle_success": float(traj_stats["oracle_success"].max().item())}
                        if "oracle_success" in traj_stats.keys() else {}),
                 }
+                if "stop_advantages" in traj_stats.keys():
+                    motion_mask = traj_stats["policy_action_mask"].bool()
+                    stop_mask = traj_stats["stop_policy_mask"].bool()
+                    for branch, advantage, credit_mask in (
+                        ("motion", traj_stats["advantages"], motion_mask),
+                        ("stop", traj_stats["stop_advantages"], stop_mask),
+                    ):
+                        selected = advantage[credit_mask]
+                        if selected.numel():
+                            rollout_stats[f"credit/{branch}_advantage_mean"] = selected.mean().item()
+                            rollout_stats[f"credit/{branch}_positive_rate"] = (selected > 0).float().mean().item()
+                    rollout_stats["credit/motion_outcome"] = traj_stats["returns"][-1].item()
+                    rollout_stats["credit/stop_outcome"] = traj_stats["stop_returns"][-1].item()
+                    rollout_stats["credit/oracle_spl"] = traj_stats["oracle_spl"][-1].item()
+                    rollout_stats["credit/strict_spl"] = traj_stats["spl_fix"][-1].item()
+                    if "oracle_reached_before" in traj_stats.keys():
+                        post_reach = motion_mask & traj_stats["oracle_reached_before"].bool()
+                        false_stop = (stop_mask & (traj_stats["categorical_stop_action"] == 1)
+                                      & ~traj_stats["success"].bool())
+                        stop_credit = traj_stats["stop_advantages"]
+                        rollout_stats["credit/false_stop_positive_count"] = (
+                            false_stop & (stop_credit > 0)).float().sum().item()
+                        rollout_stats["credit/stop_zero_rate"] = (
+                            (stop_credit[stop_mask] == 0).float().mean().item())
+                        rollout_stats["credit/post_reach_motion_abs_max"] = (
+                            traj_stats["advantages"][post_reach].abs().max().item()
+                            if post_reach.any() else 0.0)
+                        rollout_stats["credit/motion_future_return_mean"] = (
+                            traj_stats["returns"][motion_mask].mean().item()
+                            if motion_mask.any() else 0.0)
                 if "probe_distance_m" in traj_stats.keys() and \
                         "distance_to_goal" in traj_stats.keys():
                     pd = traj_stats["probe_distance_m"].float()
@@ -783,7 +852,7 @@ def stream_results_and_log(
                     target = traj_stats["stop_target"].float()
                     valid = torch.isfinite(probability) & torch.isfinite(target)
                     if bool(valid.any()):
-                        predicted = probability[valid] >= 0.95
+                        predicted = probability[valid] >= stop_threshold
                         positive = target[valid] > 0.5
                         tp = (predicted & positive).sum().item()
                         fp = (predicted & ~positive).sum().item()
@@ -814,6 +883,19 @@ def stream_results_and_log(
                         traj_stats["exploration_gain_raw_m2"].float().sum().item()
                     rollout_stats["exploration/reward"] = \
                         traj_stats["exploration_reward"].float().sum().item()
+                if "first_reach_reward" in traj_stats.keys():
+                    rollout_stats["reward/first_reach"] = \
+                        traj_stats["first_reach_reward"].float().sum().item()
+                if "path_length_reward_penalty" in traj_stats.keys():
+                    rollout_stats["reward/path_length_penalty"] = \
+                        traj_stats["path_length_reward_penalty"].float().sum().item()
+                if "executed_path_delta_m" in traj_stats.keys():
+                    executed_path = traj_stats["executed_path_delta_m"].float()
+                    finite_executed_path = executed_path[torch.isfinite(executed_path)]
+                    if len(finite_executed_path):
+                        rollout_stats["rollout/executed_path_length_m"] = (
+                            finite_executed_path.sum().item()
+                        )
                 if "action_path_length_m" in traj_stats.keys():
                     path_lengths = traj_stats["action_path_length_m"].float()
                     finite_path_lengths = path_lengths[torch.isfinite(path_lengths)]
@@ -821,10 +903,13 @@ def stream_results_and_log(
                         rollout_stats["rollout/mean_action_path_length_m"] = (
                             finite_path_lengths.mean().item()
                         )
-                if "post_goal_stillness_reward" in traj_stats.keys():
-                    rollout_stats["rollout/post_goal_stillness_reward"] = (
-                        traj_stats["post_goal_stillness_reward"].float().sum().item()
-                    )
+                if "action_yaw_path_rad" in traj_stats.keys():
+                    yaw_paths = traj_stats["action_yaw_path_rad"].float()
+                    finite_yaw_paths = yaw_paths[torch.isfinite(yaw_paths)]
+                    if len(finite_yaw_paths):
+                        rollout_stats["rollout/mean_action_yaw_path_rad"] = (
+                            finite_yaw_paths.mean().item()
+                        )
                 if "values" in traj_stats.keys():
                     rollout_stats["probe/value_mae_ep"] = \
                         (traj_stats["values"].float() - traj_stats["returns"].float()).abs().mean().item()
@@ -864,6 +949,7 @@ def stream_results_and_log(
 
             except Exception as e:
                 logger.error(f"[{completed_count}/{total_tasks}] Task failed: {e}")
+                raise
 
     metrics = aggregate_cycle_metrics(cycle_rows) if cycle_rows else {}
     if metrics:
@@ -876,7 +962,7 @@ def stream_results_and_log(
                 runtime_metrics["runtime/train_cycle_wall_seconds"] = (
                     time.perf_counter() - cycle_started
                 )
-        metrics.update(runtime_metrics)
+        metrics.update(runtime_metrics or {})
     if wandb_actor is not None and metrics:
         ray.get(wandb_actor.log_cycle_metrics.remote(metrics, global_cycle, "train"))
     return metrics
@@ -900,9 +986,10 @@ def aggregate_cycle_metrics(rows: list) -> dict:
         return float(np.mean(values)) if values else float("nan")
 
     def _reason_rate(reason):
-        return float(np.mean([
-            str(row.get("termination_reason") or "") == reason for row in rows
-        ]))
+        reasons = [row.get("termination_reason") for row in rows]
+        if not reasons or not all(reasons):
+            return float("nan")
+        return float(np.mean([value == reason for value in reasons]))
 
     return {
         "rollout/success_rate": _mean("rollout/success"),
@@ -917,24 +1004,29 @@ def aggregate_cycle_metrics(rows: list) -> dict:
         "rollout/mean_action_path_length_m": _mean(
             "rollout/mean_action_path_length_m"
         ),
-        "rollout/post_goal_stillness_reward": _mean(
-            "rollout/post_goal_stillness_reward"
+        "rollout/mean_action_yaw_path_rad": _mean(
+            "rollout/mean_action_yaw_path_rad"
         ),
         "probe/stop_precision": _mean("probe/stop_precision"),
         "probe/stop_recall": _mean("probe/stop_recall"),
         "exploration/raw_gain_m2": _mean("exploration/raw_gain_m2"),
         "exploration/reward": _mean("exploration/reward"),
+        "reward/first_reach": _mean("reward/first_reach"),
         "train/policy_loss": _mean("loss/pg_loss_scaled"),
         "train/value_mse": _mean("rollout/baseline_mse"),
         "train/ppo_kl": _mean("actor/ppo_kl"),
-        "train/clip_fraction": _mean("actor/pg_clipfrac"),
+        "train/clip_fraction": _mean("actor/ratio_outside_clip"),
+        "train/cov_mask_fraction": _mean("actor/pg_clipfrac"),
         "train/grad_norm": _mean("train/grad_norm"),
         "train/lr": _mean("train/lr"),
         "policy/ref_kl": _mean("ref/kl_k2"),
         "policy/ref_log_ratio_p95": _mean("ref/r_p95"),
         "policy/ref_log_ratio_absmax": _mean("ref/r_absmax"),
         "policy/log_ratio_abs_mean": _mean("chain/abs_log_ratio_mean"),
-        "policy/hidden_drift": _mean("chain/h_drift_from_init"),
+        **{key: _mean(key) for key in set().union(*(row.keys() for row in rows))
+           if key.startswith(("fixed/", "stop/", "credit/", "train/grad_norm_", "train/clip_fraction_",
+                              "train/lr_used_", "probe/stop_", "probe/p_stop_"))
+           or key == "train/optimizer_step"},
     }
 
 
@@ -1063,7 +1155,7 @@ def _save_checkpoint_snapshot(
     return final_dir
 
 
-def maybe_save_eval_bests(
+def maybe_save_eval_candidates(
     trainers,
     eval_row: Dict[str, float],
     global_cycle: int,
@@ -1071,14 +1163,14 @@ def maybe_save_eval_bests(
     run_name: str,
     trajectory_list: Optional[list] = None,
 ) -> None:
-    """Keep one immutable snapshot for each newly best fixed-eval metric."""
+    """Keep unvalidated candidates from the in-training fixed-eval curve."""
     slots = {
-        "best_ospl": "eval/ospl",
-        "best_spl": "eval/spl",
-        "best_sr": "eval/success_rate",
+        "candidate_best_ospl": "eval/ospl",
+        "candidate_best_spl": "eval/spl",
+        "candidate_best_sr": "eval/success_rate",
     }
     checkpoint_root = os.path.join(output_dir, run_name, "checkpoints")
-    metadata_path = os.path.join(checkpoint_root, "best_metrics.json")
+    metadata_path = os.path.join(checkpoint_root, "candidate_metrics.json")
     previous = {}
     if os.path.isfile(metadata_path):
         with open(metadata_path) as f:
@@ -1105,13 +1197,26 @@ def maybe_save_eval_bests(
             "cycle": global_cycle,
             "checkpoint": os.path.basename(snapshot),
         }
+    linked_snapshots = {
+        os.path.abspath(os.path.join(checkpoint_root, os.readlink(link)))
+        for slot in slots
+        if os.path.islink(link := os.path.join(checkpoint_root, slot))
+    }
+    for name in os.listdir(checkpoint_root):
+        candidate = os.path.join(checkpoint_root, name)
+        if (
+            name.startswith("checkpoint_eval_")
+            and os.path.isdir(candidate)
+            and os.path.abspath(candidate) not in linked_snapshots
+        ):
+            shutil.rmtree(candidate)
     temp_metadata = f"{metadata_path}.tmp-{os.getpid()}"
     with open(temp_metadata, "w") as f:
         json.dump(previous, f, indent=2, sort_keys=True)
         f.write("\n")
     os.replace(temp_metadata, metadata_path)
     print(
-        "fixed-eval best checkpoint saved: "
+        "unvalidated fixed-eval candidate saved: "
         + ", ".join(f"{slot}={value:.6f}" for slot, _, value in improved),
         flush=True,
     )
@@ -1131,6 +1236,8 @@ def maybe_checkpoint(
     them, exactly one hidden rolling directory is retained; the ``latest`` symlink
     changes only after weights, optimizer, scheduler, and driver state are complete.
     """
+    if not all(ray.get([trainer.checkpoint_ready.remote() for trainer in trainers])):
+        return
     steps_until_save = (global_cycle + 1) % save_step
     checkpoint_root = os.path.join(output_dir, run_name, "checkpoints")
     final_name = (

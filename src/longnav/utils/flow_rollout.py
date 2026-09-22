@@ -52,6 +52,7 @@ A checkpoint declaring no specs loads and runs with the mechanism inert.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional, Union
 
@@ -131,7 +132,16 @@ def load_flow_policy(
     if pin_flow_noise is not None:
         model.codec.pin_flow_noise(int(pin_flow_noise))
     print(f"[flow] {model.codec.describe()}", flush=True)
-    return VectorRolloutPolicy(model, processor, cfg)
+    policy = VectorRolloutPolicy(model, processor, cfg)
+    state_probe = checkpoint_dir / "state_probe.pt"
+    state_probe_config = checkpoint_dir / "state_probe_config.json"
+    if state_probe.is_file() or state_probe_config.is_file():
+        # Preserve the existing loud error for an incomplete STOP probe bundle.
+        if not state_probe.is_file() or not state_probe_config.is_file():
+            policy.attach_state_probe(checkpoint_dir)
+        elif json.loads(state_probe_config.read_text()).get("stop") is not None:
+            policy.attach_state_probe(checkpoint_dir)
+    return policy
 
 
 def seed_latent(policy: VectorRolloutPolicy, seed: Optional[int]) -> None:

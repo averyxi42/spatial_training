@@ -1,0 +1,19 @@
+# @package _global_
+defaults:
+  - hm3d_stop_rl_stopstudy_b1_v2
+
+sim:
+  slack_penalty: 0.01
+  path_length_penalty: 0.025
+
+training:
+  learning_rate: 1.0e-7
+  weight_decay: 0.01
+  rl_config:
+    n_rollout: 4
+    ref_kl_coeff: 0.01
+
+task:
+  run_name: hm3d_stopstudy_b4_anchored
+  logger:
+    group: hm3dpe_b3b4_300_r1

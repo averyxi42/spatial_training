@@ -53,7 +53,7 @@ training and the head silently degrades.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -162,7 +162,7 @@ class RolloutConfig:
     # The alternative placement: the goal repeated inside every observation block.
     goal_inline_text: str = "Goal: {marker}"
     use_sparse: bool = True
-    merge_lora: bool = True  # fold adapters into the base weights for inference speed
+    merge_lora: bool = False
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
     # Optional guard: raise once the cached context passes this many tokens, instead of
@@ -673,6 +673,53 @@ class VectorRolloutPolicy:
         self._stop_rng = torch.Generator(device=self.cfg.device).manual_seed(int(seed))
         return self
 
+    def attach_state_probe(self, checkpoint_dir: Union[str, Path]) -> "VectorRolloutPolicy":
+        """Load the checkpointed history-conditioned STOP probe for rollout."""
+        import json
+
+        from longnav.utils.state_probe import (
+            STATE_PROBE_CONFIG_FILE,
+            STATE_PROBE_FILE,
+            load_state_probe,
+        )
+
+        checkpoint_dir = Path(checkpoint_dir)
+        config_path = checkpoint_dir / STATE_PROBE_CONFIG_FILE
+        weights_path = checkpoint_dir / STATE_PROBE_FILE
+        if not config_path.is_file() or not weights_path.is_file():
+            raise FileNotFoundError(
+                f"state probe requires {config_path} and {weights_path}"
+            )
+        metadata = json.loads(config_path.read_text())
+        offset = metadata.get("worker_value_readout_offset")
+        if offset in (None, 0):
+            raise ValueError(
+                "state probe requires a nonzero worker_value_readout_offset"
+            )
+        probe = load_state_probe(
+            checkpoint_dir, input_dim=self.language_model.config.hidden_size
+        )
+        if probe.stop_head is None:
+            raise ValueError("state probe checkpoint has no stop head")
+        expected = metadata.get("probe_token_id")
+        matches = [i for i, token in enumerate(self.emit_ids) if token == expected]
+        if len(matches) != 1:
+            raise ValueError(
+                f"state probe token id {expected} occurs {len(matches)} time(s) in "
+                f"the emitted assistant prefix {self.emit_ids}"
+            )
+        expected_match = len(self.emit_ids) + int(offset) - 1
+        if matches[0] != expected_match:
+            raise ValueError(
+                "state probe token/readout contract disagrees with the emitted "
+                f"assistant prefix: token index={matches[0]}, expected "
+                f"{expected_match} for worker offset={offset}"
+            )
+        self._probe = probe.to(self.cfg.device).eval()
+        # Use the worker's complete-turn readout offset, not the preceding probe token.
+        self._probe_readout_offset = int(offset)
+        return self
+
     def _resolve_pose_spec(self):
         """The single spec whose values are raw poses, or None.
 
@@ -939,7 +986,13 @@ class VectorRolloutPolicy:
             step_modality = pending.concat(step_modality or ModalityBatch())
 
         t0 = time.perf_counter()
+        probe_hidden = None
+        probe_backbone_seconds = 0.0
+        action_backbone_started = time.perf_counter()
         outputs = self._forward(inputs, step_modality)
+        action_backbone_seconds = time.perf_counter() - action_backbone_started
+        if getattr(self, "_probe", None) is not None:
+            probe_hidden = outputs["last_hidden_state"][:, self._probe_readout_offset, :]
 
         # The emitted block ends exactly at the last readout position, so the states the
         # head wants are the final `n_readout` of the sequence -- no span search needed, and
@@ -948,21 +1001,31 @@ class VectorRolloutPolicy:
         hidden = outputs["last_hidden_state"][:, -n:, :]
         head_dtype = next(self.model.head.parameters()).dtype
         states = hidden.to(head_dtype)
+        action_head_started = time.perf_counter()
         vector = self.model.head(states)
+        action_head_seconds = time.perf_counter() - action_head_started
+        flow_started = time.perf_counter()
         chunk = self.model.normalizer.denormalize(
             vector.view(-1, *self.model.target_shape)
         )[0].float().cpu()
+        flow_seconds = time.perf_counter() - flow_started
 
         # The stop readout, on the same pooled context the motion head just used. Reported
         # rather than acted on: whether an episode ends is the caller's decision, and a
         # policy that silently truncated its own rollout would be indistinguishable from
         # one that crashed.
-        stop_prob = stop = None
+        stop_prob = stop = stop_logit = None
+        stop_started = time.perf_counter()
         if self.model.stop_head is not None:
             pooled = self.model.head.pooled_context(states)
             logit = self.model.stop_head(pooled)
             stop_prob = float(self.model.stop_head.probability(logit)[0])
             stop = bool(self.model.stop_head.decide(logit, generator=self._stop_rng)[0])
+        elif probe_hidden is not None:
+            logit = self._probe.stop_head(probe_hidden)
+            stop_logit = float(logit.reshape(-1)[0].float().cpu())
+            stop_prob = float(torch.sigmoid(logit).reshape(-1)[0].float().cpu())
+        stop_seconds = time.perf_counter() - stop_started
 
         self._pending = list(self.tail_ids)
         self.step_index += 1
@@ -974,7 +1037,15 @@ class VectorRolloutPolicy:
             "cached_tokens": self.cached_tokens,
             "dense_tokens": self.dense_tokens,
             "latency_s": time.perf_counter() - t0,
+            "runtime_s": {
+                "probe_backbone": probe_backbone_seconds,
+                "action_backbone": action_backbone_seconds,
+                "action_head": action_head_seconds,
+                "flow_decode": flow_seconds,
+                "stop_readout": stop_seconds,
+            },
             "stop_prob": stop_prob,
+            "stop_logit": stop_logit,
             "stop": stop,
             # The value that was actually injected, not the raw pose that was passed in.
             # A decodability probe has to correlate the pooled state against what the
@@ -1002,7 +1073,10 @@ class VectorRolloutPolicy:
 
     def _forward(self, inputs, modality: Optional[ModalityBatch] = None):
         device = self.cfg.device
-        turn = {k: v.to(device) for k, v in inputs.items() if v is not None}
+        turn = {
+            k: v.to(device) if hasattr(v, "to") else v
+            for k, v in inputs.items() if v is not None
+        }
         n_new = turn["input_ids"].shape[1]
 
         # Rope positions for the new tokens only, continued from where the last turn

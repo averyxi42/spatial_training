@@ -71,6 +71,14 @@ def main(cfg: RLConfig):
 
     eval_uids_file = getattr(bootstrapper.typed_cfg.task, "eval_uids_file", None)
     if eval_uids_file:
+        adapter_roundtrips = int(getattr(
+            bootstrapper.typed_cfg.task, "eval_adapter_roundtrip_cycles", 0
+        ))
+        if adapter_roundtrips < 0:
+            raise ValueError("task.eval_adapter_roundtrip_cycles must be non-negative")
+        for _ in range(adapter_roundtrips):
+            ray.get([trainer.merge_adapter.remote() for trainer in trainers])
+            ray.get([trainer.unmerge_adapter.remote() for trainer in trainers])
         with open(eval_uids_file) as f:
             uids = [uid.strip() for uid in f.read().replace("\n", ",").split(",")
                     if uid.strip()]
@@ -110,6 +118,7 @@ def main(cfg: RLConfig):
             episode_hard_timeout_seconds=ctx.episode_hard_timeout_seconds,
             sim_restart_limit=ctx.sim_restart_limit,
             stop_success_radius=float(bootstrapper.typed_cfg.sim.success_distance),
+            record_media=not bool(bootstrapper.typed_cfg.sim.minimal_logging),
         )
         os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, "eval_summary.json"), "w") as f:

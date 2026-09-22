@@ -1,0 +1,16 @@
+# @package _global_
+defaults:
+  - hm3d_stop_rl_stopstudy_b3_sampled
+
+rollout:
+  stop_shadow_miss_penalty: 1.0
+
+training:
+  learning_rate: 2.0e-6
+  rl_config:
+    state_probe_shadow_rl_weight: 0.5
+
+task:
+  run_name: hm3d_stopstudy_b3_aggressive
+  logger:
+    group: hm3dpe_b3aggressive_b4_300_r1

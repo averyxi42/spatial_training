@@ -122,7 +122,7 @@ def test_cycle_aggregation_has_only_decision_metrics():
 
     metrics = aggregate_cycle_metrics(rows)
     assert set(key.split("/", 1)[0] for key in metrics) == {
-        "rollout", "train", "policy", "probe", "exploration"
+        "rollout", "train", "policy", "probe", "exploration", "reward"
     }
     assert metrics["rollout/success_rate"] == 0.5
     assert metrics["rollout/oracle_success_rate"] == 1.0
@@ -131,3 +131,13 @@ def test_cycle_aggregation_has_only_decision_metrics():
     assert metrics["rollout/truncated_rate"] == 0.5
     assert math.isclose(metrics["train/policy_loss"], 0.3, abs_tol=1e-7)
     assert math.isclose(metrics["policy/ref_kl"], 0.04)
+
+
+def test_termination_rates_require_complete_metadata():
+    stopped = {"termination_reason": "policy_stop", "truncated": False}
+    timeout = {"termination_reason": "max_steps", "truncated": True}
+    metrics = aggregate_cycle_metrics([stopped, timeout])
+    assert metrics["rollout/policy_stop_rate"] == 0.5
+    assert metrics["rollout/truncated_rate"] == 0.5
+    for rows in ([{}], [stopped, {}]):
+        assert math.isnan(aggregate_cycle_metrics(rows)["rollout/policy_stop_rate"])

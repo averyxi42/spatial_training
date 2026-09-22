@@ -72,6 +72,12 @@ class RLAlgoConfig:
     # separate from the legacy frozen state-probe value adapter.
     state_probe_trainable: bool = False
     state_probe_stop_threshold: Optional[float] = None
+    # Train BCE in the decision coordinate used by a non-zero deployment threshold.
+    state_probe_bce_threshold: Optional[float] = None
+    state_probe_balanced_bce: bool = False
+    state_probe_bce_weight: float = 1.0
+    state_probe_ref_kl_coeff: float = 0.0
+    stop_behavior_seam_limit: Optional[float] = None
     # Training-time Bernoulli temperature for shadow STOP. Deployment calibration keeps
     # its own threshold; this value only shapes stochastic stop exploration.
     state_probe_stop_temperature: float = 1.0
@@ -79,6 +85,12 @@ class RLAlgoConfig:
     # None preserves the first-arrival weight saved with the SFT state probe.  An
     # explicit value is useful for controlled loss ablations.
     state_probe_firstpass_weight: Optional[float] = None
+    # Margin objective in the deployed hard-stop decision coordinate.  It is
+    # disabled by default so existing BCE and sampled-hazard studies are unchanged.
+    state_probe_threshold_margin_weight: float = 0.0
+    state_probe_threshold_margin_mode: str = "all"
+    state_probe_threshold_margin_positive: float = 0.0
+    state_probe_threshold_margin_negative: float = 0.0
     # 0 disables the inexpensive h-space gradient-conflict diagnostic.  A positive
     # interval logs component gradient norms/cosines every N training forwards.
     state_probe_gradient_diagnostic_interval: int = 0
@@ -89,6 +101,8 @@ class RLAlgoConfig:
     # This is the cycle mean of per-minibatch 95th-percentile absolute log ratios.
     max_ref_log_ratio_p95: Optional[float] = None
     advantage_estimator: str = "reinforce_plus_plus"
+    navigation_credit: str = "dense"
+    navigation_advantage_scale: Optional[float] = None
     n_rollout: int = 12 # note: must be divisible by num vlms times gradient accumulation
     n_adv: int = 256 # number of trajectories for advantage estimation, must > n_rollout
     n_epoch: int = 2 # number of policy gradient epochs
@@ -190,6 +204,9 @@ class VLMTrainingConfig:
     # Model weights can seed a new study without inheriting the old driver's cycle
     # counter or time-kernel advantage buffer.
     resume_driver_state: bool = True
+    # Pre-state checkpoints may not carry the driver-side state.  This permits a
+    # recovery to preserve their global-cycle/scheduler alignment explicitly.
+    resume_cycle: Optional[int] = None
 
     # Optimization
     learning_rate: float = 5e-6
@@ -201,6 +218,12 @@ class VLMTrainingConfig:
     save_step: Optional[int] = 10
     
     action_head_learning_rate: float = 5e-4
+    state_probe_learning_rate: Optional[float] = None
+    state_probe_weight_decay: Optional[float] = None
+    action_readout_only: bool = False
+    separate_gradient_clipping: bool = False
+    diagnostic_history_dir: Optional[str] = None
+    diagnostic_history_episodes: int = 32
     # Weight decay on the ADAPTERS group only (None = torch AdamW's default 0.01, which
     # every run to date has silently carried on every group). Under merge-based init
     # (vlm.merge_adapter_dir) the trainable LoRA is a zero-init delta on the SFT policy,
@@ -233,6 +256,8 @@ class VLMTrainingConfig:
 @dataclass
 class RolloutConfig:
     max_steps: int = 350
+    # An explicit value resets ODE and learned-STOP sampling to this seed every episode.
+    ode_episode_seed: Optional[int] = None
     # Episode wall-clock watchdog. The soft deadline requests an environment-level
     # terminal transition; the hard deadline replaces the simulator actor if the
     # single-threaded Isaac process cannot service that request. A replacement gets one
@@ -259,20 +284,31 @@ class RolloutConfig:
     ])
     stop_prob_threshold: Optional[float] = None
     stop_head_radius_m: float = 1.0
-    # ``shadow`` never interrupts control, ``physical`` applies the binary stop head,
-    # ``sampled`` applies its Bernoulli hazard, and ``trajectory_length`` turns a
+    # ``shadow`` never interrupts control, ``physical`` applies a thresholded binary
+    # head, ``sampled`` applies its Bernoulli hazard, ``categorical`` samples the same
+    # STOP-versus-CONTINUE policy used by PPO, and ``trajectory_length`` turns a
     # near-zero decoded action chunk into STOP.
     stop_execution_mode: str = "physical"
     trajectory_stop_threshold_m: Optional[float] = None
+    # An action chunk can be stationary in XY while requesting an in-place turn.
+    trajectory_stop_yaw_threshold_rad: Optional[float] = None
     # Ignore decoded-path STOP for this many initial zero-based action decisions.
     trajectory_stop_min_steps: int = 0
+    # Ignore any learned absorbing STOP actuator for this many initial decisions.
+    stop_execution_min_steps: int = 0
+    # Score only this initial STOP-decision prefix through the packed full-history
+    # forward path.  This is a targeted KV/full-forward parity guard for short
+    # episodes; zero preserves the incremental rollout path.
+    stop_fullscore_prefix_steps: int = 0
+    # Any learned STOP that contradicts a clearly non-stationary decoded action
+    # receives this bounded terminal penalty. Zero preserves prior behavior.
+    categorical_stop_action_consistency_penalty: float = 0.0
+    categorical_stop_action_consistency_translation_m: float = 0.1
+    categorical_stop_action_consistency_yaw_rad: float = 0.1
     stop_sample_temperature: float = 1.0
     stop_shadow_correct_reward: float = 1.0
     stop_shadow_false_penalty: float = 1.0
     stop_shadow_miss_penalty: float = 1.0
-    # The historical post-goal collection tail was masked from the action loss.  Enable
-    # this only when its reward is explicitly intended to teach stationary action chunks.
-    learn_post_goal_actions: bool = False
     # Deterministic-rollout mode: act on the env-provided state_dict['info']['oracle_action']
     # instead of sampling from the policy's own output distribution. The policy still runs a
     # real forward pass; only which action is taken (and fed back into the next turn's prompt)
@@ -309,6 +345,15 @@ class RunConfig:
     # Keep immutable snapshots when the pinned eval improves OSPL, SPL, or SR.
     save_eval_bests: bool = True
     eval_ode: bool = True
+    # Reproduce accumulated low-precision adapter merge/unmerge drift before eval.
+    eval_adapter_roundtrip_cycles: int = 0
+    # Run the fixed eval at this cycle and exit before any rollout or optimizer step.
+    eval_only_cycle: Optional[int] = None
+    # Stop after this many driver cycles while retaining the configured scheduler horizon.
+    # This supports checkpoint gates without changing the learning-rate schedule.
+    max_train_cycles: Optional[int] = None
+    save_initial_checkpoint: bool = False
+    initialization_only: bool = False
 
 # --- ROOT CONFIGs ---
 # `sim` and `vlm.policy_head` are Hydra ConfigStore groups (see conf/env_configs.py,

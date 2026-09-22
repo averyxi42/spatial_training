@@ -226,6 +226,12 @@ class StateProbeConfig:
         return cls(**{k: v for k, v in dict(d).items() if k in names})
 
 
+def binary_stop_log_probs(logits: torch.Tensor) -> torch.Tensor:
+    """Score the same bounded Bernoulli used by the STOP behavior sampler."""
+    probability = logits.float().sigmoid().double().clamp(1e-6, 1.0 - 1e-6)
+    return torch.stack((torch.log1p(-probability), probability.log()), dim=-1).float()
+
+
 class BinaryStopHead(nn.Module):
     """EPISODE-stop classifier: "is the agent at the goal, should the episode end?"
 
@@ -278,18 +284,22 @@ class BinaryStopHead(nn.Module):
         return self.mlp(x.to(self.dtype)).squeeze(-1)
 
     def loss(self, logits: torch.Tensor, y: torch.Tensor,
-             mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+             mask: Optional[torch.Tensor] = None,
+             balanced: bool = False) -> torch.Tensor:
         """Masked-mean BCE. NaN labels are masked, matching the other heads."""
         y = y.to(logits.device)
         finite = torch.isfinite(y)
         m = finite if mask is None else (mask.bool().to(y.device) & finite)
         if not bool(m.any()):
             return logits.sum() * 0.0
-        pw = (None if self.pos_weight is None
+        pw = (None if balanced or self.pos_weight is None
               else torch.tensor(self.pos_weight, device=logits.device, dtype=torch.float32))
         bce = nn.functional.binary_cross_entropy_with_logits(
             logits.float(), torch.where(finite, y, torch.zeros_like(y)).float(),
             pos_weight=pw, reduction="none")
+        if balanced:
+            classes = [m & (y > 0.5), m & (y <= 0.5)]
+            return torch.stack([bce[valid].mean() for valid in classes if valid.any()]).mean()
         mf = m.float()
         return (bce * mf).sum() / mf.sum().clamp_min(1.0)
 
@@ -361,6 +371,57 @@ class BinaryStopHead(nn.Module):
             return p * 0.0, False
         return (p - (1.0 - float(target_eps))) ** 2, True
 
+    @staticmethod
+    def threshold_margin_loss(
+        logits: torch.Tensor,
+        y: torch.Tensor,
+        threshold: float,
+        positive_margin: float,
+        negative_margin: float,
+        mode: str = "all",
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Keep logits on the intended side of the deployed hard-stop boundary."""
+        if not 0.0 < threshold < 1.0:
+            raise ValueError("stop threshold margin threshold must be in (0, 1)")
+        if positive_margin < 0.0 or negative_margin < 0.0:
+            raise ValueError("stop threshold margins must be non-negative")
+        if mode not in {"all", "first_visit"}:
+            raise ValueError(f"unknown stop threshold margin mode: {mode}")
+
+        lg = logits.float().reshape(-1)
+        yy = y.to(lg.device).float().reshape(-1)
+        valid = torch.isfinite(yy)
+        if mask is not None:
+            valid = valid & mask.to(lg.device).bool().reshape(-1)
+        positive = valid & (yy > 0.5)
+        selected = valid
+        if mode == "first_visit" and bool(positive.any()):
+            indices = torch.arange(positive.numel(), device=lg.device)
+            first = int(torch.nonzero(positive, as_tuple=False)[0, 0])
+            after_first = valid & (indices >= first)
+            first_nonpositive = torch.nonzero(
+                after_first & ~positive, as_tuple=False
+            )
+            end = (
+                int(first_nonpositive[0, 0])
+                if first_nonpositive.numel()
+                else positive.numel()
+            )
+            selected = valid & ((indices < first) | ((indices >= first) & (indices < end)))
+
+        positive = selected & (yy > 0.5)
+        negative = selected & ~positive
+        decision_logit = math.log(threshold / (1.0 - threshold))
+        terms = []
+        if bool(positive.any()):
+            terms.append(torch.relu(decision_logit + positive_margin - lg[positive]).square().mean())
+        if bool(negative.any()):
+            terms.append(torch.relu(lg[negative] - (decision_logit - negative_margin)).square().mean())
+        if not terms:
+            return lg.sum() * 0.0
+        return torch.stack(terms).mean()
+
 
 class StateProbe(nn.Module):
     """Both heads over one readout hidden. Loss = weighted sum of per-head CE."""
@@ -394,6 +455,13 @@ class StateProbe(nn.Module):
                shadow_stop_temperature: float = 1.0,
                shadow_stop_weight: float = 1.0,
                firstpass_weight: Optional[float] = None,
+               bce_threshold: Optional[float] = None,
+               balanced_bce: bool = False,
+               bce_weight: float = 1.0,
+               threshold_margin_weight: float = 0.0,
+               threshold_margin_mode: str = "all",
+               threshold_margin_positive: float = 0.0,
+               threshold_margin_negative: float = 0.0,
                gradient_diagnostics: bool = False,
                ordered: bool = True) -> dict:
         g = float(self.cfg.grad_scale)
@@ -412,10 +480,21 @@ class StateProbe(nn.Module):
             _lg = self.stop_head(h)
             _fp = (float(self.cfg.stop.get("firstpass_weight", 0.0) or 0.0)
                    if firstpass_weight is None else float(firstpass_weight))
-            _bce = self.cfg.stop.get("loss_weight", 1.0) * \
-                self.stop_head.loss(_lg, stop_targets, mask)
+            bce_logits = _lg
+            if bce_threshold is not None:
+                threshold = float(bce_threshold)
+                if not 0.0 < threshold < 1.0:
+                    raise ValueError("stop BCE threshold must be in (0, 1)")
+                import math
+
+                bce_logits = _lg - math.log(threshold / (1.0 - threshold))
+            if bce_weight < 0.0:
+                raise ValueError("stop BCE weight must be nonnegative")
+            _bce = float(bce_weight) * self.cfg.stop.get("loss_weight", 1.0) * \
+                self.stop_head.loss(bce_logits, stop_targets, mask, balanced=balanced_bce)
             out["probe/stop_bce_loss"] = _bce
             out["probe/stop_firstpass_loss"] = _lg.sum() * 0.0
+            out["probe/stop_threshold_margin_loss"] = _lg.sum() * 0.0
             if _fp > 0.0:
                 # ORDER-DEPENDENT: survival is a running product over real time, so a
                 # turn permutation makes it meaningless. Shuffled rows fall back to BCE,
@@ -434,6 +513,23 @@ class StateProbe(nn.Module):
                     out["probe/stop_firstpass_loss"] = _lg.sum() * 0.0
             out["probe/stop_loss"] = out["probe/stop_bce_loss"] + \
                 out["probe/stop_firstpass_loss"]
+            if float(threshold_margin_weight) > 0.0:
+                margin_threshold = 0.5 if bce_threshold is None else float(bce_threshold)
+                margin_loss = self.stop_head.threshold_margin_loss(
+                    _lg,
+                    stop_targets,
+                    threshold=margin_threshold,
+                    positive_margin=float(threshold_margin_positive),
+                    negative_margin=float(threshold_margin_negative),
+                    mode=threshold_margin_mode,
+                    mask=mask,
+                )
+                out["probe/stop_threshold_margin_loss"] = (
+                    float(threshold_margin_weight) * margin_loss
+                )
+                out["probe/stop_loss"] = (
+                    out["probe/stop_loss"] + out["probe/stop_threshold_margin_loss"]
+                )
             if shadow_stop_actions is not None and shadow_stop_rewards is not None:
                 actions = shadow_stop_actions.to(h.device).float()
                 rewards = shadow_stop_rewards.to(h.device).float()
@@ -463,6 +559,7 @@ class StateProbe(nn.Module):
                 components = {
                     "bce": out["probe/stop_bce_loss"],
                     "firstpass": out["probe/stop_firstpass_loss"],
+                    "margin": out["probe/stop_threshold_margin_loss"],
                     "shadow": out.get("probe/shadow_stop_rl_loss", _lg.sum() * 0.0),
                 }
                 gradients = {}
@@ -473,9 +570,9 @@ class StateProbe(nn.Module):
                     if gradient is not None:
                         gradients[name] = gradient.detach().float().reshape(-1)
                         out[f"probe/grad_{name}_norm"] = gradients[name].norm()
-                for left, right in (("bce", "firstpass"), ("bce", "shadow"),
-                                    ("firstpass", "shadow")):
-                    if left in gradients and right in gradients:
+                names = tuple(gradients)
+                for left_index, left in enumerate(names):
+                    for right in names[left_index + 1:]:
                         denom = gradients[left].norm() * gradients[right].norm()
                         out[f"probe/grad_cos_{left}_{right}"] = (
                             (gradients[left] * gradients[right]).sum()

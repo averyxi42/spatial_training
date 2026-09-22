@@ -103,6 +103,27 @@ def test_continuous_trajectory_shape(ray_session):
     assert "rollout_probs" not in trajectory
 
 
+def test_success_region_observation_does_not_make_a_transition_terminal(ray_session):
+    script = _make_script(n_steps=4, done_at=2)
+    script[1]["info"] = {"just_reached": True}
+    script[2]["info"] = {"just_reached": False}
+    env_handle = _replay_handle(script)
+    initial_state_ref = ray.get(env_handle.reset.remote())
+    worker = StubEpisodeWorker(
+        policy_head_type="continuous",
+        continuous_action_sequence=[
+            np.array([0.1, -0.2], dtype=np.float32),
+            np.array([0.3, 0.4], dtype=np.float32),
+        ],
+    )
+
+    _, _, trajectory = worker.run_episode(
+        env_handle, initial_state_ref, collect_trajectory=True, compute_value=False
+    )
+
+    assert trajectory["dones"].tolist() == [False, True]
+
+
 def test_chain_action_context_uses_executed_chunk_not_credited_chain():
     worker = StubEpisodeWorker(
         policy_head_type="continuous",
@@ -128,7 +149,7 @@ def test_chain_action_context_uses_executed_chunk_not_credited_chain():
     assert "11.000" not in action_text
 
 
-def test_trajectory_stop_uses_cumulative_xy_path_length():
+def test_trajectory_stop_requires_near_zero_translation_and_yaw():
     worker = StubEpisodeWorker(
         policy_head_type="continuous",
         continuous_action_sequence=[np.zeros(2, dtype=np.float32)],
@@ -136,6 +157,7 @@ def test_trajectory_stop_uses_cumulative_xy_path_length():
             **MINIMAL_ROLLOUT_CONFIG,
             "stop_execution_mode": "trajectory_length",
             "trajectory_stop_threshold_m": 0.21,
+            "trajectory_stop_yaw_threshold_rad": 0.01,
         },
     )
     chunk = np.asarray([[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]], dtype=np.float32)
@@ -148,6 +170,12 @@ def test_trajectory_stop_uses_cumulative_xy_path_length():
     stop, _, _ = worker._policy_stop_decision(chunk, stop_probability=None)
     assert not stop
 
+    worker.rollout_config["trajectory_stop_threshold_m"] = 0.21
+    rotating_chunk = np.asarray([[0.0, 0.0, 0.2]], dtype=np.float32)
+    stop, _, length = worker._policy_stop_decision(rotating_chunk, stop_probability=None)
+    assert np.isclose(length, 0.0)
+    assert not stop
+
 
 def test_trajectory_stop_respects_initial_no_stop_prefix():
     worker = StubEpisodeWorker(
@@ -157,6 +185,7 @@ def test_trajectory_stop_respects_initial_no_stop_prefix():
             **MINIMAL_ROLLOUT_CONFIG,
             "stop_execution_mode": "trajectory_length",
             "trajectory_stop_threshold_m": 0.21,
+            "trajectory_stop_yaw_threshold_rad": 0.01,
             "trajectory_stop_min_steps": 30,
         },
     )
@@ -183,6 +212,92 @@ def test_sampled_stop_uses_a_seeded_episode_hazard():
     worker._policy_stop_rng = np.random.default_rng(0)
     stop, _, _ = worker._policy_stop_decision(np.zeros(2), stop_probability=1.0)
     assert stop
+
+
+def test_sampled_stop_feedback_reuses_the_executed_action():
+    worker = StubEpisodeWorker(
+        policy_head_type="continuous",
+        continuous_action_sequence=[np.zeros(2, dtype=np.float32)],
+        rollout_config={
+            **MINIMAL_ROLLOUT_CONFIG,
+            "stop_execution_mode": "sampled",
+            "stop_sample_temperature": 1.0,
+            "stop_shadow_correct_reward": 3.0,
+            "stop_shadow_false_penalty": 3.0,
+        },
+    )
+    worker._policy_stop_rng = np.random.default_rng(0)
+    stop, _, _ = worker._policy_stop_decision(np.zeros(2), stop_probability=1.0)
+    feedback = worker._shadow_stop_decision(
+        {"info": {"distance_to_goal": 0.5}}, probability=1.0
+    )
+
+    assert stop
+    assert feedback["shadow_stop_action"] == 1.0
+    assert feedback["shadow_stop_reward"] == 3.0
+
+
+def test_categorical_stop_records_the_sampled_policy_action():
+    worker = StubEpisodeWorker(
+        policy_head_type="continuous",
+        continuous_action_sequence=[np.zeros(2, dtype=np.float32)],
+        rollout_config={
+            **MINIMAL_ROLLOUT_CONFIG,
+            "stop_execution_mode": "categorical",
+        },
+    )
+    worker._policy_stop_rng = np.random.default_rng(0)
+    stop, mode, _ = worker._policy_stop_decision(
+        np.zeros(2), stop_probability=0.2
+    )
+    assert mode == "categorical"
+    assert not stop
+    assert worker.last_categorical_stop_action is False
+    assert np.isclose(worker.last_categorical_stop_logprob, np.log(0.8))
+
+
+def test_action_path_stop_does_not_create_a_categorical_policy_action():
+    worker = StubEpisodeWorker(
+        policy_head_type="continuous",
+        continuous_action_sequence=[np.zeros(2, dtype=np.float32)],
+        rollout_config={
+            **MINIMAL_ROLLOUT_CONFIG,
+            "stop_execution_mode": "trajectory_length",
+            "trajectory_stop_threshold_m": 0.1,
+            "trajectory_stop_yaw_threshold_rad": 0.1,
+        },
+    )
+    worker._policy_stop_decision(np.zeros((1, 3)), stop_probability=None)
+    assert worker.last_categorical_stop_action is None
+    assert np.isnan(worker.last_categorical_stop_logprob)
+
+
+def test_categorical_stop_consistency_penalizes_only_large_decoded_motion():
+    worker = StubEpisodeWorker(
+        policy_head_type="continuous",
+        continuous_action_sequence=[np.zeros(2, dtype=np.float32)],
+        rollout_config={
+            **MINIMAL_ROLLOUT_CONFIG,
+            "categorical_stop_action_consistency_penalty": 0.25,
+            "categorical_stop_action_consistency_translation_m": 0.1,
+            "categorical_stop_action_consistency_yaw_rad": 0.1,
+        },
+    )
+    assert worker._categorical_stop_action_consistency_penalty(
+        np.array([[0.05, 0.0, 0.05]], dtype=np.float32)
+    ) == 0.0
+    assert np.isclose(
+        worker._categorical_stop_action_consistency_penalty(
+            np.array([[0.2, 0.0, 0.0]], dtype=np.float32)
+        ),
+        0.25,
+    )
+    assert np.isclose(
+        worker._categorical_stop_action_consistency_penalty(
+            np.array([[0.0, 0.0, 0.2]], dtype=np.float32)
+        ),
+        0.25,
+    )
 
 
 def test_stop_prob_threshold_guard(ray_session, monkeypatch):

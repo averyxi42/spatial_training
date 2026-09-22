@@ -39,6 +39,8 @@ def _actor_runtime_env(conda_env, extra_pythonpath=None):
     """Build a Ray runtime env without dropping a configured simulator package path."""
     env = {"conda": conda_env} if conda_env else {}
     env |= thread_cap_env
+    if "LONGNAV_TRAIN_SEED" in os.environ:
+        env["env_vars"] = dict(env["env_vars"], LONGNAV_TRAIN_SEED=os.environ["LONGNAV_TRAIN_SEED"])
     if extra_pythonpath:
         inherited = os.environ.get("PYTHONPATH", "")
         env["env_vars"] = dict(env["env_vars"])
@@ -242,6 +244,8 @@ class SimWorkerFactory:
         )
 
         ctor_kwargs = strip_reserved_keys(sim_dict)
+        if ctor_kwargs.get("seed") is not None:
+            ctor_kwargs["seed"] = int(ctor_kwargs["seed"]) + worker_index
         if config_overrides is not None:
             if worker_index >= len(config_overrides):
                 raise ValueError(
@@ -339,14 +343,18 @@ class LoggerFactory:
                 print(f"Skipping {len(episodes_to_skip)} episodes already logged in WandB.")
             except Exception as e:
                 print(f"Could not determine episodes to skip from WandB history: {e}")
+        wandb_init_kwargs = {
+            "project": project,
+            "name": run_cfg.run_name,
+            "job_type": run_cfg.jobtype,
+            "id": id,
+            "resume": "allow",
+        }
+        group = getattr(run_cfg.logger, "group", None)
+        if group:
+            wandb_init_kwargs["group"] = group
         return RemoteLogger.remote(
-            wandb_init_kwargs={
-                "project": project,
-                "name": run_cfg.run_name,
-                "job_type": run_cfg.jobtype,
-                "id": id,
-                "resume": "allow",
-            },
+            wandb_init_kwargs=wandb_init_kwargs,
             run_config=full_dict_cfg,
             compact_metrics=bool(getattr(run_cfg.logger, "compact_metrics", False)),
         ),episodes_to_skip

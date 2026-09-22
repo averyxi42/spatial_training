@@ -1,0 +1,20 @@
+# @package _global_
+defaults:
+  - hm3d_stop_rl_stopstudy_b3_freeze
+
+training:
+  learning_rate: 2.0e-6
+  rl_config:
+    state_probe_firstpass_weight: 0.0
+    state_probe_shadow_rl_weight: 0.0
+    state_probe_bce_threshold: 0.95
+    state_probe_threshold_margin_weight: 1.0
+    state_probe_threshold_margin_mode: all
+    state_probe_threshold_margin_positive: 0.35
+    state_probe_threshold_margin_negative: 0.35
+    state_probe_gradient_diagnostic_interval: 16
+
+task:
+  run_name: hm3d_stopstudy_margin_all
+  logger:
+    group: hm3dpe_stopmargin_50gate_r1

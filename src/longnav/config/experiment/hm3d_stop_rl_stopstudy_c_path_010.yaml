@@ -1,18 +1,14 @@
 # @package _global_
-# C: no binary state probe.  The first 30 chunks always execute, then a decoded cumulative
-# XY path <= 10 cm is STOP; the sampled chain remains in PPO so the action head can learn it.
+# C: no binary state probe.  The first 30 chunks always execute, then a decoded chunk is
+# STOP only when both cumulative translation and cumulative yaw are near zero.
 defaults:
   - hm3d_stop_rl_stopstudy_common
-
-sim:
-  post_goal_stillness_reward: 0.5
-  post_goal_stillness_scale_m: 0.15
 
 rollout:
   stop_execution_mode: trajectory_length
   trajectory_stop_threshold_m: 0.10
+  trajectory_stop_yaw_threshold_rad: 0.10
   trajectory_stop_min_steps: 30
-  learn_post_goal_actions: true
 
 training:
   rl_config:
