@@ -312,7 +312,6 @@ class VLMWorker:
             image_grid_thw=image_grid_thw, 
             video_grid_thw=None,
             attention_mask=attention_mask,
-            mm_token_type_ids=turn_inputs.get('mm_token_type_ids', None),
         )
         position_ids += self.offset
         self.offset += len(turn_inputs['input_ids'][0])
