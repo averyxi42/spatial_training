@@ -1,12 +1,44 @@
 from typing import Any, Dict
-import ray
 import wandb
 import numpy as np
 import os
-import sys
 import subprocess
 
 class WandbLoggerActor:
+    POLICY_METRIC_KEYS = {
+        "train/success_rate",
+        "train/spl_mean",
+        "train/reward_mean",
+        "train/episode_length_mean",
+        "train/final_distance_mean",
+        "train/progress_fraction_mean",
+        "train/collision_rate",
+        "train/action_stop_fraction",
+        "train/action_forward_fraction",
+        "train/action_left_fraction",
+        "train/action_right_fraction",
+        "train/pg_loss",
+        "train/ppo_kl",
+        "train/pg_clip_fraction",
+        "train/policy_entropy",
+        "train/rollout_kl",
+        "train/return",
+        "train/agent_inference_seconds",
+        "train/sim_rollout_seconds",
+        "train/policy_update_seconds",
+        "train/iter_overhead_seconds",
+        "train/iter_seconds",
+        "optimizer/grad_norm",
+        "optimizer/lr",
+        "test/success_rate",
+        "test/spl_mean",
+        "test/reward_mean",
+        "test/episode_length_mean",
+        "test/final_distance_mean",
+        "test/progress_fraction_mean",
+        "test/collision_rate",
+    }
+
     def __init__(self, wandb_init_kwargs, run_config=None, log_raw=False, commit_interval=5):
         """
         Args:
@@ -28,8 +60,21 @@ class WandbLoggerActor:
         self.run = wandb.init(
             **wandb_init_kwargs, 
             config=full_config, 
-            reinit=True
+            reinit="finish_previous",
         )
+        self._remove_deprecated_video_table_summary()
+        self.run.define_metric("policy_update")
+        for metric_pattern in (
+            "train/*",
+            "test/*",
+            "test_video/*",
+            "optimizer/*",
+        ):
+            self.run.define_metric(
+                metric_pattern,
+                step_metric="policy_update",
+                summary="last",
+            )
         
         self.log_raw = log_raw
         self.commit_interval = commit_interval
@@ -41,6 +86,21 @@ class WandbLoggerActor:
 
         self.defined_metrics = set()
 
+    @staticmethod
+    def _plain_scalar(value):
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "item"):
+            try:
+                value = value.item()
+            except (ValueError, RuntimeError):
+                return None
+        if isinstance(value, np.number):
+            value = value.item()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+        return None
+
     def log_global_metrics(self, metrics: dict, step=None):
         """
         For Driver-side metrics: Training Loss, Learning Rate, Epoch, etc.
@@ -50,6 +110,54 @@ class WandbLoggerActor:
             self.run.log(metrics, step=step)
         else:
             self.run.log(metrics)
+
+    def log_policy_update(self, policy_update: int, metrics: dict):
+        payload = {"policy_update": int(policy_update)}
+        for key, value in metrics.items():
+            if key not in self.POLICY_METRIC_KEYS:
+                continue
+            scalar = self._plain_scalar(value)
+            if scalar is not None:
+                payload[key] = scalar
+        self.run.log(payload)
+
+    def log_eval_batch(
+        self,
+        policy_update: int,
+        aggregate_metrics: dict,
+        episode_rows: list[dict],
+        marker_path: str | None = None,
+    ):
+        self._remove_deprecated_video_table_summary()
+        payload = {"policy_update": int(policy_update)}
+        for key, value in aggregate_metrics.items():
+            if key not in self.POLICY_METRIC_KEYS:
+                continue
+            scalar = self._plain_scalar(value)
+            if scalar is not None:
+                payload[key] = scalar
+        for row in episode_rows:
+            label = row["episode_label"]
+            video_path = row.get("video_path")
+            if video_path:
+                payload[f"test_video/{label}"] = wandb.Video(
+                    video_path,
+                    format="mp4",
+                )
+        self.run.log(payload)
+        if marker_path:
+            temporary_path = f"{marker_path}.tmp"
+            with open(temporary_path, "w") as file:
+                file.write(f"{int(policy_update)}\n")
+            os.replace(temporary_path, marker_path)
+
+    def _remove_deprecated_video_table_summary(self):
+        if self.run.summary.get("test/videos") is None:
+            return
+        del self.run.summary["test/videos"]
+
+    def finish(self):
+        self.run.finish()
     def log(self,row):
         """
         Processes a single episode row with namespace-based media detection.

@@ -1,4 +1,5 @@
 import ray
+import os
 from collections import deque
 from typing import List, Dict, Any, Iterator
 from string import Template
@@ -6,7 +7,7 @@ from PIL import Image
 from longnav.utils.vlm_worker import VLMWorker,VLMTrainingMixin
 import numpy as np
 from longnav.utils.tensor_utils import TensorPacker
-import time 
+import time
 
 def substitute_convo_template(conversation_template: List[Dict], substitutions: Dict[str, Any]) -> List[Dict]:
     """
@@ -41,7 +42,7 @@ def substitute_convo_template(conversation_template: List[Dict], substitutions: 
                         text_template = Template(text_obj)
                         # Perform the substitution
                         new_item["text"] = text_template.substitute(substitutions)
-                    except KeyError as e:
+                    except KeyError:
                         raise
                         # Fallback to safe_substitute to prevent crashing on missing keys,
                         # but log it so we know something is wrong.
@@ -122,7 +123,12 @@ class EpisodeRolloutMixin:
                 t0 = time.time()
                 action_probs,action_logprobs,outputs = self.infer_probs(images=[rgb_pil],messages=messages,temperature = self.rollout_config['temperature'],pos_id_kwargs=pos_id_kwargs)
                 
-                vlm_logs |= {'mean/vlm_latency':time.time()-t0,'min/vlm_latency':time.time()-t0,'max/vlm_latency':time.time()-t0,'sum/spguard_trigger_count':0}
+                vlm_logs |= {
+                    'mean/vlm_latency': time.time() - t0,
+                    'min/vlm_latency': time.time() - t0,
+                    'max/vlm_latency': time.time() - t0,
+                    'sum/spguard_trigger_count': 0,
+                }
                 try:
                     import torch
                     vlm_logs |= {"vlm_mem_GB":torch.cuda.memory_allocated()/(1024**3)}
@@ -131,16 +137,16 @@ class EpisodeRolloutMixin:
                 # print(f"vlm step{step_count}")
                 # print("done")
                 #except for the first turn, all messages follow the exact same template.
-                action_id = np.random.choice(len(action_probs),p=action_probs) # sampling
+                action_id = int(np.random.choice(len(action_probs), p=action_probs)) # sampling
                 if action_id ==0 and self.rollout_config['stop_prob_threshold'] is not None:
                     if action_probs[0] >= self.rollout_config['stop_prob_threshold']:
                         action_id = 0
                     else:
                         vlm_logs['sum/spguard_trigger_count']=1
-                        action_id = np.random.choice(len(action_probs)-1,p=action_probs[1:]/np.sum(action_probs[1:]))+1
+                        action_id = int(np.random.choice(len(action_probs)-1,p=action_probs[1:]/np.sum(action_probs[1:]))+1)
                     
                 entropy = -np.sum(action_probs * np.log(action_probs + 1e-9))
-                vlm_logs |= {'mean/entropy':entropy,'mean/action_prob':float(action_probs[action_id]),"action_probs":action_probs.tolist()} 
+                vlm_logs |= {'mean/entropy':float(entropy),'mean/action_prob':float(action_probs[action_id]),"action_probs":action_probs.tolist()}
                 # D. Store Transition
                
 
@@ -188,8 +194,7 @@ class EpisodeRolloutMixin:
             print(f"Episode failed: {e}")
             import traceback
             traceback.print_exc()
-            # Return handles anyway so we don't leak resources (or handle crash logic)
-            return False, None,None
+            raise
 
 class RolloutWorker(VLMWorker, EpisodeRolloutMixin):
     def __init__(self, rollout_config: Dict[str, Any], **vlm_kwargs):
@@ -239,12 +244,270 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
             self.save_pixels = False
         is_exhausted,result,trajectory = super().run_episode(env_handle, initial_state_ref,collect_trajectory=True,compute_value=False)
         self.rl_trajectory = trajectory
-        inputs,embeds = None,None
+        inputs = None
 
         if rtn_inputs:
             inputs = self._pack_inputs()
             self.rl_seq_inputs = inputs
         return is_exhausted,result,trajectory,inputs
+
+    @staticmethod
+    def _write_eval_video(frames, output_path, fps):
+        import imageio.v2 as imageio
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        imageio.mimwrite(
+            output_path,
+            frames,
+            fps=fps,
+            codec="libx264",
+            quality=7,
+            macro_block_size=8,
+        )
+
+    @staticmethod
+    def _annotate_eval_frame(
+        rgb,
+        *,
+        width,
+        lines,
+    ):
+        from PIL import ImageDraw
+
+        image = Image.fromarray(rgb).convert("RGB")
+        if width and image.width != width:
+            height = max(1, round(image.height * width / image.width))
+            image = image.resize((width, height), Image.Resampling.BILINEAR)
+        draw = ImageDraw.Draw(image)
+        line_height = 15
+        panel_height = line_height * len(lines) + 8
+        draw.rectangle((0, 0, image.width, panel_height), fill=(0, 0, 0))
+        for index, line in enumerate(lines):
+            draw.text((5, 4 + index * line_height), str(line), fill=(255, 255, 255))
+        return np.asarray(image)
+
+    def run_episode_batch(
+        self,
+        env_handle,
+        initial_state_ref,
+        eval_config=None,
+    ):
+        import torch
+
+        batch_started = time.perf_counter()
+        eval_config = dict(eval_config or {})
+        eval_mode = bool(eval_config.get("enabled", False))
+        capture_video = bool(eval_config.get("capture_video", False)) and (
+            eval_config.get("video_style", "simple") == "simple"
+        )
+        video_width = int(eval_config.get("video_width", 480))
+        video_fps = int(eval_config.get("video_fps", 4))
+        video_output_dir = eval_config.get("video_output_dir")
+        policy_update = eval_config.get("policy_update")
+        previous_save_outputs = self.save_outputs
+        if eval_mode:
+            self.save_outputs = False
+
+        rgb_batch, state_dicts = initial_state_ref
+        batch_size = len(state_dicts)
+        self.save_pixels = False
+        self.rl_batch_sequence_states = [self.new_sequence_state() for _ in range(batch_size)]
+        self.rl_batch_trajectories = [[] for _ in range(batch_size)]
+        messages = [
+            substitute_convo_template(
+                self.rollout_config["convo_start_template"],
+                state["obs"] | self.rollout_config,
+            )
+            for state in state_dicts
+        ]
+        instructions = [state["obs"]["instr_or_goal"] for state in state_dicts]
+        step_counts = np.zeros(batch_size, dtype=np.int32)
+        done = np.asarray([state["done"] for state in state_dicts], dtype=bool)
+        video_frames = [[] for _ in range(batch_size)] if capture_video else None
+        vlm_inference_seconds = 0.0
+        environment_step_seconds = 0.0
+        env_step_timeout_seconds = float(
+            os.environ.get("LONGNAV_ENV_STEP_TIMEOUT_SECONDS", "300")
+        )
+        if env_step_timeout_seconds <= 0:
+            raise ValueError("LONGNAV_ENV_STEP_TIMEOUT_SECONDS must be positive")
+
+        try:
+            while np.any(~done & (step_counts < self.rollout_config["max_steps"])):
+                actions = np.zeros(batch_size, dtype=np.int64)
+                decision_data = [None] * batch_size
+                for index in range(batch_size):
+                    if done[index] or step_counts[index] >= self.rollout_config["max_steps"]:
+                        continue
+                    self.restore_sequence_state(self.rl_batch_sequence_states[index])
+                    rgb_pil = Image.fromarray(rgb_batch[index])
+                    started = time.perf_counter()
+                    action_probs, action_logprobs, outputs = self.infer_probs(
+                        images=[rgb_pil],
+                        messages=messages[index],
+                        temperature=self.rollout_config["temperature"],
+                        pos_id_kwargs={"mode": "standard"},
+                    )
+                    latency = time.perf_counter() - started
+                    vlm_inference_seconds += latency
+                    action_id = int(np.random.choice(len(action_probs), p=action_probs))
+                    stop_threshold = self.rollout_config["stop_prob_threshold"]
+                    spguard_triggered = 0
+                    if (
+                        action_id == 0
+                        and stop_threshold is not None
+                        and action_probs[0] < stop_threshold
+                    ):
+                        spguard_triggered = 1
+                        action_id = int(
+                            np.random.choice(
+                                len(action_probs) - 1,
+                                p=action_probs[1:] / np.sum(action_probs[1:]),
+                            )
+                            + 1
+                        )
+                    actions[index] = action_id
+                    decision_data[index] = (
+                        action_probs,
+                        action_logprobs,
+                        outputs,
+                        latency,
+                        spguard_triggered,
+                    )
+                    self.rl_batch_sequence_states[index] = self.capture_sequence_state()
+                    if capture_video:
+                        info = state_dicts[index].get("info", {})
+                        video_frames[index].append(
+                            self._annotate_eval_frame(
+                                rgb_batch[index],
+                                width=video_width,
+                                lines=[
+                                    f"policy update: {policy_update}",
+                                    f"episode: {info.get('episode_label', 'unknown')}",
+                                    f"step: {step_counts[index]}  goal: {instructions[index]}",
+                                    (
+                                        f"action: {self.rollout_config['action_space'][action_id]}  "
+                                        f"p={float(action_probs[action_id]):.3f}"
+                                    ),
+                                    (
+                                        "probs [stop/fwd/left/right]: "
+                                        + "/".join(f"{float(value):.2f}" for value in action_probs)
+                                    ),
+                                    f"distance: {float(info.get('distance_to_goal', float('nan'))):.2f}",
+                                ],
+                            )
+                        )
+
+                env_started = time.perf_counter()
+                step_ref = env_handle.step_batch.remote(
+                    actions.tolist(), supplementary_logs=None
+                )
+                try:
+                    rgb_batch, next_states = ray.get(
+                        step_ref,
+                        timeout=env_step_timeout_seconds,
+                    )
+                except ray.exceptions.GetTimeoutError as exc:
+                    active_episodes = [
+                        state.get("info", {}).get("episode_label", "unknown")
+                        for index, state in enumerate(state_dicts)
+                        if not done[index]
+                    ]
+                    raise RuntimeError(
+                        "NavVerse vector environment step exceeded "
+                        f"{env_step_timeout_seconds:.0f}s; "
+                        f"active_episodes={active_episodes}"
+                    ) from exc
+                environment_step_seconds += time.perf_counter() - env_started
+                for index, next_state in enumerate(next_states):
+                    if decision_data[index] is None:
+                        continue
+                    (
+                        action_probs,
+                        action_logprobs,
+                        outputs,
+                        latency,
+                        spguard_triggered,
+                    ) = decision_data[index]
+                    entropy = -np.sum(action_probs * np.log(action_probs + 1e-9))
+                    trajectory_dict = {
+                        "actions": int(actions[index]),
+                        "rollout_logprobs": action_logprobs,
+                        "rollout_probs": action_probs,
+                        "rewards": next_state.get("reward", 0.0),
+                        "dones": next_state["done"],
+                        **next_state["info"],
+                        "mean/vlm_latency": latency,
+                        "mean/entropy": float(entropy),
+                        "mean/action_prob": float(action_probs[actions[index]]),
+                        "sum/spguard_trigger_count": spguard_triggered,
+                        "vlm_mem_GB": torch.cuda.memory_allocated() / (1024**3),
+                    }
+                    self.rl_batch_trajectories[index].append(trajectory_dict)
+                    messages[index] = substitute_convo_template(
+                        self.rollout_config["convo_turn_template"],
+                        {"action": self.rollout_config["action_space"][actions[index]]},
+                    )
+                    step_counts[index] += 1
+                    done[index] = next_state["done"]
+                state_dicts = next_states
+        finally:
+            self.save_outputs = previous_save_outputs
+
+        self.rl_batch_trajectories = [
+            self._pack_trajectory(buffer) for buffer in self.rl_batch_trajectories
+        ]
+        results = [
+            state["info"]
+            | {
+                "steps": int(step_counts[index]),
+                "instr_or_goal": instructions[index],
+            }
+            for index, state in enumerate(state_dicts)
+        ]
+        video_encode_started = time.perf_counter()
+        if capture_video:
+            if not video_output_dir:
+                raise ValueError("video_output_dir is required when capture_video is enabled")
+            for index, result in enumerate(results):
+                video_frames[index].append(
+                    self._annotate_eval_frame(
+                        rgb_batch[index],
+                        width=video_width,
+                        lines=[
+                            f"policy update: {policy_update}",
+                            f"episode: {result.get('episode_label', 'unknown')}",
+                            f"steps: {result['steps']}  goal: {instructions[index]}",
+                            (
+                                f"success: {float(result.get('success', 0.0)):.0f}  "
+                                f"spl: {float(result.get('spl', 0.0)):.3f}"
+                            ),
+                            (
+                                f"final distance: "
+                                f"{float(result.get('distance_to_goal', float('nan'))):.2f}"
+                            ),
+                            f"termination: {result.get('termination_reason') or 'max_steps'}",
+                        ],
+                    )
+                )
+                label = result.get("episode_label", f"episode_{index}")
+                output_path = os.path.join(video_output_dir, f"{label}.mp4")
+                self._write_eval_video(video_frames[index], output_path, video_fps)
+                result["video_path"] = output_path
+        video_encode_seconds = time.perf_counter() - video_encode_started
+        environment_profile = ray.get(
+            env_handle.get_vector_profile.remote(reset=True)
+        )
+        worker_runtime = {
+            "wall_seconds": time.perf_counter() - batch_started,
+            "vlm_inference_seconds": vlm_inference_seconds,
+            "environment_step_seconds": environment_step_seconds,
+            "video_encode_seconds": video_encode_seconds,
+            "episode_steps_total": int(step_counts.sum()),
+            "episode_steps_max": int(step_counts.max(initial=0)),
+            "environment_profile": environment_profile,
+        }
+        return bool(state_dicts[0]["is_exhausted"]), results, worker_runtime
 
     def postprocess_episode(self,eval=False):
         '''
@@ -260,24 +523,45 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
             embeds = self._pack_embeds()
             self.rl_embeds_inputs = embeds
             values = None
-            import torch
-            with torch.no_grad():
-                if self.rl_embeds_inputs is not None:
-                    logits,values = self._forward_embeds(self.rl_embeds_inputs,self.rl_algo_config.use_value)
-                    model_inputs = self.rl_embeds_inputs
-                elif self.rl_seq_inputs is not None:
-                    logits,values = self._forward_seq(self.rl_seq_inputs,self.rl_algo_config.use_value)
-                    model_inputs = self.rl_seq_inputs
-                else:
+            reuse_rollout_logprobs = os.environ.get(
+                "LONGNAV_REUSE_ROLLOUT_LOGPROBS",
+                "0",
+            ).lower() in {"1", "true", "yes"}
+            if reuse_rollout_logprobs:
+                if self.rl_algo_config.use_value or self.rl_algo_config.use_ref:
+                    raise ValueError(
+                        "LONGNAV_REUSE_ROLLOUT_LOGPROBS requires use_value=false "
+                        "and use_ref=false"
+                    )
+                if self.rl_embeds_inputs is None:
                     raise ValueError("No stored model inputs found for postprocessing.")
-                logprobs = self._calculate_action_logprobs(logits).squeeze().float().cpu()
-                if logprobs.dim() == 1:
-                    logprobs = logprobs.unsqueeze(0) # ensure batch dim
-                self.rl_trajectory['old_logprobs'] = logprobs.numpy()
-                if values is not None:
-                    self.rl_trajectory['values'] = values.squeeze().float().cpu().numpy()
+                model_inputs = self.rl_embeds_inputs
+                self.rl_trajectory["old_logprobs"] = np.asarray(
+                    self.rl_trajectory["rollout_logprobs"],
+                    dtype=np.float32,
+                )
+            else:
+                import torch
+
+                with torch.no_grad():
+                    if self.rl_embeds_inputs is not None:
+                        logits,values = self._forward_embeds(self.rl_embeds_inputs,self.rl_algo_config.use_value)
+                        model_inputs = self.rl_embeds_inputs
+                    elif self.rl_seq_inputs is not None:
+                        logits,values = self._forward_seq(self.rl_seq_inputs,self.rl_algo_config.use_value)
+                        model_inputs = self.rl_seq_inputs
+                    else:
+                        raise ValueError("No stored model inputs found for postprocessing.")
+                    logprobs = self._calculate_action_logprobs(logits).squeeze().float().cpu()
+                    if logprobs.dim() == 1:
+                        logprobs = logprobs.unsqueeze(0) # ensure batch dim
+                    self.rl_trajectory['old_logprobs'] = logprobs.numpy()
+                    if values is not None:
+                        self.rl_trajectory['values'] = values.squeeze().float().cpu().numpy()
 
             if self.rl_algo_config.use_ref:
+                import torch
+
                 with torch.no_grad():
                     self.unmerge_adapter()
                     with self.model.disable_adapter():
@@ -291,6 +575,19 @@ class RLWorker(RolloutWorker,VLMTrainingMixin):
                         self.rl_trajectory['ref_logprobs'] = ref_logprobs.numpy()
 
         return self.rl_trajectory,model_inputs    
+
+    def postprocess_batch(self, eval=False):
+        processed = []
+        for sequence_state, trajectory in zip(
+            self.rl_batch_sequence_states, self.rl_batch_trajectories
+        ):
+            self.restore_sequence_state(sequence_state)
+            self.rl_trajectory = trajectory
+            self.rl_seq_inputs = None
+            self.rl_embeds_inputs = None
+            processed.append(RLWorker.postprocess_episode(self, eval=eval))
+        self.reset(clear_cuda_cache=False)
+        return processed
     
 class RLActor(RLWorker):
     def run_episode(self,env_handle,initial_state_ref):
@@ -302,7 +599,18 @@ class RLActor(RLWorker):
         if return_inputs:
             inputs_tensors,inputs_metadata = TensorPacker.pack(model_inputs)
             return trajectory,inputs_tensors,inputs_metadata
-        else: return trajectory,None,None
+        return trajectory, None, None
+
+    def postprocess_batch(self, return_inputs=True, eval=False):
+        processed = RLWorker.postprocess_batch(self, eval=eval)
+        results = []
+        for trajectory, model_inputs in processed:
+            if return_inputs:
+                input_tensors, input_metadata = TensorPacker.pack(model_inputs)
+                results.append((trajectory, input_tensors, input_metadata))
+            else:
+                results.append((trajectory, None, None))
+        return results
 
     def train_rl_step(self, embeds_inputs_np, embeds_inputs_meta,traj_batch):
         embeds_inputs = TensorPacker.unpack(embeds_inputs_np,embeds_inputs_meta,device=self.accelerator.device)
@@ -439,8 +747,6 @@ def collect_rollouts(
 
     result_dict = {}
     log_dict = {}
-    iterator_exhausted = False
-
     last_dispatch_time = time.time()
     # --- 3. Bootstrap: Initial Sharding & Resets ---
     for env_handle in env_handles:
@@ -451,9 +757,7 @@ def collect_rollouts(
             reset_ref = env_handle.reset.remote()
             pending_resets[reset_ref] = env_handle
         except StopIteration:
-            iterator_exhausted = True
             print("Warning: Not enough shards for all workers during bootstrap.")
-            pass
     print(f"Bootstrapping: Initializing {len(env_handles)} environments...")
     initial_live_sims = len(pending_resets)
     # Helper to check if we should keep the loop alive
@@ -565,3 +869,209 @@ def collect_rollouts(
     return ray.get(rollouts), result_list, log_list
 
 
+def collect_vector_rollouts(
+    env_handles,
+    vlm_handles,
+    shard_iterator: Iterator[list[str]],
+    target_episodes: int,
+    episodes_per_worker: int,
+    postprocess_kwargs={"return_inputs": True, "eval": False},
+    eval_config=None,
+    return_timings=False,
+):
+    collection_started = time.perf_counter()
+    if len(env_handles) != len(vlm_handles):
+        raise ValueError(
+            f"Vector rollout requires one VLM per simulator; got "
+            f"{len(vlm_handles)} VLMs and {len(env_handles)} simulators"
+        )
+    episodes_per_wave = len(env_handles) * episodes_per_worker
+    if target_episodes <= 0 or target_episodes % episodes_per_wave:
+        raise ValueError(
+            "Vector rollout target must be a positive multiple of workers * "
+            f"episodes_per_worker; got {target_episodes} and wave size "
+            f"{len(env_handles)} * {episodes_per_worker} = {episodes_per_wave}"
+        )
+    wave_count = target_episodes // episodes_per_wave
+    benchmark_video = bool(
+        eval_config
+        and eval_config.get("capture_video", False)
+        and eval_config.get("video_style") == "benchmark"
+    )
+    assign_seconds = 0.0
+    episode_seconds = 0.0
+    postprocess_seconds = 0.0
+    benchmark_video_futures = []
+    rollouts = []
+    results = []
+    logs = []
+    worker_runtimes = []
+    wave_runtimes = []
+    wave_timeout_seconds = float(
+        os.environ.get("LONGNAV_VECTOR_WAVE_TIMEOUT_SECONDS", "1800")
+    )
+    if wave_timeout_seconds <= 0:
+        raise ValueError("LONGNAV_VECTOR_WAVE_TIMEOUT_SECONDS must be positive")
+    for wave_index in range(wave_count):
+        worker_labels = [next(shard_iterator) for _ in env_handles]
+        if any(len(labels) != episodes_per_worker for labels in worker_labels):
+            raise ValueError(
+                "Vector rollout shards must contain exactly "
+                f"{episodes_per_worker} labels"
+            )
+        print(
+            "Vector rollout wave start "
+            f"wave={wave_index + 1}/{wave_count} "
+            f"episodes={sum(len(labels) for labels in worker_labels)} "
+            f"scenes={[labels[0].rsplit('_', 1)[0] for labels in worker_labels]}"
+        )
+
+        assign_started = time.perf_counter()
+        ray.get(
+            [
+                env_handle.assign_shard.remote(labels)
+                for env_handle, labels in zip(env_handles, worker_labels)
+            ]
+        )
+        wave_assign_seconds = time.perf_counter() - assign_started
+        assign_seconds += wave_assign_seconds
+        ray.get(
+            [
+                env_handle.configure_benchmark_video_capture.remote(
+                    eval_config if benchmark_video else None
+                )
+                for env_handle in env_handles
+            ]
+        )
+
+        episode_started = time.perf_counter()
+        initial_states = [
+            env_handle.reset_batch.remote() for env_handle in env_handles
+        ]
+        episode_futures = [
+            vlm_handle.run_episode_batch.remote(
+                env_handle,
+                initial_state,
+                eval_config=eval_config,
+            )
+            for env_handle, vlm_handle, initial_state in zip(
+                env_handles, vlm_handles, initial_states
+            )
+        ]
+        try:
+            episode_outputs = ray.get(
+                episode_futures,
+                timeout=wave_timeout_seconds,
+            )
+        except ray.exceptions.GetTimeoutError as exc:
+            ready, _ = ray.wait(
+                episode_futures,
+                num_returns=len(episode_futures),
+                timeout=0,
+            )
+            raise RuntimeError(
+                "Vector rollout wave exceeded "
+                f"{wave_timeout_seconds:.0f}s: wave={wave_index + 1}/{wave_count}, "
+                f"completed_workers={len(ready)}/{len(episode_futures)}, "
+                f"worker_labels={worker_labels}"
+            ) from exc
+        wave_episode_seconds = time.perf_counter() - episode_started
+        episode_seconds += wave_episode_seconds
+        print(
+            "Vector rollout wave complete "
+            f"wave={wave_index + 1}/{wave_count} "
+            f"seconds={wave_episode_seconds:.1f}"
+        )
+
+        if benchmark_video:
+            from longnav.utils.benchmark_video_worker import (
+                render_benchmark_video_batch,
+            )
+
+            video_runtime_env = {
+                "conda": os.environ.get("LONGNAV_HABITAT_CONDA_ENV", "navverse"),
+                "env_vars": {
+                    "OMP_NUM_THREADS": "1",
+                    "MKL_NUM_THREADS": "1",
+                    "OPENBLAS_NUM_THREADS": "1",
+                },
+            }
+            render_video = ray.remote(render_benchmark_video_batch).options(
+                num_cpus=2,
+                num_gpus=0,
+                runtime_env=video_runtime_env,
+            )
+            captures = [
+                env_handle.export_benchmark_video_capture.remote()
+                for env_handle in env_handles
+            ]
+            benchmark_video_futures.extend(
+                render_video.remote(capture) for capture in captures
+            )
+
+        postprocess_started = time.perf_counter()
+        rollout_batches = ray.get(
+            [
+                vlm_handle.postprocess_batch.remote(**postprocess_kwargs)
+                for vlm_handle in vlm_handles
+            ]
+        )
+        wave_postprocess_seconds = time.perf_counter() - postprocess_started
+        postprocess_seconds += wave_postprocess_seconds
+        log_refs = [
+            env_handle.flush_logs_to_disk.remote() for env_handle in env_handles
+        ]
+        wave_workers = []
+        for worker_rollouts, episode_output, log_ref in zip(
+            rollout_batches,
+            episode_outputs,
+            log_refs,
+        ):
+            if len(episode_output) == 3:
+                _, worker_results, worker_runtime = episode_output
+            else:
+                _, worker_results = episode_output
+                worker_runtime = {}
+            if len(worker_rollouts) != episodes_per_worker:
+                raise RuntimeError(
+                    f"Vector VLM returned {len(worker_rollouts)} rollouts; "
+                    f"expected {episodes_per_worker}"
+                )
+            if len(worker_results) != episodes_per_worker:
+                raise RuntimeError(
+                    f"Vector simulator returned {len(worker_results)} results; "
+                    f"expected {episodes_per_worker}"
+                )
+            if benchmark_video:
+                for result in worker_results:
+                    label = result.get("episode_label")
+                    result["video_path"] = os.path.join(
+                        eval_config["video_output_dir"],
+                        f"{label}_obs_action_LongNav.mp4",
+                    )
+            rollouts.extend(worker_rollouts)
+            results.extend(worker_results)
+            logs.extend([log_ref] * episodes_per_worker)
+            worker_runtimes.append(worker_runtime)
+            wave_workers.append(worker_runtime)
+        wave_runtimes.append(
+            {
+                "wave_index": wave_index,
+                "assign_seconds": wave_assign_seconds,
+                "episode_seconds": wave_episode_seconds,
+                "postprocess_seconds": wave_postprocess_seconds,
+                "worker_runtimes": wave_workers,
+            }
+        )
+    timings = {
+        "total_seconds": time.perf_counter() - collection_started,
+        "assign_seconds": assign_seconds,
+        "episode_seconds": episode_seconds,
+        "postprocess_seconds": postprocess_seconds,
+        "worker_runtimes": worker_runtimes,
+        "wave_runtimes": wave_runtimes,
+        "video_futures": benchmark_video_futures,
+    }
+    if return_timings:
+        return rollouts, results, logs, timings
+    return rollouts, results, logs

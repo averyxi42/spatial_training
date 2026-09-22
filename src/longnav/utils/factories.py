@@ -1,10 +1,16 @@
 import ray
 import os
 from omegaconf import OmegaConf
-from longnav.config_schema import *
+from longnav.config_schema import (
+    InferenceConfig,
+    ResourceConfig,
+    RLConfig,
+    RunConfig,
+    VLMTrainingConfig,
+)
 
 # Use these imports for type hinting
-from typing import List, Dict, Any, Iterator, Optional,Union
+from typing import List, Iterator, Optional, Union
 import logging
 import json
 thread_cap_env = {
@@ -64,7 +70,7 @@ def resolve_checkpoint_path(path_or_id):
     If local path, returns as-is.
     """
     import os
-    from huggingface_hub import snapshot_download, hf_hub_download
+    from huggingface_hub import snapshot_download
     from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 
     # 1. If it exists locally, trust it.
@@ -226,10 +232,16 @@ class WandbFactory:
         )
         import wandb
         api = wandb.Api()
+        wandb_entity = os.environ.get("WANDB_ENTITY")
+        project_path = (
+            f"{wandb_entity}/{run_cfg.wandb_project}"
+            if wandb_entity
+            else run_cfg.wandb_project
+        )
         # fetch latest run id matching name
         id = None
         try:
-            runs = api.runs(run_cfg.wandb_project,filters={"displayName":run_cfg.run_name})
+            runs = api.runs(project_path,filters={"displayName":run_cfg.run_name})
             print(f"Found {len(runs)} existing runs with name '{run_cfg.run_name}' in project '{run_cfg.wandb_project}'.")
         except:
             print(f"Could not fetch runs for project '{run_cfg.wandb_project}'. Check your WandB connection and project name.")
@@ -249,8 +261,9 @@ class WandbFactory:
         return RemoteLogger.remote(
             wandb_init_kwargs={
                 "project": run_cfg.wandb_project,
+                "entity": wandb_entity,
                 "name": run_cfg.run_name,
-                "job_type": "eval", # Hardcode or add to RunConfig schema,
+                "job_type": run_cfg.jobtype,
                 "id": id,
                 "resume": "allow",
             },

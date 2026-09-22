@@ -14,6 +14,7 @@ from utils.modeling import Qwen3VLSparseForConditionalGeneration
 import os
 import sys
 import argparse
+import json
 from pathlib import Path
 from PIL import Image as PILImage
 def validate_episode_images(example):
@@ -210,6 +211,372 @@ ORIG_W = 640
 TOTAL_BUDGET = 39000#34000
 dynamic_resize_transform = make_dynamic_resize_transform(SYSTEM_TOKENS,TURN_TOKENS,ORIG_H,ORIG_W,TOTAL_BUDGET-600)
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+NAVVERSE_ACTION_TEXT = {
+    "STOP": "stop",
+    "MOVE_FORWARD": "forward",
+    "TURN_LEFT": "left",
+    "TURN_RIGHT": "right",
+}
+NAVVERSE_NORMALIZE_ACTIONS = False
+NAVVERSE_WINDOW_IMAGES = 0
+
+
+def _normalize_navverse_text(text):
+    if text is None:
+        return text
+    text = text.replace("[STOP, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT]", "[stop, forward, left, right]")
+    for src, dst in NAVVERSE_ACTION_TEXT.items():
+        text = text.replace(f"**{src}**", f"**{dst}**")
+    return text
+
+
+def normalize_navverse_messages(example):
+    messages = example.get("messages")
+    if messages is None:
+        return example
+    return {"messages": _normalize_navverse_message_list(messages)}
+
+
+def _normalize_navverse_message_list(messages):
+    new_messages = []
+    for message in messages:
+        new_message = dict(message)
+        new_content = []
+        for item in message.get("content", []):
+            new_item = dict(item)
+            if "text" in new_item:
+                new_item["text"] = _normalize_navverse_text(new_item["text"])
+            new_content.append(new_item)
+        new_message["content"] = new_content
+        new_messages.append(new_message)
+    return new_messages
+
+
+def normalize_navverse_batch(batch):
+    batch = _maybe_window_sample_navverse_batch(batch)
+    messages = batch.get("messages")
+    if NAVVERSE_NORMALIZE_ACTIONS and messages is not None:
+        if messages and isinstance(messages[0], list):
+            batch["messages"] = [_normalize_navverse_message_list(item) for item in messages]
+        else:
+            batch["messages"] = _normalize_navverse_message_list(messages)
+    images = batch.get("images")
+    if images is not None:
+        if images and isinstance(images[0], list):
+            batch["images"] = [_decode_navverse_image_sequence(item) for item in images]
+        else:
+            batch["images"] = _decode_navverse_image_sequence(images)
+    return batch
+
+
+def _maybe_window_sample_navverse_batch(batch):
+    if NAVVERSE_WINDOW_IMAGES <= 0:
+        return batch
+    images = batch.get("images")
+    if images is None:
+        return batch
+    if images and isinstance(images[0], list):
+        sampled = {key: [] for key in batch.keys()}
+        for idx in range(len(images)):
+            item = {key: value[idx] for key, value in batch.items()}
+            item = _window_sample_navverse_item(item)
+            for key in batch.keys():
+                sampled[key].append(item.get(key))
+        return sampled
+    return _window_sample_navverse_item(dict(batch))
+
+
+def _window_sample_navverse_item(example):
+    import random
+
+    images = example.get("images")
+    if not images:
+        return example
+    num_images = len(images)
+    window = min(NAVVERSE_WINDOW_IMAGES, num_images)
+    if window <= 0 or num_images <= window:
+        return example
+
+    start = random.randint(0, num_images - window)
+    end = start + window
+    example["images"] = images[start:end]
+
+    messages = example.get("messages")
+    if messages is not None:
+        if len(messages) == 1 + 2 * num_images:
+            example["messages"] = [messages[0]] + messages[1 + 2 * start : 1 + 2 * end]
+        elif len(messages) == 2 * num_images:
+            example["messages"] = messages[2 * start : 2 * end]
+
+    for key in ("action_sequence", "pos_rots", "poses", "rgb_sequence"):
+        value = example.get(key)
+        if isinstance(value, list) and len(value) == num_images:
+            example[key] = value[start:end]
+
+    action_ids = example.get("action_ids")
+    if isinstance(action_ids, list):
+        if len(action_ids) == num_images:
+            example["action_ids"] = action_ids[start:end]
+        elif len(action_ids) == num_images + 1:
+            example["action_ids"] = action_ids[start : end + 1]
+
+    return example
+
+
+def _decode_navverse_image_sequence(images):
+    import io
+    from PIL import Image as PILImage
+
+    decoded = []
+    for image in images:
+        if hasattr(image, "size"):
+            decoded.append(image)
+        elif isinstance(image, dict):
+            if image.get("bytes") is not None:
+                with PILImage.open(io.BytesIO(image["bytes"])) as img:
+                    decoded.append(img.convert("RGB"))
+            elif image.get("path"):
+                with PILImage.open(os.path.expanduser(image["path"])) as img:
+                    decoded.append(img.convert("RGB"))
+            else:
+                raise ValueError("image dict has neither bytes nor path")
+        else:
+            decoded.append(image)
+    return decoded
+
+
+def _dataset_paths(value):
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _parquet_files(path):
+    files = []
+    for raw_path in _dataset_paths(path):
+        files.extend(_parquet_files_for_path(raw_path))
+    if files:
+        return sorted(dict.fromkeys(files))
+    return []
+
+
+def _parquet_files_for_path(raw_path):
+    files = []
+    if not raw_path:
+        return files
+    expanded = os.path.expanduser(raw_path)
+    if os.path.isdir(expanded):
+        root = Path(expanded)
+        files.extend(sorted(str(p) for p in root.glob("*.parquet")))
+        data_dir = root / "data"
+        if data_dir.is_dir():
+            files.extend(sorted(str(p) for p in data_dir.glob("*.parquet")))
+    elif os.path.isfile(expanded) and expanded.endswith(".parquet"):
+        files.append(expanded)
+    return sorted(dict.fromkeys(files))
+
+
+def _parquet_file_groups(path):
+    groups = []
+    for raw_path in _dataset_paths(path):
+        files = _parquet_files_for_path(raw_path)
+        if files:
+            groups.append((raw_path, files))
+    return groups
+
+
+def _apply_navverse_transform(dataset, args, decode_images=False):
+    global NAVVERSE_NORMALIZE_ACTIONS, NAVVERSE_WINDOW_IMAGES
+    NAVVERSE_NORMALIZE_ACTIONS = bool(getattr(args, "normalize_navverse_actions", False))
+    NAVVERSE_WINDOW_IMAGES = int(getattr(args, "window_sample_images", 0) or 0)
+    if not NAVVERSE_NORMALIZE_ACTIONS and not decode_images and NAVVERSE_WINDOW_IMAGES <= 0:
+        return dataset
+    if NAVVERSE_NORMALIZE_ACTIONS:
+        print("Normalizing NavVerse action text: STOP/MOVE_FORWARD/TURN_LEFT/TURN_RIGHT -> stop/forward/left/right")
+    if NAVVERSE_WINDOW_IMAGES > 0:
+        print(f"Window sampling Train: random contiguous windows of <= {NAVVERSE_WINDOW_IMAGES} images")
+    if hasattr(dataset, "with_transform"):
+        return dataset.with_transform(normalize_navverse_batch)
+    return dataset.map(normalize_navverse_messages)
+
+
+def _maybe_filter_navverse_max_images(dataset, args):
+    max_images = int(getattr(args, "max_train_images", 0) or 0)
+    if max_images <= 0:
+        return dataset
+    print(f"Filtering Train: keeping episodes with <= {max_images} images")
+    try:
+        return dataset.filter(
+            lambda example: len(example.get("images") or []) <= max_images,
+            desc=f"Max train images <= {max_images}",
+        )
+    except TypeError:
+        return dataset.filter(lambda example: len(example.get("images") or []) <= max_images)
+
+
+def _filter_by_episode_ids(dataset, episode_ids, keep=True):
+    if "episode_id" not in dataset.column_names:
+        raise ValueError("Holdout eval manifest requires an episode_id column")
+    episode_id_set = {str(episode_id) for episode_id in episode_ids}
+    return dataset.filter(
+        lambda episode_id: (str(episode_id) in episode_id_set) == keep,
+        input_columns=["episode_id"],
+    )
+
+
+def _holdout_eval_manifest_path(args):
+    manifest_path = str(getattr(args, "holdout_eval_manifest", "") or "").strip()
+    if manifest_path:
+        return os.path.expanduser(manifest_path)
+    ratio = float(getattr(args, "holdout_eval_ratio", 0.0) or 0.0)
+    if ratio > 0.0:
+        return os.path.join(args.output_dir, "holdout_eval_manifest.json")
+    return ""
+
+
+def _load_holdout_eval_manifest(args):
+    import json
+
+    manifest_path = _holdout_eval_manifest_path(args)
+    if not manifest_path or not os.path.exists(manifest_path):
+        return {"version": 1, "sources": {}}
+    with open(manifest_path, "r") as f:
+        manifest = json.load(f)
+    manifest.setdefault("version", 1)
+    manifest.setdefault("sources", {})
+    print(f"Loading holdout eval manifest: {manifest_path}")
+    return manifest
+
+
+def _save_holdout_eval_manifest(args, manifest):
+    import json
+
+    manifest_path = _holdout_eval_manifest_path(args)
+    if not manifest_path:
+        return
+    manifest_dir = os.path.dirname(manifest_path)
+    if manifest_dir:
+        os.makedirs(manifest_dir, exist_ok=True)
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Saved holdout eval manifest: {manifest_path}")
+
+
+def _split_train_eval_dataset(dataset, args, source_label, manifest):
+    source_manifests = manifest.setdefault("sources", {})
+    source_manifest = source_manifests.get(source_label)
+    if source_manifest and source_manifest.get("eval_episode_ids"):
+        eval_episode_ids = source_manifest["eval_episode_ids"]
+        eval_dataset = _filter_by_episode_ids(dataset, eval_episode_ids, keep=True)
+        train_dataset = _filter_by_episode_ids(dataset, eval_episode_ids, keep=False)
+        print(
+            f"Loaded holdout split for {source_label}: train={len(train_dataset)}, "
+            f"eval={len(eval_dataset)}, manifest_ids={len(eval_episode_ids)}"
+        )
+        return train_dataset, eval_dataset
+
+    ratio = float(getattr(args, "holdout_eval_ratio", 0.0) or 0.0)
+    if ratio <= 0.0:
+        return dataset, None
+    if ratio >= 1.0:
+        raise ValueError("--holdout_eval_ratio must be smaller than 1.0")
+    if len(dataset) < 2:
+        print(f"Skipping holdout split for {source_label}: dataset has {len(dataset)} row(s)")
+        return dataset, None
+
+    seed = int(getattr(args, "holdout_eval_seed", 42) or 42)
+    split = dataset.train_test_split(test_size=ratio, seed=seed, shuffle=True)
+    eval_episode_ids = [str(episode_id) for episode_id in split["test"]["episode_id"]]
+    source_manifests[source_label] = {
+        "source": source_label,
+        "ratio": ratio,
+        "seed": seed,
+        "train_count": len(split["train"]),
+        "eval_count": len(split["test"]),
+        "eval_episode_ids": eval_episode_ids,
+    }
+    print(
+        f"Holdout split for {source_label}: train={len(split['train'])}, "
+        f"eval={len(split['test'])}, ratio={ratio:g}, seed={seed}"
+    )
+    return split["train"], split["test"]
+
+
+def _concat_datasets(datasets):
+    if not datasets:
+        return None
+    if len(datasets) == 1:
+        return datasets[0]
+    from datasets import concatenate_datasets
+
+    return concatenate_datasets(datasets)
+
+
+def load_train_eval_datasets_for_navverse(args, use_streaming):
+    from datasets import load_from_disk, load_dataset, Sequence, Image
+    from utils.data_misc import decode_image_sequence
+
+    parquet_groups = _parquet_file_groups(args.train_dataset_dir)
+    if parquet_groups:
+        train_parts = []
+        eval_parts = []
+        holdout_manifest = _load_holdout_eval_manifest(args)
+        total_shards = sum(len(files) for _, files in parquet_groups)
+        print(f"Loading Train (Parquet): {total_shards} shard(s) from {args.train_dataset_dir}")
+        for source_label, parquet_files in parquet_groups:
+            print(f"Loading Train source (Parquet): {len(parquet_files)} shard(s) from {source_label}")
+            dataset = load_dataset("parquet", data_files=parquet_files, split="train")
+            dataset = _maybe_filter_navverse_max_images(dataset, args)
+            train_part, eval_part = _split_train_eval_dataset(dataset, args, source_label, holdout_manifest)
+            train_parts.append(train_part)
+            if eval_part is not None:
+                eval_parts.append(eval_part)
+        if eval_parts:
+            _save_holdout_eval_manifest(args, holdout_manifest)
+        train_dataset = _concat_datasets(train_parts)
+        eval_dataset = _concat_datasets(eval_parts)
+        train_dataset = _apply_navverse_transform(train_dataset, args, decode_images=True)
+        if eval_dataset is not None:
+            eval_dataset = _apply_navverse_transform(eval_dataset, args, decode_images=True)
+        return train_dataset, eval_dataset
+
+    if not os.path.exists(os.path.expanduser(args.train_dataset_dir)) and "/" in args.train_dataset_dir:
+        print(f"Loading Train (Streaming): {args.train_dataset_dir}")
+        train_dataset = load_dataset(args.train_dataset_dir, split="train", streaming=use_streaming)
+        if use_streaming:
+            train_dataset = train_dataset.map(decode_image_sequence)
+        else:
+            train_dataset = train_dataset.shuffle(seed=42)
+            train_dataset = train_dataset.cast_column("images", Sequence(Image(decode=True)))
+        train_dataset = _maybe_filter_navverse_max_images(train_dataset, args)
+        return _apply_navverse_transform(train_dataset, args), None
+
+    print(f"Loading Train (Disk): {args.train_dataset_dir}")
+    train_dataset = load_from_disk(args.train_dataset_dir)
+    train_dataset = _maybe_filter_navverse_max_images(train_dataset, args)
+    return _apply_navverse_transform(train_dataset, args, decode_images=True), None
+
+
+def load_train_dataset_for_navverse(args, use_streaming):
+    train_dataset, _ = load_train_eval_datasets_for_navverse(args, use_streaming)
+    return train_dataset
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="SFT training (minimal CLI: only overrides hardcoded paths)")
     p.add_argument("--model_id", type=str, default=MODEL_ID, help="HF model id or local path")
@@ -224,6 +591,28 @@ def parse_args():
     p.add_argument("--eval_max_samples", type=int, default=EVAL_MAX_SAMPLES, help="Eval subset size")
     p.add_argument("--print_config", action="store_true", help="Print config then exit")
     p.add_argument("--resume_path", type=str, default="",help = "checkpoint to resume")
+    p.add_argument("--max_steps", type=int, default=1000, help="Trainer max_steps")
+    p.add_argument("--save_steps", type=int, default=77, help="Checkpoint save interval")
+    p.add_argument("--eval_steps", type=int, default=77, help="Eval interval")
+    p.add_argument("--logging_steps", type=int, default=1, help="Logging interval")
+    p.add_argument("--learning_rate", type=float, default=3e-5, help="Trainer learning rate")
+    p.add_argument("--optim", type=str, default="adamw_torch_fused", help="Trainer optimizer name")
+    p.add_argument("--warmup_steps", type=int, default=0, help="Trainer warmup steps")
+    p.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Trainer gradient accumulation steps")
+    p.add_argument("--dataloader_num_workers", type=int, default=2, help="Trainer dataloader workers")
+    p.add_argument("--report_to", type=str, default="none", help="Trainer report_to target; use none to disable")
+    p.add_argument("--attn_impl", type=str, default="sdpa", choices=["sdpa", "flash_attention_2", "eager"], help="Attention backend")
+    p.add_argument("--lora_r", type=int, default=128, help="LoRA rank")
+    p.add_argument("--lora_alpha", type=int, default=256, help="LoRA alpha")
+    p.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
+    p.add_argument("--collator_dropout", type=float, default=0.3, help="Action masking collator dropout")
+    p.add_argument("--normalize_navverse_actions", action="store_true", help="Map NavVerse action labels to stop/forward/left/right text")
+    p.add_argument("--max_train_images", type=int, default=0, help="Drop train episodes longer than this many images; 0 disables filtering")
+    p.add_argument("--window_sample_images", type=int, default=0, help="Randomly crop each train episode to this many contiguous images; 0 disables window sampling")
+    p.add_argument("--holdout_eval_ratio", type=float, default=0.0, help="Per-train-source eval holdout ratio; 0 disables automatic holdout")
+    p.add_argument("--holdout_eval_seed", type=int, default=42, help="Seed for per-source holdout eval split")
+    p.add_argument("--holdout_eval_manifest", type=str, default="", help="JSON file of per-source holdout eval episode ids to create or reuse")
+    p.add_argument("--ddp_find_unused_parameters", type=str, default="false", choices=["true", "false"], help="DDP find_unused_parameters setting")
     return p.parse_args()
 
 
@@ -268,7 +657,7 @@ def main():
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
-        attn_implementation = "flash_attention_2",
+        attn_implementation=args.attn_impl,
     )
     model.enable_input_require_grads()
     processor = AutoProcessor.from_pretrained(args.model_id)
@@ -279,7 +668,7 @@ def main():
     print("Applying LoRA...")
 
     peft_config = LoraConfig(
-                r=128, lora_alpha=256, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
+                r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM",
                 target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
                 # modules_to_save=["multi_modal_projector"],
                 modules_to_save=["spatial_head"], 
@@ -289,45 +678,10 @@ def main():
     from datasets import load_from_disk, load_dataset, Sequence, Image,Value
     from utils.data_misc import decode_image_sequence
     use_streaming = True
-    if not os.path.exists(os.path.expanduser(args.train_dataset_dir)) and "/" in args.train_dataset_dir:
-        print(f"Loading Train (Streaming): {args.train_dataset_dir}")
-        train_dataset = load_dataset(args.train_dataset_dir, split="train", streaming=use_streaming)
-        # IterableDataset needs .shuffle with buffer_size
-        if use_streaming:
-            # train_dataset = train_dataset.shuffle(seed=42, buffer_size=)
-            train_dataset = train_dataset.map(decode_image_sequence)
-            # print(f"length of images in sample before dynamic resize: {len(next(iter(train_dataset))['images'])}")
-            # train_dataset = train_dataset.map(dynamic_resize_transform, batched=True,batch_size=1)
-            # new_features = train_dataset.features.copy()
-            # new_features["images"] = Sequence(Image())
-
-            # 3. Resize
-            # train_dataset = train_dataset.map(
-            #     dynamic_resize_transform,
-            #     batched=True,
-            #     batch_size=1,
-            #     # features=new_features # Explicitly pass the new schema
-            # )
-            
-            # print(f"length of images in sample after dynamic resize: {len(next(iter(train_dataset))['images'])}")
-        else:
-            train_dataset = train_dataset.shuffle(seed=42)
-            train_dataset = train_dataset.cast_column("images", Sequence(Image(decode=True)))
-            # train_dataset.set_transform(dynamic_resize_transform)
-
-        # train_dataset = train_dataset.filter(lambda x: len(x['images']) <= 70)
-        # IterableDataset doesn't support set_transform directly, use map
-
-    else:
-        print(f"Loading Train (Disk): {args.train_dataset_dir}")
-        train_dataset = load_from_disk(args.train_dataset_dir)
-        # train_dataset = train_dataset.cast_column('images',Sequence(Value(dtype='string')))
-        # train_dataset = train_dataset.filter(validate_episode_images, num_proc=32, desc="Img Verify",batch_size=10)
-
-        # train_dataset = train_dataset.filter(lambda example:len(example['action_sequence'])>396,batch_size=10,writer_batch_size=10,num_proc=16)
-        train_dataset = train_dataset.cast_column("images", Sequence(Image(decode=True)))
-        # train_dataset.set_transform(dynamic_resize_transform)
-    if args.eval_dataset_dir:
+    train_dataset, holdout_eval_dataset = load_train_eval_datasets_for_navverse(args, use_streaming)
+    if holdout_eval_dataset is not None:
+        eval_dataset = holdout_eval_dataset
+    elif args.eval_dataset_dir:
         if not os.path.exists(os.path.expanduser(args.eval_dataset_dir)) and "/" in args.eval_dataset_dir:
             print(f"Loading Eval (Streaming): {args.eval_dataset_dir}")
             # Try to load 'validation' split, or fallback to 'train' if needed (user provided specific val repo)
@@ -371,29 +725,31 @@ def main():
         output_dir=args.output_dir,
         # run_name="qwen-vln-action-dropout",
         save_strategy="steps",        # Save checkpoints frequently
-        save_steps=77,
+        save_steps=args.save_steps,
                   # Save every 500 steps
         eval_strategy="steps" if eval_dataset is not None else "no",
-        eval_steps=77,               # Frequency: Every 100 steps
+        eval_steps=args.eval_steps,
         per_device_eval_batch_size=1,
         
         per_device_train_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=1,
-        learning_rate=3e-5,
-        logging_steps=1,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        logging_steps=args.logging_steps,
         max_length=None,#TARGET_SEQ_LEN,
         packing=False, # FALSE is critical to strictly enforce batch_size x seq_len shape
         bf16=True,     # Use bfloat16 for A100
         gradient_checkpointing=GRADIENT_CHECKPOINTING,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        max_steps=1000,   # We only need a few steps to hit peak memory
-        report_to="wandb",
+        max_steps=args.max_steps,
+        warmup_steps=args.warmup_steps,
+        report_to=[] if args.report_to.lower() in {"none", "disabled", "disable"} else args.report_to,
         # dataset_text_field="text",
 
-        resume_from_checkpoint=args.resume_path,
+        resume_from_checkpoint=args.resume_path or None,
         assistant_only_loss=False,
-        optim="adamw_torch_fused",
-        dataloader_num_workers=2,
+        optim=args.optim,
+        dataloader_num_workers=args.dataloader_num_workers,
+        ddp_find_unused_parameters=args.ddp_find_unused_parameters.lower() == "true",
 
         remove_unused_columns=False,
         # resume_from_checkpoint='/Projects/SG_VLN_HumanData/contrastive_training_5view_mlp/checkpoint-4050'
@@ -407,7 +763,7 @@ def main():
             processor=processor,
             length_warning = TOTAL_BUDGET,
             # max_length=TOTAL_BUDGET,
-            dropout=0.3,
+            dropout=args.collator_dropout,
         ),
         args=training_args,
         train_dataset=train_dataset,
@@ -426,7 +782,7 @@ def main():
     # 6. Run Training & Measure
     torch.cuda.reset_peak_memory_stats()
     print("Starting training loop...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_path or None)
     # try:
         
     # except Exception as e:

@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 from trl import SFTTrainer
@@ -11,6 +13,61 @@ def entropy_from_logits(logits):
     return -torch.sum(probs * log_probs, dim=-1)
 
 class PrunedSFTTrainer(SFTTrainer):
+    @staticmethod
+    def _is_finite_metric_value(value):
+        try:
+            if isinstance(value, torch.Tensor):
+                value = value.item()
+            return math.isfinite(float(value))
+        except (RuntimeError, TypeError, ValueError):
+            return False
+
+    def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        mode = "train" if self.model.training else "eval"
+        metrics = {}
+        for key, values in self._metrics[mode].items():
+            finite_values = [value for value in values if self._is_finite_metric_value(value)]
+            if finite_values:
+                metrics[key] = sum(finite_values) / len(finite_values)
+
+        if mode == "eval":
+            metrics = {f"eval_{key}": value for key, value in metrics.items()}
+
+        logs = {**logs, **metrics}
+        super(SFTTrainer, self).log(logs, start_time)
+        self._metrics[mode].clear()
+
+    def _get_fixed_action_template_token_ids(self, device):
+        cached = getattr(self, "_fixed_action_template_token_ids", None)
+        if cached is not None:
+            return cached.to(device)
+
+        tokenizer = getattr(self.processing_class, "tokenizer", self.processing_class)
+        token_ids = []
+        for text in ("**", "<|im_end|>"):
+            token_ids.extend(tokenizer.encode(text, add_special_tokens=False))
+
+        if not token_ids:
+            return None
+
+        fixed_ids = sorted(set(token_ids))
+        self._fixed_action_template_token_ids = torch.tensor(fixed_ids, dtype=torch.long)
+        return self._fixed_action_template_token_ids.to(device)
+
+    def _get_action_token_ids(self, device):
+        cached = getattr(self, "_action_token_ids", None)
+        if cached is not None:
+            return {name: token_ids.to(device) for name, token_ids in cached.items()}
+
+        tokenizer = getattr(self.processing_class, "tokenizer", self.processing_class)
+        action_token_ids = {}
+        for action in ("forward", "stop", "right", "left"):
+            token_ids = tokenizer.encode(action, add_special_tokens=False)
+            if token_ids:
+                action_token_ids[action] = torch.tensor(sorted(set(token_ids)), dtype=torch.long)
+
+        self._action_token_ids = action_token_ids
+        return {name: token_ids.to(device) for name, token_ids in action_token_ids.items()}
     
     def _prune_tensor(self, tensor, mask, padding_value=0):
         """
@@ -135,9 +192,7 @@ class PrunedSFTTrainer(SFTTrainer):
 
         # Compute Accuracy
         if self.args.use_liger_kernel:
-            # Liger handles its own accuracy internally, assuming it received pruned inputs inside forward
-            token_accuracy = self.accelerator.gather_for_metrics(outputs.token_accuracy).mean().item()
-            self._metrics[mode]["mean_token_accuracy"].append(token_accuracy)
+            pass
         else:
             with torch.no_grad():
                 if "shift_labels" in inputs:
@@ -161,16 +216,42 @@ class PrunedSFTTrainer(SFTTrainer):
                 predictions = shift_logits.argmax(dim=-1)
                 mask = shift_labels != -100
 
-                correct_predictions = (predictions == shift_labels) & mask
-                total_tokens = mask.sum()
-                correct_tokens = correct_predictions.sum()
+                fixed_template_ids = self._get_fixed_action_template_token_ids(shift_labels.device)
+                if fixed_template_ids is None:
+                    action_mask = mask
+                else:
+                    fixed_template_mask = (shift_labels[..., None] == fixed_template_ids).any(dim=-1)
+                    action_mask = mask & ~fixed_template_mask
 
-                correct_tokens = self.accelerator.gather_for_metrics(correct_tokens)
-                total_tokens = self.accelerator.gather_for_metrics(total_tokens)
+                correct_action_predictions = (predictions == shift_labels) & action_mask
+                total_action_tokens = action_mask.sum()
+                correct_action_tokens = correct_action_predictions.sum()
 
-                total_sum = total_tokens.sum()
-                accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
-                self._metrics[mode]["mean_token_accuracy"].append(accuracy)
+                correct_action_tokens = self.accelerator.gather_for_metrics(correct_action_tokens)
+                total_action_tokens = self.accelerator.gather_for_metrics(total_action_tokens)
+
+                total_action_sum = total_action_tokens.sum()
+                action_accuracy = (
+                    correct_action_tokens.sum() / total_action_sum
+                ).item() if total_action_sum > 0 else 0.0
+
+                self._metrics[mode]["mean_action_token_accuracy"].append(action_accuracy)
+
+                action_token_ids = self._get_action_token_ids(shift_labels.device)
+                for action_name, action_ids in action_token_ids.items():
+                    per_action_mask = action_mask & (shift_labels[..., None] == action_ids).any(dim=-1)
+                    correct_per_action_tokens = ((predictions == shift_labels) & per_action_mask).sum()
+                    total_per_action_tokens = per_action_mask.sum()
+
+                    correct_per_action_tokens = self.accelerator.gather_for_metrics(correct_per_action_tokens)
+                    total_per_action_tokens = self.accelerator.gather_for_metrics(total_per_action_tokens)
+
+                    total_per_action_sum = total_per_action_tokens.sum()
+                    if total_per_action_sum > 0:
+                        per_action_accuracy = (
+                            correct_per_action_tokens.sum() / total_per_action_sum
+                        ).item()
+                        self._metrics[mode][f"mean_{action_name}_action_accuracy"].append(per_action_accuracy)
 
         # if self.aux_loss_enabled:
         #     aux_loss = outputs.aux_loss

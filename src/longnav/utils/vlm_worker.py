@@ -65,7 +65,18 @@ class VLMWorker:
         torch.cuda.empty_cache()
         self.reset()
         
-    def reset(self):
+    _SEQUENCE_STATE_FIELDS = (
+        "offset",
+        "past_key_values",
+        "outputs",
+        "cumulative_inputs",
+        "seq_keep_mask",
+        "vis_keep_masks",
+        "past_image_embeds",
+        "logit_indices",
+    )
+
+    def reset(self, clear_cuda_cache=True):
         from transformers import DynamicCache,StaticCache
         import torch
         self.offset=0
@@ -77,7 +88,22 @@ class VLMWorker:
         self.vis_keep_masks = []
         self.past_image_embeds = None #per batch list of image embed tensors of the form N_patch by N_hidden
         self.logit_indices = []
-        torch.cuda.empty_cache()
+        if clear_cuda_cache:
+            torch.cuda.empty_cache()
+
+    def capture_sequence_state(self):
+        return {name: getattr(self, name) for name in self._SEQUENCE_STATE_FIELDS}
+
+    def restore_sequence_state(self, state):
+        for name in self._SEQUENCE_STATE_FIELDS:
+            setattr(self, name, state[name])
+
+    def new_sequence_state(self):
+        current = self.capture_sequence_state()
+        self.reset(clear_cuda_cache=False)
+        state = self.capture_sequence_state()
+        self.restore_sequence_state(current)
+        return state
 
     def load_model(self):
         if not self.use_sparse:
@@ -121,6 +147,25 @@ class VLMWorker:
         )
         return inputs
     
+    def _get_mm_token_type_ids(self, inputs):
+        mm_token_type_ids = inputs.get('mm_token_type_ids')
+        if mm_token_type_ids is not None:
+            return mm_token_type_ids.to(inputs['input_ids'].device).to(torch.int)
+
+        input_ids = inputs['input_ids']
+        mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
+        image_token_id = getattr(self.processor, "image_token_id", None)
+        video_token_id = getattr(self.processor, "video_token_id", None)
+        if image_token_id is None and self.model is not None:
+            image_token_id = getattr(self.model.config, "image_token_id", None)
+        if video_token_id is None and self.model is not None:
+            video_token_id = getattr(self.model.config, "video_token_id", None)
+        if image_token_id is not None:
+            mm_token_type_ids[input_ids == image_token_id] = 1
+        if video_token_id is not None:
+            mm_token_type_ids[input_ids == video_token_id] = 2
+        return mm_token_type_ids
+
     def _get_sandwich_indices(self, input_ids):
         import torch
         """
@@ -197,6 +242,11 @@ class VLMWorker:
             self.cumulative_inputs['attention_mask'] = torch.cat([self.cumulative_inputs['attention_mask'],inputs['attention_mask']],dim=-1)
             # self.cumulative_inputs['position_ids'] = torch.cat([self.cumulative_inputs['position_ids'],inputs['position_ids']],dim=-1)
             self.cumulative_inputs['input_ids'] = torch.cat([self.cumulative_inputs['input_ids'],inputs['input_ids']],dim=-1)
+            if 'mm_token_type_ids' in inputs:
+                if 'mm_token_type_ids' in self.cumulative_inputs:
+                    self.cumulative_inputs['mm_token_type_ids'] = torch.cat([self.cumulative_inputs['mm_token_type_ids'],inputs['mm_token_type_ids']],dim=-1)
+                else:
+                    self.cumulative_inputs['mm_token_type_ids'] = inputs['mm_token_type_ids'].to('cpu')
             self.cumulative_inputs['image_grid_thw'] = torch.cat([self.cumulative_inputs['image_grid_thw'],inputs['image_grid_thw']],dim=0) # N_image by Hidden Size (16*16*6 ?)
             if self.save_pixels:
                 self.cumulative_inputs['pixel_values'].append(inputs['pixel_values'].to('cpu'))
@@ -224,11 +274,12 @@ class VLMWorker:
             input_ids = self.cumulative_inputs['input_ids']
             image_grid_thw = self.cumulative_inputs['image_grid_thw']
             attention_mask = self.cumulative_inputs['attention_mask']
-            # mm_token_type_ids = self.cumulative_inputs['mm_token_type_ids'] # not sure if needed but just in case
+            mm_token_type_ids = self._get_mm_token_type_ids(self.cumulative_inputs)
             # 1. Ask Qwen to calculate the 3D layout for this chunk
             # This returns positions starting at T=0, H=0, W=0 relative to this chunk
             position_ids, deltas = self.vl_model.get_rope_index(
                 input_ids=input_ids,
+                mm_token_type_ids=mm_token_type_ids,
                 image_grid_thw=image_grid_thw, 
                 video_grid_thw=None,
                 attention_mask=attention_mask,
@@ -254,12 +305,14 @@ class VLMWorker:
         input_ids = turn_inputs['input_ids']
         image_grid_thw = turn_inputs['image_grid_thw']
         attention_mask = turn_inputs['attention_mask']
+        mm_token_type_ids = self._get_mm_token_type_ids(turn_inputs)
         position_ids, deltas = self.vl_model.get_rope_index(
             input_ids=input_ids,
+            mm_token_type_ids=mm_token_type_ids,
             image_grid_thw=image_grid_thw, 
             video_grid_thw=None,
             attention_mask=attention_mask,
-            # mm_token_type_ids=turn_inputs.get('mm_token_type_ids',None)
+            mm_token_type_ids=turn_inputs.get('mm_token_type_ids', None),
         )
         position_ids += self.offset
         self.offset += len(turn_inputs['input_ids'][0])
@@ -299,6 +352,15 @@ class VLMWorker:
         RESETS internal outputs after packing.
         '''
         assert(self.save_outputs) # must be saving outputs to use this function.
+        if not self.outputs['position_ids']:
+            debug_lengths = {
+                key: len(value) if isinstance(value, list) else type(value).__name__
+                for key, value in self.outputs.items()
+            }
+            raise ValueError(
+                "No cached VLM outputs were stored for this rollout. "
+                f"save_outputs={self.save_outputs}, output_lengths={debug_lengths}"
+            )
         deepstack =[torch.cat([self.outputs['deepstack_visual_embeds'][i][j] for j in range(len(self.outputs['deepstack_visual_embeds'][i]))],dim=0) for i in range(len(self.outputs['deepstack_visual_embeds']))]
         position_ids = torch.cat(self.outputs['position_ids'],dim=-1)
         visual_pos_masks = torch.cat(self.outputs['visual_pos_masks'],dim=1)
@@ -361,15 +423,16 @@ class VLMWorker:
         logit_indices,prefix_starts,postfix_starts = self._get_sandwich_indices(turn_inputs['input_ids'])
         if crop_inputs:
             if len(prefix_starts)>1:
-                turn_inputs['attention_mask'] = turn_inputs['attention_mask'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)]
-                turn_inputs["input_ids"] = turn_inputs['input_ids'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)]
-                if 'mm_token_type_ids' in turn_inputs.keys():
-                    turn_inputs["mm_token_type_ids"] = turn_inputs['mm_token_type_ids'][:,(postfix_starts[0]-1):(postfix_starts[-1]-1)] 
+                crop_start = postfix_starts[0]-1
+                crop_end = postfix_starts[-1]-1
+                for key in ('attention_mask', 'input_ids', 'mm_token_type_ids'):
+                    if key in turn_inputs:
+                        turn_inputs[key] = turn_inputs[key][:,crop_start:crop_end]
             else:
-                turn_inputs['attention_mask'] = turn_inputs['attention_mask'][:,:(postfix_starts[-1]-1)]
-                turn_inputs["input_ids"] = turn_inputs['input_ids'][:,:(postfix_starts[-1]-1)]
-                if 'mm_token_type_ids' in turn_inputs.keys():
-                    turn_inputs["mm_token_type_ids"] = turn_inputs['mm_token_type_ids'][:,:(postfix_starts[-1]-1)]
+                crop_end = postfix_starts[-1]-1
+                for key in ('attention_mask', 'input_ids', 'mm_token_type_ids'):
+                    if key in turn_inputs:
+                        turn_inputs[key] = turn_inputs[key][:,:crop_end]
 
         t = time.time()
         self._accumulate_inputs(turn_inputs)
@@ -1099,8 +1162,31 @@ class VLMTrainingMixin:
         sched_path = os.path.join(path, "scheduler.pt")
         if os.path.exists(sched_path) and load_sched:
             print("loading scheduler!")
-            sched_state = torch.load(sched_path, map_location=self.accelerator.device)
-            self.scheduler.load_state_dict(sched_state,weights_only=True)
+            sched_state = torch.load(
+                sched_path,
+                map_location=self.accelerator.device,
+                weights_only=True,
+            )
+            self.scheduler.load_state_dict(sched_state)
+            base_scheduler = getattr(self.scheduler, "scheduler", self.scheduler)
+            if hasattr(base_scheduler, "lr_lambdas"):
+                resumed_lrs = [
+                    base_lr * lr_lambda(base_scheduler.last_epoch)
+                    for base_lr, lr_lambda in zip(
+                        base_scheduler.base_lrs,
+                        base_scheduler.lr_lambdas,
+                    )
+                ]
+                for param_group, resumed_lr in zip(
+                    self.optimizer.param_groups,
+                    resumed_lrs,
+                ):
+                    param_group["lr"] = resumed_lr
+                base_scheduler._last_lr = resumed_lrs
+                print(
+                    " -> Scheduler LR recomputed from current schedule: "
+                    f"last_epoch={base_scheduler.last_epoch}, lrs={resumed_lrs}"
+                )
             print(" -> Scheduler loaded.")
 
 class DataGenerator:
