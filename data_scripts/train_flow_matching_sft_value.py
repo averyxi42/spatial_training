@@ -96,7 +96,6 @@ from longnav.utils.vector_sft import (  # noqa: E402
 
 
 # --- PROBE ---------------------------------------------------------------------------
-import numpy as _np
 import torch as _torch
 
 from longnav.utils.state_probe import (
@@ -133,6 +132,7 @@ class ProbeCollator(_BaseCollator):
 
     distance_column: str = "distance_targets"
     return_column: str = "return_targets"
+    terminal_zero_metrics: bool = False
 
     def __call__(self, examples):
         ex = examples[0]
@@ -160,6 +160,20 @@ class ProbeCollator(_BaseCollator):
             vals = [float("nan") if v is None else float(v)
                     for v in raw[start:start + n_kept]]
             out[key] = _torch.tensor(vals, dtype=_torch.float32)
+        if self.terminal_zero_metrics:
+            raw_stop = ex.get("stop_targets")
+            if raw_stop is None:
+                out["terminal_zero_mask"] = _torch.zeros(n_kept, dtype=_torch.bool)
+            else:
+                if len(raw_stop) < start + n_kept:
+                    raise ValueError(
+                        "stop_targets is not aligned with the action-target window"
+                    )
+                stop = _torch.as_tensor(
+                    raw_stop[start:start + n_kept], dtype=_torch.float32
+                )
+                is_zero = out["targets"].reshape(n_kept, -1).eq(0).all(dim=1)
+                out["terminal_zero_mask"] = is_zero & (stop >= 0.5)
         return out
 
 
@@ -470,6 +484,8 @@ def parse_args():
                         "compare a discrete head's codebook occupancy against a "
                         "continuous head's, which the current mixture does not ask. "
                         "The sums are accumulated either way, so this is logging only")
+    f.add_argument("--terminal-zero-metrics", action="store_true",
+                   help="log separate loss and action error for zero-action terminal targets")
     f.add_argument("--inference-steps", type=int, default=NUM_INFERENCE_STEPS,
                    help="Euler steps at deploy time (a knob, not a trained quantity)")
     f.add_argument("--metric-steps", type=int, default=None,
@@ -675,6 +691,7 @@ def parse_args():
     # with the default and nothing says so.
     args.eval_per_component = mine.eval_per_component
     args.log_motion_bands = mine.log_motion_bands
+    args.terminal_zero_metrics = mine.terminal_zero_metrics
     # Derived, never accepted: there is no context projection, so the readout MLP must emit
     # exactly one d_model-wide vector per prefix token.
     args.context_dim = mine.context_tokens * mine.decoder_d_model
@@ -964,9 +981,12 @@ def main():
     # --- PROBE --- ProbeCollator only when co-training; otherwise the original
     _Coll = ProbeCollator if args.probe else TurnVectorCollator
     train_collator = _Coll(processor, data_cfg, train=True, seed=args.seed,
-                                        modality_specs=specs)
+                           modality_specs=specs)
     eval_collator = _Coll(processor, data_cfg, train=False, seed=args.seed,
-                                       modality_specs=specs)
+                          modality_specs=specs)
+    if args.probe:
+        train_collator.terminal_zero_metrics = args.terminal_zero_metrics
+        eval_collator.terminal_zero_metrics = args.terminal_zero_metrics
 
     if not args.no_preflight and is_main:
         model.to("cuda" if torch.cuda.is_available() else "cpu")
