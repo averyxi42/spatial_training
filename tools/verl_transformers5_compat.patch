@@ -1,0 +1,15 @@
+diff --git a/verl/__init__.py b/verl/__init__.py
+index bf679101..70118311 100644
+--- a/verl/__init__.py
++++ b/verl/__init__.py
+@@ -25,0 +26,10 @@ from .utils.logging_utils import set_basic_config
++try:
++    import transformers
++
++    if not hasattr(transformers, "AutoModelForVision2Seq") and hasattr(
++        transformers, "AutoModelForImageTextToText"
++    ):
++        transformers.AutoModelForVision2Seq = transformers.AutoModelForImageTextToText
++except Exception:
++    pass
++
